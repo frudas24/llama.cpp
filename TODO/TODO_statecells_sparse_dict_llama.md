@@ -227,3 +227,75 @@ for row in 0..R-1:
   - **Calibración funcional (CoSpaDi‑style):** optimizar `||W X − Ŵ X||` con activaciones reales para preservar PPL/QA.
   - **Kernels tipo codebook (AQLM‑style):** el valor no está solo en el formato; está en el **micro‑kernel cache‑friendly** (y en decidir `M/k` por tensor).
 - Conclusión: la integración actual es la base correcta; para ganar contra Q‑quants en serio, el siguiente salto es **data‑aware builder + coeficientes baratos (row_scale) + schedule por tensor**.
+
+---
+
+## 11) Ejemplos de uso (Devstral 24B Q5 → StateCells)
+
+### 11.1 Construir `devstral_sc.gguf` (capas medias primero)
+
+> Nota: esto **no** abre una UI; es un tool offline y puede tardar bastante. Usa `--checkpoint-every 1` para ir escribiendo progreso.
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
+OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
+
+./llama.cpp/build/bin/llama-statecells-build \
+  -i "$IN" \
+  -o "$OUT" \
+  --layers 6-25 \
+  --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
+  --dict-k 32 \
+  --dict-iters 2 \
+  --dict-max-samples 2048 \
+  --row-scale \
+  --eval-cols 64 \
+  --report-json /tmp/devstral_sc_report.json \
+  --checkpoint-every 1
+```
+
+### 11.2 Reanudar/continuar (sin perder horas)
+
+Si `OUT` ya existe y quieres seguir agregando capas (o completar `row_scale` si faltaba), usa `--resume`:
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
+OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
+
+./llama.cpp/build/bin/llama-statecells-build \
+  -i "$IN" \
+  -o "$OUT" \
+  --resume \
+  --layers 26-39 \
+  --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
+  --dict-k 32 --dict-iters 2 \
+  --row-scale \
+  --checkpoint-every 1
+```
+
+### 11.3 Ejecutar con `llama-cli` (StateCells + KV quant)
+
+```bash
+OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
+
+./llama.cpp/build/bin/llama-cli \
+  -m "$OUT" \
+  --statecells --statecells-gap 0.02 \
+  -t 16 -tb 16 -c 4096 -fa on \
+  -ctk q8_0 -ctv q8_0 \
+  -p "hola" -n 128 \
+  --single-turn < /dev/null
+```
+
+### 11.4 Evaluación rápida A/B (perplexity + QA)
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
+OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
+
+./llama.cpp/scripts/statecells-eval.sh \
+  --base "$IN" \
+  --sc "$OUT" \
+  --text /ruta/a/wikitext-2-raw/wiki.test.raw \
+  --threads 16 --ctx 4096
+```
