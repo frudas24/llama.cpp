@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-statecells.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -590,6 +591,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    statecells_ctx   (params.statecells_ctx),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -612,7 +614,17 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = nullptr;
+
+    if (statecells_ctx && statecells_ctx->enabled) {
+        if (const auto * scw = statecells_ctx->find(w); scw && scw->dict && scw->codes) {
+            res = llama_statecells_mul_mat(ctx0, cur, scw->dict, scw->codes);
+        }
+    }
+
+    if (!res) {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

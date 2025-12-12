@@ -341,6 +341,9 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // StateCells sparse-dictionary backend [EXPERIMENTAL]
+        float    statecells_gap_tol; // tolerance for fallback to dense
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -364,6 +367,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool statecells;  // enable StateCells weights if present in GGUF [EXPERIMENTAL]
     };
 
     // model quantization parameters

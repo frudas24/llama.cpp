@@ -4,6 +4,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-statecells.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -238,6 +239,7 @@ private:
     llama_cparams       cparams;
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
+    llama_statecells_context statecells_ctx;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

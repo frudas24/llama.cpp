@@ -2653,6 +2653,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
 
+                            // Optional StateCells sparse-dictionary tensors, if present in GGUF.
+                            // These must be created to keep tensor counts consistent when using extended GGUFs.
+                            auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                                const auto tn_dict = tn(t, "dict", i);
+                                if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
+                                    dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+
+                                const auto tn_codes = tn(t, "codes", i);
+                                if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
+                                    codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+                            };
+                            try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
+                            try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
+                            try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+
                             // optional MLP bias
                             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
                             layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
