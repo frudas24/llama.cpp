@@ -71,6 +71,7 @@
     - `--dict-k` átomos activos por columna/fila (p.ej. 16–48).
     - `--dict-k-gate`, `--dict-k-up`, `--dict-k-down` overrides por matriz.
     - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
+    - `-t, --threads N` paraleliza el encoding (default: nproc).
     - `--resume` reanuda sobre un `-o` ya creado (salta pesos con `dict+codes`).
     - `--checkpoint-every N` escribe `-o` cada N capas (I/O grande; útil para no perder progreso).
     - `--row-scale` / `--no-row-scale` emite `..._row_scale` (fp16) por salida (default: on).
@@ -243,6 +244,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
 ./llama.cpp/build/bin/llama-statecells-build \
   -i "$IN" \
   -o "$OUT" \
+  -t 16 \
   --layers 6-25 \
   --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
   --dict-k 32 \
@@ -266,6 +268,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   -i "$IN" \
   -o "$OUT" \
   --resume \
+  -t 16 \
   --layers 26-39 \
   --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
   --dict-k 32 --dict-iters 2 \
