@@ -1,5 +1,6 @@
 #include "common.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -240,133 +241,128 @@ static void encode_codes_sign(
         const std::string & tag) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
-    codes_out.assign((size_t) k * n_out, 0);
 
+    GGML_ASSERT((int64_t) D.size() == n_in * M);
+    GGML_ASSERT(M > 0);
+
+    k = std::min<int>(k, (int) M);
+    if (k <= 0 || n_out <= 0) {
+        codes_out.clear();
+        return;
+    }
+
+    // codes store ±(atom+1) in int16.
+    GGML_ASSERT(M <= 32767);
+
+    codes_out.assign((size_t) k * (size_t) n_out, 0);
+
+    // Encode with a blocked GEMM: Y = D^T * Wblk, Y: [M, B]
+    // This reuses D across B columns (huge speedup vs per-column dot loops).
     n_threads = std::max(1, n_threads);
     n_threads = std::min<int>(n_threads, (int) std::max<int64_t>(1, n_out));
 
     const int64_t t0 = ggml_time_us();
+    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
 
-    if (n_threads == 1) {
-        const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+    const int64_t B = std::min<int64_t>(64, n_out);
 
-        std::vector<float> w;
-        std::vector<float> y(M);
+    const size_t size_dict = (size_t) n_in * (size_t) M * sizeof(float);
+    const size_t size_wblk = (size_t) n_in * (size_t) B * sizeof(float);
+    const size_t size_y    = (size_t) M    * (size_t) B * sizeof(float);
 
-        for (int64_t col = 0; col < n_out; ++col) {
-            read_column_f32(W, col, w);
+    const size_t mem_size =
+            ggml_tensor_overhead() * 16 +
+            ggml_graph_overhead_custom(256, /*grads*/ false) +
+            size_dict + size_wblk + size_y +
+            1024*1024;
 
-            for (int64_t j = 0; j < M; ++j) {
-                const float * dcol = D.data() + j * n_in;
-                float dot = 0.0f;
-                for (int64_t i = 0; i < n_in; ++i) dot += dcol[i] * w[i];
-                y[j] = dot;
-            }
+    ggml_init_params params = { mem_size, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
 
-            const auto topk = topk_abs_indices(y, k);
-            for (int ti = 0; ti < k; ++ti) {
-                const int j = topk[ti];
-                const float yj = y[j];
-                const int sign = yj >= 0 ? 1 : -1;
-                codes_out[(size_t) ti + (size_t) col * (size_t) k] = (int16_t) (sign * (j + 1));
-            }
+    ggml_tensor * t_dict = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, M);
+    ggml_tensor * t_wblk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, B);
 
-            if ((col + 1) % progress_every == 0 || col + 1 == n_out) {
-                const double pct = 100.0 * double(col + 1) / double(n_out);
-                const double sec = double(ggml_time_us() - t0) / 1e6;
-                fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs",
-                        tag.c_str(), col + 1, n_out, pct, sec);
-                fflush(stderr);
-                if (col + 1 == n_out) {
-                    fprintf(stderr, "\n");
-                }
-            }
-        }
-        return;
+    std::memcpy(t_dict->data, D.data(), size_dict);
+
+    ggml_tensor * t_y = ggml_mul_mat(ctx, t_dict, t_wblk);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, t_y);
+
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    ggml_threadpool * threadpool = ggml_threadpool_new(&tpp);
+    GGML_ASSERT(threadpool != nullptr);
+
+    ggml_cplan plan = ggml_graph_plan(gf, n_threads, threadpool);
+    std::vector<uint8_t> work_buffer;
+    if (plan.work_size > 0) {
+        work_buffer.resize(plan.work_size);
+        plan.work_data = work_buffer.data();
     }
 
-    std::atomic<int64_t> next_col{0};
-    std::atomic<int64_t> done_cols{0};
+    auto * wblk_data = (float *) t_wblk->data;
+    const auto * y_data = (const float *) t_y->data;
 
-    auto worker = [&]() {
-        std::vector<float> w;
-        std::vector<float> y(M);
-        std::vector<int> idx((size_t) M);
+    std::vector<float> w;
+    std::vector<int> idx((size_t) M);
 
-        while (true) {
-            const int64_t col = next_col.fetch_add(1);
-            if (col >= n_out) {
-                break;
-            }
+    int64_t last_print = 0;
+    for (int64_t col0 = 0; col0 < n_out; col0 += B) {
+        const int64_t nb = std::min<int64_t>(B, n_out - col0);
 
-            read_column_f32(W, col, w);
+        for (int64_t b = 0; b < nb; ++b) {
+            read_column_f32(W, col0 + b, w);
+            std::memcpy(wblk_data + b * n_in, w.data(), (size_t) n_in * sizeof(float));
+        }
+        for (int64_t b = nb; b < B; ++b) {
+            std::memset(wblk_data + b * n_in, 0, (size_t) n_in * sizeof(float));
+        }
 
-            for (int64_t j = 0; j < M; ++j) {
-                const float * dcol = D.data() + j * n_in;
-                float dot = 0.0f;
-                for (int64_t i = 0; i < n_in; ++i) dot += dcol[i] * w[i];
-                y[j] = dot;
-            }
+        const enum ggml_status st = ggml_graph_compute(gf, &plan);
+        GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t col = col0 + b;
+            const float * y_col = y_data + b * M;
 
             std::iota(idx.begin(), idx.end(), 0);
             const int k_eff = std::min<int>(k, (int) idx.size());
             if (k_eff > 0 && k_eff < (int) idx.size()) {
                 std::nth_element(idx.begin(), idx.begin() + k_eff, idx.end(), [&](int a, int b) {
-                    return std::fabs(y[a]) > std::fabs(y[b]);
+                    return std::fabs(y_col[a]) > std::fabs(y_col[b]);
                 });
             }
             if (k_eff > 0) {
                 std::sort(idx.begin(), idx.begin() + k_eff, [&](int a, int b) {
-                    return std::fabs(y[a]) > std::fabs(y[b]);
+                    return std::fabs(y_col[a]) > std::fabs(y_col[b]);
                 });
             }
 
             for (int ti = 0; ti < k_eff; ++ti) {
                 const int j = idx[ti];
-                const float yj = y[j];
+                const float yj = y_col[j];
                 const int sign = yj >= 0 ? 1 : -1;
                 codes_out[(size_t) ti + (size_t) col * (size_t) k] = (int16_t) (sign * (j + 1));
             }
-
-            done_cols.fetch_add(1, std::memory_order_relaxed);
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (int i = 0; i < n_threads; ++i) {
-        threads.emplace_back(worker);
-    }
-
-    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
-    int64_t last_print = 0;
-    while (true) {
-        const int64_t done = done_cols.load(std::memory_order_relaxed);
-        if (done >= n_out) {
-            break;
         }
 
-        if (done >= last_print + progress_every) {
+        const int64_t done = std::min<int64_t>(col0 + nb, n_out);
+        if (done >= last_print + progress_every || done == n_out) {
             last_print = done;
             const double pct = 100.0 * double(done) / double(n_out);
             const double sec = double(ggml_time_us() - t0) / 1e6;
-            fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs (%d thr)",
-                    tag.c_str(), done, n_out, pct, sec, n_threads);
+            fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs (%d thr, B=%" PRId64 ")",
+                    tag.c_str(), done, n_out, pct, sec, n_threads, B);
             fflush(stderr);
+            if (done == n_out) {
+                fprintf(stderr, "\n");
+            }
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    for (auto & t : threads) {
-        t.join();
-    }
-
-    {
-        const double sec = double(ggml_time_us() - t0) / 1e6;
-        fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (100.0%%) elapsed %.1fs (%d thr)\n",
-                tag.c_str(), n_out, n_out, sec, n_threads);
-    }
+    ggml_threadpool_free(threadpool);
+    ggml_free(ctx);
 }
 
 static void compute_row_scale_sign(
