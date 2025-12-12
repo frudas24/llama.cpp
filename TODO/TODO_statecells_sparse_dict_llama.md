@@ -5,6 +5,7 @@
 ---
 
 ## Índice
+0) Contexto (Devstral 24B, RAM/KV)  
 1) Idea central  
 2) Matemática esencial  
 3) Config/flags  
@@ -14,8 +15,35 @@
 7) Roadmap  
 8) Riesgos/mitigación  
 9) Commits sugeridos
+10) Research/prior art (para “hacerlo bien”)
 
 ---
+
+## Estado actual (✅ implementado en este repo)
+- **Runtime (llama-cli/server):**
+  - Flags: `--statecells` y `--statecells-gap` (global).
+  - Loader opcional de `blk.N.ffn_{gate,up,down}.{dict,codes}` desde GGUF.
+  - Hook en grafo: intercepta matmuls de FFN vía `build_lora_mm`.
+  - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes`.
+- **Offline:**
+  - Tool `llama-statecells-build` genera `*.dict` + `*.codes` y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
+  - Iteración rápida: `--resume` (reanuda sobre `-o` existente), `--checkpoint-every N` (checkpoint por capas), `--eval-cols/--report-json` (gap report).
+- **Pendiente inmediato (para “velocidad de la luz”):**
+  - Soporte `*.vals` (scheme fp16), gap/fallback per‑layer + métricas + kernels más vectorizados.
+
+---
+
+## 0) Contexto (Devstral‑Small‑2 24B, 32 GB RAM)
+**Geometría (aprox):** `n_layers=40`, `n_embd=5120`, `n_ff=32768`, `n_heads=40`, `n_kv_heads=8`, `head_dim=128`.
+
+**Por qué FFN/MLP primero (ROI):** los pesos FFN (gate+up+down) dominan el total de parámetros; si StateCells funciona “bien” en FFN, el impacto en RAM es masivo.
+
+**Trampa real de RAM en contexto largo (KV cache):**
+- Aunque bajemos mucho **weights**, en contextos grandes la RAM se la come KV.
+- Para Devstral, el KV en FP16 crece ~lineal por token; con `ctx` grande puede romper 32 GB.
+- En llama.cpp hay mitigación práctica vía **KV cache quantization**: `-ctk` / `-ctv` (p.ej. `q8_0`).
+
+**Implicación de diseño:** StateCells debe apuntar a **weights**; para “resolver RAM de una vez por todas” hay que reportar y tunear **weights + KV** juntos (no solo weights).
 
 ### 1) Idea central
 - En lugar de guardar W densa/quant completa, se aprende un **diccionario** `D ∈ R^{d×M}` (átomos) y cada fila/bloque de W se codifica como un **SparseCode** con `k` átomos activos:
@@ -41,13 +69,22 @@
     - `--dict-M` tamaño diccionario por peso (p.ej. 512–4096).
     - `--dict-k` átomos activos por columna/fila (p.ej. 16–48).
     - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
+    - `--resume` reanuda sobre un `-o` ya creado (salta pesos con `dict+codes`).
+    - `--checkpoint-every N` escribe `-o` cada N capas (I/O grande; útil para no perder progreso).
+    - `--eval-cols N` calcula métricas de gap sobre N salidas por peso (sampling).
+    - `--report-json FILE` exporta métricas por peso/capa a JSON.
+    - (futuro) `--dict-M-{gate,up,down}` y `--dict-k-{gate,up,down}` para **schedule por matriz** (clave en Devstral: `down` necesita `M` mucho menor).
+    - (futuro) `--scheme sign|sign+row_scale|fp16` para controlar coeficientes sin inflar RAM.
+    - (futuro) `--calib-*` para builder **data‑aware** (ver sección 4).
   - Esquemas:
     - `sign` (actual): coeficiente implícito ±1 dentro de `codes` I16.
-    - `fp16` (futuro): tensor adicional `..._vals` con coeficientes fp16.
+    - `sign+row_scale` (futuro recomendado): `codes` ±1 + escala por fila/bloque (`..._row_scale` fp16) para recuperar magnitud “casi gratis”.
+    - `fp16` (futuro): tensor adicional `..._vals` con coeficientes fp16 (más calidad, más RAM).
 - Runtime:
   - `--statecells` habilita backend si el GGUF trae dict/codes.
   - `--statecells-gap 0.02` tolerancia de fallback (por ahora global).
   - (futuro) flags per‑layer/target cuando extendamos más allá de FFN.
+  - Recomendado para Devstral en 32 GB con ctx grande: usar también `-ctk`/`-ctv` (KV quant) porque StateCells no reduce KV.
 
 ### 4) Integración
 **4.1 Offline (compresión)**
@@ -74,12 +111,38 @@
 
   **Nota de disco/RAM:** el GGUF resultante puede conservar pesos densos para compatibilidad; con `mmap` no deberían cargar en RAM si el runtime usa StateCells.
 
+**4.1.1 Builder “data‑aware” (CoSpaDi‑style) — prioridad para calidad**
+- Riesgo principal del builder weight‑only: minimizar `||W − Ŵ||` no garantiza minimizar el error funcional de la capa.
+- Objetivo recomendado para preservar calidad: minimizar `||W X − Ŵ X||` con un `X` pequeño de **activaciones reales** (calibration set).
+- Plan incremental (sin rehacer todo):
+  1) **Recolectar activaciones** `X` por capa/peso objetivo (`ffn_gate/up/down`) con un dataset corto (p.ej. Wikitext2 o prompts QA).
+  2) En `statecells-build`, en vez de entrenar el diccionario con filas `w`, entrenar con el objetivo funcional:
+     - usar `y = (W X)` como “target” y `ŷ = (Ŵ X)` como predicción,
+     - ajustar `D` y/o coeficientes para reducir `||y − ŷ||`.
+  3) Mantener `--calib-max-samples` pequeño (2k–8k) para iterar rápido.
+
+**4.1.2 Schedule por matriz (M/k no global) — prioridad para RAM+speed**
+- En Devstral:
+  - `ffn_gate/up`: `d_in=5120`, `d_out=32768` → toleran `M` más alto.
+  - `ffn_down`: `d_in=32768`, `d_out=5120` → `M` debe ser **mucho menor** (si no, el `Dᵀx` cuesta demasiado y no ahorra RAM).
+- Heurística inicial (por tensor): `M ≈ d_out/8` (redondear a potencia de 2).
+  - gate/up: `M≈4096`, `k=16..32`
+  - down: `M≈512..640`, `k=16..32`
+- Builder debe permitir overrides por peso (`--dict-M-down`, etc) y reportar memoria estimada por tensor.
+
+**4.1.3 Coeficientes sin inflar RAM — prioridad para calidad**
+- `sign` puro es agresivo (puede subir PPL y empuja a aumentar `M/k`).
+- Antes de `..._vals` completo, implementar:
+  - `..._row_scale` (fp16) por fila (o por bloque de filas) y mantener `codes` ±1.
+  - Esto mejora magnitud con overhead mínimo (≈2 bytes por fila).
+
 **4.2 Runtime (inferencia)**
 Dos rutas:
 1. **Sin reconstruir W:**  
    - Para input `x`, computa proyecciones base `p_j = dot(D[:,j], x)` para todos `j=1..M`.  
    - Para cada fila `r`: `y_r = Σ_{(j,s)∈code(r)} s · p_j`.  
    - Complejidad ≈ `O(M·d + k·rows)` (si `M ≪ rows`, ahorro grande).
+   - (futuro) **reuso de `p`**: si `ffn_gate` y `ffn_up` comparten diccionario `D`, se calcula `p = Dᵀx` una vez y se usa para ambos (ahorro directo).
 2. **Reconstrucción bajo demanda + cache:**  
    - Reconstruye bloques `ŵ_block` solo cuando se usan, con LRU en RAM.  
    - Útil si además hay sparsidad KWTA/event‑driven que evita usar todos los bloques.
@@ -120,20 +183,27 @@ for row in 0..R-1:
   - Memoria de pesos ↓ ≥30–50% vs Q5_K_M (misma capa objetivo),
   - Speedup CPU ≥10–20% en prompt+gen,
   - Δppl ≤2% (o menos con scheme=fp16).
+  - Para Devstral en 32 GB: reportar también **KV cache RAM** (según `-ctk/-ctv` y `ctx`), porque puede dominar el total.
 
 ### 7) Roadmap
-- Estado actual: backend runtime + tool `llama-statecells-build` (sign‑scheme) ya implementados; falta kernel CPU rápido, scheme fp16/vals y gap per‑layer.
-1. Tool offline `statecells-build` (leer GGUF, entrenar D, emitir codes).  
-2. Formato GGUF extendido + loader en llama.cpp.  
-3. Kernel runtime “sin reconstrucción” para MLP primero.  
-4. Integración con KWTA/event‑driven para explotar que no todas las filas/bloques se usan.  
-5. Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5.
+1. ✅ Tool offline `llama-statecells-build` (leer GGUF, entrenar D, emitir `*.dict/*.codes`, escribir GGUF).  
+2. ✅ Formato GGUF extendido + loader/hook runtime opt‑in en llama.cpp (`--statecells`).  
+3. ✅ Kernel runtime rápido “sin reconstrucción” (precompute `p = Dᵀx`, sumar `k` coeficientes por salida).  
+4. ⏳ Schedule por matriz (`M/k` por `gate/up/down`) + reporte de memoria por tensor (Devstral: `down` con `M` bajo).  
+5. ⏳ Scheme `sign+row_scale` (barato) y luego `fp16` (`*.vals`) + metadatos `statecells.scheme/version`.  
+6. ⏳ Builder data‑aware (`||W X − Ŵ X||`) con calibration set + auto‑tune por capa/tensor.  
+7. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
+8. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
+9. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
 
 ### 8) Riesgos/mitigación
 - **M demasiado grande** → no hay ahorro: auto‑tune M por capa (target M≈rows/8).  
 - **k muy bajo** → sube ppl: empezar con k=16–32 y bajar gradualmente.  
 - **Costo p_j** puede dominar: vectorizar dot(D,x) y reusar para varias proyecciones en la capa.  
 - **No todas las capas separables**: permitir fallback per‑layer con `gap_tol`.
+- **Tool offline lento** en pesos grandes: limitar `--dict-max-samples`, restringir `--layers`, y preferir correr el builder en Ubuntu real con suficiente RAM (evitar swap/WSL).
+- **Sign‑only puede ser muy restrictivo**: priorizar `row_scale` o `vals` antes de aumentar `M` sin control.
+- **KV cache domina en ctx largo**: mitigar con `-ctk/-ctv` y medir el total (weights+KV) para no optimizar “la mitad equivocada”.
 
 ### Compatibilidad e interacciones
 - **Backend de pesos exclusivo por capa:** no combinar StateCells con ternario/TT/proc‑sparse en la misma matriz en primera iteración.  
@@ -145,3 +215,12 @@ for row in 0..R-1:
 - `gguf: add dict/codes tensor types + metadata`  
 - `kernels: add statecells matvec path (mlp)`  
 - `runtime: flags + gap fallback + metrics`
+
+---
+
+## 10) Research/prior art (para “hacerlo bien”)
+- Esto cae en la familia **Sparse Dictionary Learning / Sparse Coding** (K‑SVD/OMP) y variantes recientes para LLMs.
+- Dos ideas “robables” que encajan perfecto aquí:
+  - **Calibración funcional (CoSpaDi‑style):** optimizar `||W X − Ŵ X||` con activaciones reales para preservar PPL/QA.
+  - **Kernels tipo codebook (AQLM‑style):** el valor no está solo en el formato; está en el **micro‑kernel cache‑friendly** (y en decidir `M/k` por tensor).
+- Conclusión: la integración actual es la base correcta; para ganar contra Q‑quants en serio, el siguiente salto es **data‑aware builder + coeficientes baratos (row_scale) + schedule por tensor**.

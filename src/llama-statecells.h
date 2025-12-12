@@ -9,8 +9,8 @@ struct ggml_tensor;
 // For now we support FFN matrices only; dict/codes are expected to be present in GGUF.
 
 struct llama_statecells_weight {
-    const ggml_tensor * dict  = nullptr; // [n_in, M], F16/F32
-    const ggml_tensor * codes = nullptr; // [k, n_out], I16 signed atom indices
+    ggml_tensor * dict  = nullptr; // [n_in, M], F16/F32
+    ggml_tensor * codes = nullptr; // [k, n_out], I16 signed atom indices
 };
 
 struct llama_statecells_context {
@@ -30,6 +30,5 @@ struct llama_statecells_context {
 ggml_tensor * llama_statecells_mul_mat(
         ggml_context * ctx,
         ggml_tensor  * x,
-        const ggml_tensor * dict,
-        const ggml_tensor * codes);
-
+        ggml_tensor * dict,
+        ggml_tensor * codes);
