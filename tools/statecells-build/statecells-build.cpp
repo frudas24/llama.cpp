@@ -710,6 +710,8 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
     }
 
+    const int64_t t0_total = ggml_time_us();
+
     if (!report_json.empty() && eval_cols <= 0) {
         eval_cols = 64;
     }
@@ -1043,6 +1045,11 @@ int main(int argc, char ** argv) {
     ggml_free(ctx_data);
     gguf_free(dst);
     gguf_free(src);
+
+    {
+        const double sec = double(ggml_time_us() - t0_total) / 1e6;
+        fprintf(stderr, "statecells-build: done in %.1fs\n", sec);
+    }
 
     return 0;
 }
