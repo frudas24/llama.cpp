@@ -270,10 +270,13 @@ struct llama_layer {
     // StateCells sparse-dictionary weights (optional, GGUF-provided)
     struct ggml_tensor * ffn_gate_dict  = nullptr;
     struct ggml_tensor * ffn_gate_codes = nullptr; // I16 signed atom indices, shape [k, n_ff]
+    struct ggml_tensor * ffn_gate_row_scale = nullptr; // optional, shape [n_ff]
     struct ggml_tensor * ffn_up_dict    = nullptr;
     struct ggml_tensor * ffn_up_codes   = nullptr; // I16 signed atom indices, shape [k, n_ff]
+    struct ggml_tensor * ffn_up_row_scale = nullptr; // optional, shape [n_ff]
     struct ggml_tensor * ffn_down_dict  = nullptr;
     struct ggml_tensor * ffn_down_codes = nullptr; // I16 signed atom indices, shape [k, n_embd]
+    struct ggml_tensor * ffn_down_row_scale = nullptr; // optional, shape [n_embd]
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp    = nullptr;

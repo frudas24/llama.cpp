@@ -144,13 +144,13 @@ llama_context::llama_context(
             const auto & layer = model.layers[il];
 
             if (layer.ffn_gate && layer.ffn_gate_dict && layer.ffn_gate_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_gate, llama_statecells_weight{ layer.ffn_gate_dict, layer.ffn_gate_codes });
+                statecells_ctx.weights.emplace(layer.ffn_gate, llama_statecells_weight{ layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale });
             }
             if (layer.ffn_up && layer.ffn_up_dict && layer.ffn_up_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_up, llama_statecells_weight{ layer.ffn_up_dict, layer.ffn_up_codes });
+                statecells_ctx.weights.emplace(layer.ffn_up, llama_statecells_weight{ layer.ffn_up_dict, layer.ffn_up_codes, layer.ffn_up_row_scale });
             }
             if (layer.ffn_down && layer.ffn_down_dict && layer.ffn_down_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_down, llama_statecells_weight{ layer.ffn_down_dict, layer.ffn_down_codes });
+                statecells_ctx.weights.emplace(layer.ffn_down, llama_statecells_weight{ layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale });
             }
         }
 

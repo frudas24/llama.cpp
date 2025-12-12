@@ -2655,7 +2655,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                             // Optional StateCells sparse-dictionary tensors, if present in GGUF.
                             // These must be created to keep tensor counts consistent when using extended GGUFs.
-                            auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                            auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes, ggml_tensor *& row_scale) {
                                 const auto tn_dict = tn(t, "dict", i);
                                 if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
                                     dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -2665,10 +2665,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
                                     codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
                                 }
+
+                                const auto tn_row_scale = tn(t, "row_scale", i);
+                                if (auto * meta_row_scale = ml.get_tensor_meta(tn_row_scale.str().c_str())) {
+                                    row_scale = create_tensor(tn_row_scale, { meta_row_scale->ne[0], meta_row_scale->ne[1], meta_row_scale->ne[2], meta_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
                             };
-                            try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
-                            try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
-                            try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+                            try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale);
+                            try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_row_scale);
+                            try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale);
 
                             // optional MLP bias
                             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
@@ -3902,7 +3907,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // Optional StateCells sparse-dictionary tensors, if present in GGUF.
                         // These must be created to keep tensor counts consistent when using extended GGUFs.
-                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes, ggml_tensor *& row_scale) {
                             const auto tn_dict = tn(t, "dict", i);
                             if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
                                 dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -3912,10 +3917,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
                                 codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_row_scale = tn(t, "row_scale", i);
+                            if (auto * meta_row_scale = ml.get_tensor_meta(tn_row_scale.str().c_str())) {
+                                row_scale = create_tensor(tn_row_scale, { meta_row_scale->ne[0], meta_row_scale->ne[1], meta_row_scale->ne[2], meta_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
-                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
-                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale);
                     }
                 } break;
             case LLM_ARCH_GEMMA2:
@@ -3944,7 +3954,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // Optional StateCells sparse-dictionary tensors, if present in GGUF.
                         // These must be created to keep tensor counts consistent when using extended GGUFs.
-                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes, ggml_tensor *& row_scale) {
                             const auto tn_dict = tn(t, "dict", i);
                             if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
                                 dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -3954,10 +3964,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
                                 codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_row_scale = tn(t, "row_scale", i);
+                            if (auto * meta_row_scale = ml.get_tensor_meta(tn_row_scale.str().c_str())) {
+                                row_scale = create_tensor(tn_row_scale, { meta_row_scale->ne[0], meta_row_scale->ne[1], meta_row_scale->ne[2], meta_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
-                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
-                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
                     }
                 } break;
@@ -4001,7 +4016,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // Optional StateCells sparse-dictionary tensors, if present in GGUF.
                         // These must be created to keep tensor counts consistent when using extended GGUFs.
-                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes, ggml_tensor *& row_scale) {
                             const auto tn_dict = tn(t, "dict", i);
                             if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
                                 dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -4011,10 +4026,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
                                 codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_row_scale = tn(t, "row_scale", i);
+                            if (auto * meta_row_scale = ml.get_tensor_meta(tn_row_scale.str().c_str())) {
+                                row_scale = create_tensor(tn_row_scale, { meta_row_scale->ne[0], meta_row_scale->ne[1], meta_row_scale->ne[2], meta_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
-                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
-                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
                     }
                 } break;
@@ -4061,7 +4081,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // Optional StateCells sparse-dictionary tensors, if present in GGUF.
                         // These must be created to keep tensor counts consistent when using extended GGUFs.
-                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes) {
+                        auto try_statecells = [&](llm_tensor t, ggml_tensor *& dict, ggml_tensor *& codes, ggml_tensor *& row_scale) {
                             const auto tn_dict = tn(t, "dict", i);
                             if (auto * meta_dict = ml.get_tensor_meta(tn_dict.str().c_str())) {
                                 dict = create_tensor(tn_dict, { meta_dict->ne[0], meta_dict->ne[1], meta_dict->ne[2], meta_dict->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -4071,10 +4091,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_codes = ml.get_tensor_meta(tn_codes.str().c_str())) {
                                 codes = create_tensor(tn_codes, { meta_codes->ne[0], meta_codes->ne[1], meta_codes->ne[2], meta_codes->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_row_scale = tn(t, "row_scale", i);
+                            if (auto * meta_row_scale = ml.get_tensor_meta(tn_row_scale.str().c_str())) {
+                                row_scale = create_tensor(tn_row_scale, { meta_row_scale->ne[0], meta_row_scale->ne[1], meta_row_scale->ne[2], meta_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes);
-                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes);
-                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes);
+                        try_statecells(LLM_TENSOR_FFN_GATE, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_row_scale);
+                        try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
 
                         // altup & laurel
