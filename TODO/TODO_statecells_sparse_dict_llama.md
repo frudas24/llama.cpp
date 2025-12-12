@@ -22,15 +22,16 @@
 ## Estado actual (✅ implementado en este repo)
 - **Runtime (llama-cli/server):**
   - Flags: `--statecells` y `--statecells-gap` (global).
-  - Loader opcional de `blk.N.ffn_{gate,up,down}.{dict,codes}` desde GGUF.
+  - Loader opcional de `blk.N.ffn_{gate,up,down}.{dict,codes,vals,row_scale}` desde GGUF.
   - Hook en grafo: intercepta matmuls de FFN vía `build_lora_mm`.
-  - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes` (+ `row_scale` opcional).
+  - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes` (+ `vals` y/o `row_scale` opcionales).
 - **Offline:**
   - Tool `llama-statecells-build` genera `*.dict` + `*.codes` (+ `*.row_scale`) y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
   - Encoding acelerado (✅): calcula `Y = Dᵀ·Wblk` en bloques (`B=64`) usando `ggml_mul_mat` + threadpool CPU (reusa threads; evita “1 dot por columna”).
+  - Coeficientes por code `*.vals` (✅ opcional): `--vals` genera `blk.N.*.vals` (fp16) para mejorar calidad.
   - Iteración rápida: `--resume` (reanuda sobre `-o` existente), `--checkpoint-every N` (checkpoint por capas), `--eval-cols/--report-json` (gap report).
 - **Pendiente inmediato (para “velocidad de la luz”):**
-  - Soporte `*.vals` (scheme fp16), gating offline por capa/tensor (sin fallback caliente), data‑aware builder (calibración) y kernels más vectorizados.
+  - Calibración data‑aware (minimizar `||W X − Ŵ X||`), gating offline por capa/tensor (sin fallback caliente) y kernels más vectorizados.
 
 ---
 
@@ -73,6 +74,7 @@
     - `--dict-k-gate`, `--dict-k-up`, `--dict-k-down` overrides por matriz.
     - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
     - `-t, --threads N` threads CPU para encoding/row_scale (el encoding usa `ggml_mul_mat` en bloques, no 1 dot por columna).
+    - `--vals` / `--no-vals` escribe `..._vals` (coeficientes fp16 por code).
     - `--resume` reanuda sobre un `-o` ya creado (salta pesos con `dict+codes`).
     - `--checkpoint-every N` escribe `-o` cada N capas (I/O grande; útil para no perder progreso).
     - `--row-scale` / `--no-row-scale` emite `..._row_scale` (fp16) por salida (default: on).
@@ -83,7 +85,8 @@
   - Esquemas:
     - `sign` (actual): coeficiente implícito ±1 dentro de `codes` I16.
     - `sign+row_scale` (✅ implementado): `codes` ±1 + escala por salida (`..._row_scale` fp16) para recuperar magnitud “casi gratis”.
-    - `fp16` (futuro): tensor adicional `..._vals` con coeficientes fp16 (más calidad, más RAM).
+    - `sign+vals` (✅ implementado, opcional): tensor adicional `..._vals` con coeficientes fp16 por code (más calidad, más RAM).
+    - `fp16` (futuro): vals fp16 “full” + calibración data‑aware (CoSpaDi‑style).
 - Runtime:
   - `--statecells` habilita backend si el GGUF trae dict/codes.
   - `--statecells-gap 0.02` tolerancia de fallback (por ahora global).
@@ -103,7 +106,7 @@
      - `blk.N.ffn_up.codes`   `[k, n_ff]`   tipo I16  
      - `blk.N.ffn_down.dict`  `[n_ff,  M]`  tipo F16/F32  
      - `blk.N.ffn_down.codes` `[k, n_embd]` tipo I16  
-     - (opcional futuro) `blk.N.*.vals` `[k, d_out]` fp16 para esquema `fp16`.
+     - (✅ opcional) `blk.N.*.vals` `[k, d_out]` fp16 para esquema `sign+vals`.
 
   **Interpretación codes (sign‑scheme):**
   - `codes[t, r] = ±(atom+1)` con `atom∈[0,M)`; `0` = slot vacío.
@@ -252,6 +255,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --dict-k 32 \
   --dict-iters 2 \
   --dict-max-samples 2048 \
+  --vals \
   --row-scale \
   --eval-cols 64 \
   --report-json /tmp/devstral_sc_6-8.json \
@@ -268,6 +272,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --dict-k 32 \
   --dict-iters 2 \
   --dict-max-samples 2048 \
+  --vals \
   --row-scale \
   --eval-cols 64 \
   --report-json /tmp/devstral_sc_6-25.json \
@@ -290,6 +295,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --layers 26-39 \
   --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
   --dict-k 32 --dict-iters 2 \
+  --vals \
   --row-scale \
   --eval-cols 64 --report-json /tmp/devstral_sc_26-39.json \
   --checkpoint-every 1
