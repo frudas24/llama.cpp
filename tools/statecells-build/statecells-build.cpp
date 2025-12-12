@@ -36,6 +36,8 @@ static void usage(const char * argv0) {
     printf("  -t, --threads N      worker threads for encoding (default: nproc)\n");
     printf("  --layers A-B         restrict to layer range (default: all)\n");
     printf("  --dict-type f16|f32  output dict type (default: f16)\n");
+    printf("  --vals               write per-code fp16 coefficient tensor (default: off)\n");
+    printf("  --no-vals            disable vals tensor output\n");
     printf("  --row-scale          write per-output row_scale tensor (default: on)\n");
     printf("  --no-row-scale       disable row_scale tensor output\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
@@ -155,6 +157,70 @@ static void read_mat_f16_f32_to_f32(const ggml_tensor * A, std::vector<float> & 
     }
 }
 
+static void read_mat_f16_f32_to_fp16(const ggml_tensor * A, std::vector<ggml_fp16_t> & out) {
+    GGML_ASSERT(A != nullptr);
+    GGML_ASSERT(ggml_n_dims(A) == 2);
+    GGML_ASSERT(A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32);
+
+    const int64_t n0 = A->ne[0];
+    const int64_t n1 = A->ne[1];
+
+    out.resize((size_t) n0 * (size_t) n1);
+
+    if (ggml_is_contiguous(A)) {
+        if (A->type == GGML_TYPE_F16) {
+            std::memcpy(out.data(), A->data, (size_t) n0 * (size_t) n1 * sizeof(ggml_fp16_t));
+            return;
+        }
+
+        const float * src = (const float *) A->data;
+        for (int64_t j = 0; j < n1; ++j) {
+            ggml_fp32_to_fp16_row(src + j * n0, out.data() + j * n0, n0);
+        }
+        return;
+    }
+
+    const uint8_t * base = (const uint8_t *) A->data;
+    for (int64_t j = 0; j < n1; ++j) {
+        for (int64_t i = 0; i < n0; ++i) {
+            const uint8_t * p = base + i * A->nb[0] + j * A->nb[1];
+            const float v = A->type == GGML_TYPE_F16 ?
+                    ggml_fp16_to_fp32(*(const ggml_fp16_t *) p) :
+                    *(const float *) p;
+            out[(size_t) j * (size_t) n0 + (size_t) i] = ggml_fp32_to_fp16(v);
+        }
+    }
+}
+
+static void read_vec_f16_f32_to_fp16(const ggml_tensor * A, std::vector<ggml_fp16_t> & out) {
+    GGML_ASSERT(A != nullptr);
+    GGML_ASSERT(ggml_n_dims(A) == 1);
+    GGML_ASSERT(A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32);
+
+    const int64_t n = A->ne[0];
+    out.resize((size_t) n);
+
+    if (ggml_is_contiguous(A)) {
+        if (A->type == GGML_TYPE_F16) {
+            std::memcpy(out.data(), A->data, (size_t) n * sizeof(ggml_fp16_t));
+            return;
+        }
+
+        const float * src = (const float *) A->data;
+        ggml_fp32_to_fp16_row(src, out.data(), n);
+        return;
+    }
+
+    const uint8_t * base = (const uint8_t *) A->data;
+    for (int64_t i = 0; i < n; ++i) {
+        const uint8_t * p = base + i * A->nb[0];
+        const float v = A->type == GGML_TYPE_F16 ?
+                ggml_fp16_to_fp32(*(const ggml_fp16_t *) p) :
+                *(const float *) p;
+        out[(size_t) i] = ggml_fp32_to_fp16(v);
+    }
+}
+
 static void train_dict_oja_kwta(
         const ggml_tensor * W,
         int64_t M,
@@ -238,6 +304,7 @@ static void encode_codes_sign(
         int k,
         int n_threads,
         std::vector<int16_t> & codes_out,
+        std::vector<ggml_fp16_t> * vals_out,
         const std::string & tag) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
@@ -255,6 +322,9 @@ static void encode_codes_sign(
     GGML_ASSERT(M <= 32767);
 
     codes_out.assign((size_t) k * (size_t) n_out, 0);
+    if (vals_out) {
+        vals_out->assign((size_t) k * (size_t) n_out, ggml_fp32_to_fp16(0.0f));
+    }
 
     // Encode with a blocked GEMM: Y = D^T * Wblk, Y: [M, B]
     // This reuses D across B columns (huge speedup vs per-column dot loops).
@@ -344,6 +414,16 @@ static void encode_codes_sign(
                 const float yj = y_col[j];
                 const int sign = yj >= 0 ? 1 : -1;
                 codes_out[(size_t) ti + (size_t) col * (size_t) k] = (int16_t) (sign * (j + 1));
+                if (vals_out) {
+                    float v = std::fabs(yj);
+                    if (!std::isfinite(v) || v < 0.0f) {
+                        v = 0.0f;
+                    }
+                    if (v > 65504.0f) { // max finite fp16
+                        v = 65504.0f;
+                    }
+                    (*vals_out)[(size_t) ti + (size_t) col * (size_t) k] = ggml_fp32_to_fp16(v);
+                }
             }
         }
 
@@ -365,12 +445,152 @@ static void encode_codes_sign(
     ggml_free(ctx);
 }
 
+static void compute_vals_sign(
+        const ggml_tensor * W,
+        const std::vector<float> & D,
+        int64_t M,
+        int k,
+        const std::vector<int16_t> & codes,
+        int n_threads,
+        std::vector<ggml_fp16_t> & vals_out,
+        const std::string & tag) {
+    const int64_t n_in  = W->ne[0];
+    const int64_t n_out = W->ne[1];
+
+    GGML_ASSERT((int64_t) D.size() == n_in * M);
+    GGML_ASSERT((int64_t) codes.size() == (int64_t) k * n_out);
+    GGML_ASSERT(M > 0);
+
+    k = std::min<int>(k, (int) M);
+    if (k <= 0 || n_out <= 0) {
+        vals_out.clear();
+        return;
+    }
+
+    // codes store ±(atom+1) in int16.
+    GGML_ASSERT(M <= 32767);
+
+    vals_out.assign((size_t) k * (size_t) n_out, ggml_fp32_to_fp16(0.0f));
+
+    n_threads = std::max(1, n_threads);
+    n_threads = std::min<int>(n_threads, (int) std::max<int64_t>(1, n_out));
+
+    const int64_t t0 = ggml_time_us();
+    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+
+    const int64_t B = std::min<int64_t>(64, n_out);
+
+    const size_t size_dict = (size_t) n_in * (size_t) M * sizeof(float);
+    const size_t size_wblk = (size_t) n_in * (size_t) B * sizeof(float);
+    const size_t size_y    = (size_t) M    * (size_t) B * sizeof(float);
+
+    const size_t mem_size =
+            ggml_tensor_overhead() * 16 +
+            ggml_graph_overhead_custom(256, /*grads*/ false) +
+            size_dict + size_wblk + size_y +
+            1024*1024;
+
+    ggml_init_params params = { mem_size, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * t_dict = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, M);
+    ggml_tensor * t_wblk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, B);
+
+    std::memcpy(t_dict->data, D.data(), size_dict);
+
+    ggml_tensor * t_y = ggml_mul_mat(ctx, t_dict, t_wblk);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, t_y);
+
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+    ggml_threadpool * threadpool = ggml_threadpool_new(&tpp);
+    GGML_ASSERT(threadpool != nullptr);
+
+    ggml_cplan plan = ggml_graph_plan(gf, n_threads, threadpool);
+    std::vector<uint8_t> work_buffer;
+    if (plan.work_size > 0) {
+        work_buffer.resize(plan.work_size);
+        plan.work_data = work_buffer.data();
+    }
+
+    auto * wblk_data = (float *) t_wblk->data;
+    const auto * y_data = (const float *) t_y->data;
+
+    std::vector<float> w;
+
+    int64_t last_print = 0;
+    for (int64_t col0 = 0; col0 < n_out; col0 += B) {
+        const int64_t nb = std::min<int64_t>(B, n_out - col0);
+
+        for (int64_t b = 0; b < nb; ++b) {
+            read_column_f32(W, col0 + b, w);
+            std::memcpy(wblk_data + b * n_in, w.data(), (size_t) n_in * sizeof(float));
+        }
+        for (int64_t b = nb; b < B; ++b) {
+            std::memset(wblk_data + b * n_in, 0, (size_t) n_in * sizeof(float));
+        }
+
+        const enum ggml_status st = ggml_graph_compute(gf, &plan);
+        GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t col = col0 + b;
+            const float * y_col = y_data + b * M;
+
+            const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+            ggml_fp16_t * vals_col = vals_out.data() + (size_t) col * (size_t) k;
+
+            for (int ti = 0; ti < k; ++ti) {
+                const int16_t code = codes_col[ti];
+                if (code == 0) {
+                    vals_col[ti] = ggml_fp32_to_fp16(0.0f);
+                    continue;
+                }
+
+                const int64_t atom = (int64_t) std::abs(code) - 1;
+                if (atom < 0 || atom >= M) {
+                    vals_col[ti] = ggml_fp32_to_fp16(0.0f);
+                    continue;
+                }
+
+                float v = std::fabs(y_col[atom]);
+                if (!std::isfinite(v) || v < 0.0f) {
+                    v = 0.0f;
+                }
+                if (v > 65504.0f) { // max finite fp16
+                    v = 65504.0f;
+                }
+                vals_col[ti] = ggml_fp32_to_fp16(v);
+            }
+        }
+
+        const int64_t done = std::min<int64_t>(col0 + nb, n_out);
+        if (done >= last_print + progress_every || done == n_out) {
+            last_print = done;
+            const double pct = 100.0 * double(done) / double(n_out);
+            const double sec = double(ggml_time_us() - t0) / 1e6;
+            fprintf(stderr, "\r  [%s] computing vals %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs (%d thr, B=%" PRId64 ")",
+                    tag.c_str(), done, n_out, pct, sec, n_threads, B);
+            fflush(stderr);
+            if (done == n_out) {
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
+    ggml_threadpool_free(threadpool);
+    ggml_free(ctx);
+}
+
 static void compute_row_scale_sign(
         const ggml_tensor * W,
         const std::vector<float> & D,
         int64_t M,
         int k,
         const std::vector<int16_t> & codes,
+        const std::vector<ggml_fp16_t> * vals,
         int n_threads,
         std::vector<ggml_fp16_t> & row_scale_out,
         const std::string & tag) {
@@ -378,6 +598,7 @@ static void compute_row_scale_sign(
     const int64_t n_out = W->ne[1];
 
     GGML_ASSERT((int64_t) codes.size() == (int64_t) k * n_out);
+    GGML_ASSERT(!vals || (int64_t) vals->size() == (int64_t) k * n_out);
     row_scale_out.assign((size_t) n_out, ggml_fp32_to_fp16(1.0f));
 
     n_threads = std::max(1, n_threads);
@@ -396,6 +617,7 @@ static void compute_row_scale_sign(
             std::fill(w_hat.begin(), w_hat.end(), 0.0f);
 
             const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+            const ggml_fp16_t * vals_col = vals ? (vals->data() + (size_t) col * (size_t) k) : nullptr;
             for (int ti = 0; ti < k; ++ti) {
                 const int16_t code = codes_col[ti];
                 if (code == 0) {
@@ -403,6 +625,7 @@ static void compute_row_scale_sign(
                 }
 
                 const float sign = code > 0 ? 1.0f : -1.0f;
+                const float coef = vals_col ? ggml_fp16_to_fp32(vals_col[ti]) : 1.0f;
                 const int64_t atom = (int64_t) std::abs(code) - 1;
                 if (atom < 0 || atom >= M) {
                     continue;
@@ -410,7 +633,7 @@ static void compute_row_scale_sign(
 
                 const float * dcol = D.data() + atom * n_in;
                 for (int64_t i = 0; i < n_in; ++i) {
-                    w_hat[i] += sign * dcol[i];
+                    w_hat[i] += (sign * coef) * dcol[i];
                 }
             }
 
@@ -462,6 +685,7 @@ static void compute_row_scale_sign(
             std::fill(w_hat.begin(), w_hat.end(), 0.0f);
 
             const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+            const ggml_fp16_t * vals_col = vals ? (vals->data() + (size_t) col * (size_t) k) : nullptr;
             for (int ti = 0; ti < k; ++ti) {
                 const int16_t code = codes_col[ti];
                 if (code == 0) {
@@ -469,6 +693,7 @@ static void compute_row_scale_sign(
                 }
 
                 const float sign = code > 0 ? 1.0f : -1.0f;
+                const float coef = vals_col ? ggml_fp16_to_fp32(vals_col[ti]) : 1.0f;
                 const int64_t atom = (int64_t) std::abs(code) - 1;
                 if (atom < 0 || atom >= M) {
                     continue;
@@ -476,7 +701,7 @@ static void compute_row_scale_sign(
 
                 const float * dcol = D.data() + atom * n_in;
                 for (int64_t i = 0; i < n_in; ++i) {
-                    w_hat[i] += sign * dcol[i];
+                    w_hat[i] += (sign * coef) * dcol[i];
                 }
             }
 
@@ -551,6 +776,7 @@ static eval_metrics eval_reconstruction_sign(
         int64_t M,
         int k,
         const std::vector<int16_t> & codes,
+        const std::vector<ggml_fp16_t> * vals,
         const std::vector<ggml_fp16_t> * row_scale,
         int64_t eval_cols,
         std::mt19937 & rng) {
@@ -585,6 +811,7 @@ static eval_metrics eval_reconstruction_sign(
         std::fill(w_hat.begin(), w_hat.end(), 0.0f);
 
         const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+        const ggml_fp16_t * vals_col = vals ? (vals->data() + (size_t) col * (size_t) k) : nullptr;
         for (int ti = 0; ti < k; ++ti) {
             const int16_t code = codes_col[ti];
             if (code == 0) {
@@ -592,6 +819,7 @@ static eval_metrics eval_reconstruction_sign(
             }
 
             const float sign = code > 0 ? 1.0f : -1.0f;
+            const float coef = vals_col ? ggml_fp16_to_fp32(vals_col[ti]) : 1.0f;
             const int64_t atom = (int64_t) std::abs(code) - 1;
             if (atom < 0 || atom >= M) {
                 continue;
@@ -599,7 +827,7 @@ static eval_metrics eval_reconstruction_sign(
 
             const float * dcol = D.data() + atom * n_in;
             for (int64_t i = 0; i < n_in; ++i) {
-                w_hat[i] += sign * dcol[i];
+                w_hat[i] += (sign * coef) * dcol[i];
             }
         }
 
@@ -667,6 +895,7 @@ int main(int argc, char ** argv) {
     int n_threads = (int) std::max(1u, std::thread::hardware_concurrency());
     std::string layers_range;
     std::string dict_type_str = "f16";
+    bool write_vals = false;
     bool write_row_scale = true;
     int64_t eval_cols = 0;
     std::string report_json;
@@ -692,6 +921,8 @@ int main(int argc, char ** argv) {
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--layers" && i + 1 < argc) { layers_range = argv[++i]; continue; }
         if (arg == "--dict-type" && i + 1 < argc) { dict_type_str = argv[++i]; continue; }
+        if (arg == "--vals") { write_vals = true; continue; }
+        if (arg == "--no-vals") { write_vals = false; continue; }
         if (arg == "--row-scale") { write_row_scale = true; continue; }
         if (arg == "--no-row-scale") { write_row_scale = false; continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
@@ -823,20 +1054,23 @@ int main(int argc, char ** argv) {
 
             const std::string dict_name  = "blk." + std::to_string(il) + "." + kind + ".dict";
             const std::string codes_name = "blk." + std::to_string(il) + "." + kind + ".codes";
+            const std::string vals_name  = "blk." + std::to_string(il) + "." + kind + ".vals";
             const std::string row_scale_name = "blk." + std::to_string(il) + "." + kind + ".row_scale";
 
             const bool have_dict  = gguf_find_tensor(src, dict_name.c_str())  != -1;
             const bool have_codes = gguf_find_tensor(src, codes_name.c_str()) != -1;
+            const bool have_vals  = gguf_find_tensor(src, vals_name.c_str())  != -1;
             const bool have_row_scale = gguf_find_tensor(src, row_scale_name.c_str()) != -1;
-            if ((have_dict || have_codes || have_row_scale) && (have_dict != have_codes || (!have_dict && have_row_scale))) {
+            if ((have_dict || have_codes || have_vals || have_row_scale) && (have_dict != have_codes || (!have_dict && (have_vals || have_row_scale)))) {
                 fprintf(stderr, "statecells-build: inconsistent existing tensors for %s (dict=%d codes=%d row_scale=%d)\n",
                         weight_name.c_str(), (int) have_dict, (int) have_codes, (int) have_row_scale);
                 return 1;
             }
 
             const bool need_dict_codes = !(have_dict && have_codes);
+            const bool need_vals       = write_vals && !have_vals;
             const bool need_row_scale  = write_row_scale && !have_row_scale;
-            if (!need_dict_codes && !need_row_scale) {
+            if (!need_dict_codes && !need_vals && !need_row_scale) {
                 continue;
             }
 
@@ -857,6 +1091,7 @@ int main(int argc, char ** argv) {
             int k_eff = 0;
             std::vector<float> D;
             std::vector<int16_t> codes;
+            std::vector<ggml_fp16_t> vals;
 
             if (need_dict_codes) {
                 printf("statecells-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s M=%" PRId64 " k=%d\n",
@@ -867,7 +1102,7 @@ int main(int argc, char ** argv) {
                 M_eff = std::min<int64_t>(dict_M_cur, n_out);
                 k_eff = std::min<int>(dict_k_cur, (int) M_eff);
 
-                encode_codes_sign(W, D, M_eff, k_eff, n_threads, codes, tag);
+                encode_codes_sign(W, D, M_eff, k_eff, n_threads, codes, need_vals ? &vals : nullptr, tag);
             } else {
                 ggml_tensor * t_dict  = ggml_get_tensor(ctx_data, dict_name.c_str());
                 ggml_tensor * t_codes = ggml_get_tensor(ctx_data, codes_name.c_str());
@@ -891,23 +1126,68 @@ int main(int argc, char ** argv) {
                     return 1;
                 }
 
-                printf("statecells-build: layer %" PRId64 " %s add row_scale only (M=%" PRId64 " k=%d)\n",
-                       il, kind.c_str(), M_eff, k_eff);
+                std::string add_what;
+                if (need_vals) {
+                    add_what += " vals";
+                }
+                if (need_row_scale) {
+                    add_what += " row_scale";
+                }
+                printf("statecells-build: layer %" PRId64 " %s add%s only (M=%" PRId64 " k=%d)\n",
+                       il, kind.c_str(), add_what.c_str(), M_eff, k_eff);
 
                 read_mat_f16_f32_to_f32(t_dict, D);
                 codes.resize((size_t) k_eff * (size_t) n_out);
                 std::memcpy(codes.data(), t_codes->data, codes.size() * sizeof(int16_t));
+
+                if (need_vals) {
+                    compute_vals_sign(W, D, M_eff, k_eff, codes, n_threads, vals, tag);
+                } else if (have_vals && (need_row_scale || eval_cols > 0)) {
+                    ggml_tensor * t_vals = ggml_get_tensor(ctx_data, vals_name.c_str());
+                    if (!t_vals || ggml_n_dims(t_vals) != 2) {
+                        fprintf(stderr, "statecells-build: missing existing vals tensor for %s\n", weight_name.c_str());
+                        return 1;
+                    }
+                    if (t_vals->type != GGML_TYPE_F16 && t_vals->type != GGML_TYPE_F32) {
+                        fprintf(stderr, "statecells-build: invalid existing vals tensor type for %s\n", weight_name.c_str());
+                        return 1;
+                    }
+                    if (t_vals->ne[0] != k_eff || t_vals->ne[1] != n_out) {
+                        fprintf(stderr, "statecells-build: mismatched vals shape for %s (vals=[%" PRId64 "x%" PRId64 "] expected=[%dx%" PRId64 "])\n",
+                                weight_name.c_str(), (int64_t) t_vals->ne[0], (int64_t) t_vals->ne[1], k_eff, n_out);
+                        return 1;
+                    }
+
+                    read_mat_f16_f32_to_fp16(t_vals, vals);
+                }
             }
 
             std::vector<ggml_fp16_t> row_scale;
             if (need_row_scale) {
-                compute_row_scale_sign(W, D, M_eff, k_eff, codes, n_threads, row_scale, tag);
+                compute_row_scale_sign(W, D, M_eff, k_eff, codes, vals.empty() ? nullptr : &vals, n_threads, row_scale, tag);
+            } else if (have_row_scale && eval_cols > 0) {
+                ggml_tensor * t_rs = ggml_get_tensor(ctx_data, row_scale_name.c_str());
+                if (!t_rs || ggml_n_dims(t_rs) != 1) {
+                    fprintf(stderr, "statecells-build: missing existing row_scale tensor for %s\n", weight_name.c_str());
+                    return 1;
+                }
+                if (t_rs->type != GGML_TYPE_F16 && t_rs->type != GGML_TYPE_F32) {
+                    fprintf(stderr, "statecells-build: invalid existing row_scale tensor type for %s\n", weight_name.c_str());
+                    return 1;
+                }
+                if (t_rs->ne[0] != n_out) {
+                    fprintf(stderr, "statecells-build: mismatched row_scale shape for %s (row_scale=[%" PRId64 "] expected=[%" PRId64 "])\n",
+                            weight_name.c_str(), (int64_t) t_rs->ne[0], n_out);
+                    return 1;
+                }
+
+                read_vec_f16_f32_to_fp16(t_rs, row_scale);
             }
 
             eval_metrics em;
             if (eval_cols > 0) {
                 const int64_t t0 = ggml_time_us();
-                em = eval_reconstruction_sign(W, D, M_eff, k_eff, codes, need_row_scale ? &row_scale : nullptr, eval_cols, rng);
+                em = eval_reconstruction_sign(W, D, M_eff, k_eff, codes, vals.empty() ? nullptr : &vals, row_scale.empty() ? nullptr : &row_scale, eval_cols, rng);
                 const double sec = double(ggml_time_us() - t0) / 1e6;
                 fprintf(stderr, "  [%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f (%.1fs)\n",
                         tag.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, sec);
@@ -916,8 +1196,9 @@ int main(int argc, char ** argv) {
             // Allocate a dedicated ggml context for dict+codes to avoid a giant arena.
             const size_t size_dict  = need_dict_codes ? (size_t) n_in * (size_t) M_eff * ggml_type_size(dict_type) : 0;
             const size_t size_codes = need_dict_codes ? (size_t) k_eff * (size_t) n_out * sizeof(int16_t) : 0;
+            const size_t size_vals  = need_vals ? (size_t) k_eff * (size_t) n_out * sizeof(ggml_fp16_t) : 0;
             const size_t size_row_scale = need_row_scale ? (size_t) n_out * sizeof(ggml_fp16_t) : 0;
-            const size_t mem_size_sc = ggml_tensor_overhead() * 8 + size_dict + size_codes + size_row_scale;
+            const size_t mem_size_sc = ggml_tensor_overhead() * 8 + size_dict + size_codes + size_vals + size_row_scale;
             ggml_init_params sc_params = { mem_size_sc, nullptr, false };
             ggml_context * ctx_sc = ggml_init(sc_params);
             sc_contexts.push_back(ctx_sc);
@@ -944,6 +1225,14 @@ int main(int argc, char ** argv) {
                 gguf_add_tensor(dst, t_dict);
                 gguf_add_tensor(dst, t_codes);
                 n_added += 2;
+            }
+
+            if (need_vals) {
+                ggml_tensor * t_vals = ggml_new_tensor_2d(ctx_sc, GGML_TYPE_F16, k_eff, n_out);
+                ggml_set_name(t_vals, vals_name.c_str());
+                std::memcpy(t_vals->data, vals.data(), vals.size() * sizeof(ggml_fp16_t));
+                gguf_add_tensor(dst, t_vals);
+                n_added += 1;
             }
 
             if (need_row_scale) {
@@ -1005,6 +1294,7 @@ int main(int argc, char ** argv) {
             ofs << "  \"source\": "  << "\"" << src_fname << "\",\n";
             ofs << "  \"output\": "  << "\"" << out_fname << "\",\n";
             ofs << "  \"resume\": "  << (resume ? "true" : "false") << ",\n";
+            ofs << "  \"vals\": "    << (write_vals ? "true" : "false") << ",\n";
             ofs << "  \"row_scale\": " << (write_row_scale ? "true" : "false") << ",\n";
             ofs << "  \"dict\": {\n";
             ofs << "    \"M\": " << dict_M << ",\n";

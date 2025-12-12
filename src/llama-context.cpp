@@ -140,18 +140,52 @@ llama_context::llama_context(
     statecells_ctx.enabled = params.statecells;
     statecells_ctx.gap_tol = params.statecells_gap_tol;
     if (statecells_ctx.enabled) {
+        auto try_add_statecells = [&](ggml_tensor * w, ggml_tensor * dict, ggml_tensor * codes, ggml_tensor * vals, ggml_tensor * row_scale, const char * name) {
+            if (!w || !dict || !codes) {
+                return;
+            }
+
+            if (ggml_n_dims(dict) != 2 || ggml_n_dims(codes) != 2) {
+                LLAMA_LOG_WARN("%s: ignoring statecells %s due to invalid dims\n", __func__, name);
+                return;
+            }
+            if ((dict->type != GGML_TYPE_F16 && dict->type != GGML_TYPE_F32) || codes->type != GGML_TYPE_I16) {
+                LLAMA_LOG_WARN("%s: ignoring statecells %s due to invalid types\n", __func__, name);
+                return;
+            }
+            if (dict->ne[0] != w->ne[0] || codes->ne[1] != w->ne[1]) {
+                LLAMA_LOG_WARN("%s: ignoring statecells %s due to mismatched shapes\n", __func__, name);
+                return;
+            }
+
+            if (vals) {
+                if (ggml_n_dims(vals) != 2 ||
+                    (vals->type != GGML_TYPE_F16 && vals->type != GGML_TYPE_F32) ||
+                    vals->ne[0] != codes->ne[0] ||
+                    vals->ne[1] != codes->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring statecells %s vals due to invalid shape/type\n", __func__, name);
+                    vals = nullptr;
+                }
+            }
+
+            if (row_scale) {
+                if (ggml_n_dims(row_scale) != 1 ||
+                    (row_scale->type != GGML_TYPE_F16 && row_scale->type != GGML_TYPE_F32) ||
+                    row_scale->ne[0] != w->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring statecells %s row_scale due to invalid shape/type\n", __func__, name);
+                    row_scale = nullptr;
+                }
+            }
+
+            statecells_ctx.weights.emplace(w, llama_statecells_weight{ dict, codes, vals, row_scale });
+        };
+
         for (int il = 0; il < (int) hparams.n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            if (layer.ffn_gate && layer.ffn_gate_dict && layer.ffn_gate_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_gate, llama_statecells_weight{ layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_row_scale });
-            }
-            if (layer.ffn_up && layer.ffn_up_dict && layer.ffn_up_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_up, llama_statecells_weight{ layer.ffn_up_dict, layer.ffn_up_codes, layer.ffn_up_row_scale });
-            }
-            if (layer.ffn_down && layer.ffn_down_dict && layer.ffn_down_codes) {
-                statecells_ctx.weights.emplace(layer.ffn_down, llama_statecells_weight{ layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_row_scale });
-            }
+            try_add_statecells(layer.ffn_gate, layer.ffn_gate_dict, layer.ffn_gate_codes, layer.ffn_gate_vals, layer.ffn_gate_row_scale, "ffn_gate");
+            try_add_statecells(layer.ffn_up,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_vals,   layer.ffn_up_row_scale,   "ffn_up");
+            try_add_statecells(layer.ffn_down, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_vals, layer.ffn_down_row_scale, "ffn_down");
         }
 
         if (statecells_ctx.weights.empty()) {

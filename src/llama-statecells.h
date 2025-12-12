@@ -11,6 +11,7 @@ struct ggml_tensor;
 struct llama_statecells_weight {
     ggml_tensor * dict  = nullptr; // [n_in, M], F16/F32
     ggml_tensor * codes = nullptr; // [k, n_out], I16 signed atom indices
+    ggml_tensor * vals  = nullptr; // [k, n_out], F16/F32 (optional coefficients, typically abs(dot))
     ggml_tensor * row_scale = nullptr; // [n_out], F16/F32 (optional)
 };
 
@@ -33,4 +34,5 @@ ggml_tensor * llama_statecells_mul_mat(
         ggml_tensor  * x,
         ggml_tensor * dict,
         ggml_tensor * codes,
+        ggml_tensor * vals,
         ggml_tensor * row_scale);
