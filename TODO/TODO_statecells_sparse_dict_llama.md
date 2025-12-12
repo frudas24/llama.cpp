@@ -37,14 +37,17 @@
 
 ### 3) Config/flags
 - Offline:
-  - `--statecells-build` (herramienta nueva), `--dict-M=4096`, `--dict-k=16`, `--dict-eta=0.01`, `--dict-iters=3`, `--dict-block=64`.
-  - `--dict-scheme=sign|fp16` (coeficientes binarios o fp16).
+  - Tool `llama-statecells-build -i in.gguf -o out.gguf` con flags:
+    - `--dict-M` tamaño diccionario por peso (p.ej. 512–4096).
+    - `--dict-k` átomos activos por columna/fila (p.ej. 16–48).
+    - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
+  - Esquemas:
+    - `sign` (actual): coeficiente implícito ±1 dentro de `codes` I16.
+    - `fp16` (futuro): tensor adicional `..._vals` con coeficientes fp16.
 - Runtime:
-  - `--statecells=on|off`
-  - `--statecells-dict=path/to/dict.bin`
-  - `--statecells-codes=path/to/codes.bin`
-  - `--statecells-target=mlp|attn|both`
-  - `--statecells-gap-tol=0.02` (fallback automático).
+  - `--statecells` habilita backend si el GGUF trae dict/codes.
+  - `--statecells-gap 0.02` tolerancia de fallback (por ahora global).
+  - (futuro) flags per‑layer/target cuando extendamos más allá de FFN.
 
 ### 4) Integración
 **4.1 Offline (compresión)**
@@ -53,10 +56,23 @@
   2) entrena `D` por Oja (streaming sobre filas),
   3) codifica cada fila/bloque en SparseCode top‑k,
   4) escribe un GGUF nuevo con tensores:
-     - `dict.D` (fp16/ternario opcional),
-     - `codes.idx` (uint16/uint32),
-     - `codes.sign` (int8) o `codes.val` (fp16),
-     - metadatos `M,k,block,seed,version`.
+     - `blk.N.ffn_gate.dict`  `[n_embd, M]` tipo F16/F32  
+     - `blk.N.ffn_gate.codes` `[k, n_ff]`   tipo I16 con signo embebido  
+     - `blk.N.ffn_up.dict`    `[n_embd, M]` tipo F16/F32  
+     - `blk.N.ffn_up.codes`   `[k, n_ff]`   tipo I16  
+     - `blk.N.ffn_down.dict`  `[n_ff,  M]`  tipo F16/F32  
+     - `blk.N.ffn_down.codes` `[k, n_embd]` tipo I16  
+     - (opcional futuro) `blk.N.*.vals` `[k, d_out]` fp16 para esquema `fp16`.
+
+  **Interpretación codes (sign‑scheme):**
+  - `codes[t, r] = ±(atom+1)` con `atom∈[0,M)`; `0` = slot vacío.
+
+  **Metadatos GGUF (modelo):**
+  - `statecells.enabled` bool
+  - `statecells.dict.M`, `statecells.dict.k`, `statecells.dict.eta`, `statecells.dict.iters`
+  - (futuro) `statecells.scheme` (0 sign, 1 fp16), `statecells.version`, `statecells.default_gap_tol`.
+
+  **Nota de disco/RAM:** el GGUF resultante puede conservar pesos densos para compatibilidad; con `mmap` no deberían cargar en RAM si el runtime usa StateCells.
 
 **4.2 Runtime (inferencia)**
 Dos rutas:
@@ -106,6 +122,7 @@ for row in 0..R-1:
   - Δppl ≤2% (o menos con scheme=fp16).
 
 ### 7) Roadmap
+- Estado actual: backend runtime + tool `llama-statecells-build` (sign‑scheme) ya implementados; falta kernel CPU rápido, scheme fp16/vals y gap per‑layer.
 1. Tool offline `statecells-build` (leer GGUF, entrenar D, emitir codes).  
 2. Formato GGUF extendido + loader en llama.cpp.  
 3. Kernel runtime “sin reconstrucción” para MLP primero.  
