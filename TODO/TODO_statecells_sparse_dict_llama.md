@@ -24,12 +24,12 @@
   - Flags: `--statecells` y `--statecells-gap` (global).
   - Loader opcional de `blk.N.ffn_{gate,up,down}.{dict,codes}` desde GGUF.
   - Hook en grafo: intercepta matmuls de FFN vía `build_lora_mm`.
-  - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes`.
+  - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes` (+ `row_scale` opcional).
 - **Offline:**
-  - Tool `llama-statecells-build` genera `*.dict` + `*.codes` y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
+  - Tool `llama-statecells-build` genera `*.dict` + `*.codes` (+ `*.row_scale`) y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
   - Iteración rápida: `--resume` (reanuda sobre `-o` existente), `--checkpoint-every N` (checkpoint por capas), `--eval-cols/--report-json` (gap report).
 - **Pendiente inmediato (para “velocidad de la luz”):**
-  - Soporte `*.vals` (scheme fp16), gap/fallback per‑layer + métricas + kernels más vectorizados.
+  - Soporte `*.vals` (scheme fp16), gating offline por capa/tensor (sin fallback caliente), data‑aware builder (calibración) y kernels más vectorizados.
 
 ---
 
@@ -67,18 +67,20 @@
 - Offline:
   - Tool `llama-statecells-build -i in.gguf -o out.gguf` con flags:
     - `--dict-M` tamaño diccionario por peso (p.ej. 512–4096).
+    - `--dict-M-gate`, `--dict-M-up`, `--dict-M-down` overrides por matriz (Devstral: `down` con `M` bajo).
     - `--dict-k` átomos activos por columna/fila (p.ej. 16–48).
+    - `--dict-k-gate`, `--dict-k-up`, `--dict-k-down` overrides por matriz.
     - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
     - `--resume` reanuda sobre un `-o` ya creado (salta pesos con `dict+codes`).
     - `--checkpoint-every N` escribe `-o` cada N capas (I/O grande; útil para no perder progreso).
+    - `--row-scale` / `--no-row-scale` emite `..._row_scale` (fp16) por salida (default: on).
     - `--eval-cols N` calcula métricas de gap sobre N salidas por peso (sampling).
     - `--report-json FILE` exporta métricas por peso/capa a JSON.
-    - (futuro) `--dict-M-{gate,up,down}` y `--dict-k-{gate,up,down}` para **schedule por matriz** (clave en Devstral: `down` necesita `M` mucho menor).
-    - (futuro) `--scheme sign|sign+row_scale|fp16` para controlar coeficientes sin inflar RAM.
+    - (futuro) `--scheme sign|sign+row_scale|fp16` para controlar coeficientes de forma explícita.
     - (futuro) `--calib-*` para builder **data‑aware** (ver sección 4).
   - Esquemas:
     - `sign` (actual): coeficiente implícito ±1 dentro de `codes` I16.
-    - `sign+row_scale` (futuro recomendado): `codes` ±1 + escala por fila/bloque (`..._row_scale` fp16) para recuperar magnitud “casi gratis”.
+    - `sign+row_scale` (✅ implementado): `codes` ±1 + escala por salida (`..._row_scale` fp16) para recuperar magnitud “casi gratis”.
     - `fp16` (futuro): tensor adicional `..._vals` con coeficientes fp16 (más calidad, más RAM).
 - Runtime:
   - `--statecells` habilita backend si el GGUF trae dict/codes.
@@ -189,12 +191,13 @@ for row in 0..R-1:
 1. ✅ Tool offline `llama-statecells-build` (leer GGUF, entrenar D, emitir `*.dict/*.codes`, escribir GGUF).  
 2. ✅ Formato GGUF extendido + loader/hook runtime opt‑in en llama.cpp (`--statecells`).  
 3. ✅ Kernel runtime rápido “sin reconstrucción” (precompute `p = Dᵀx`, sumar `k` coeficientes por salida).  
-4. ⏳ Schedule por matriz (`M/k` por `gate/up/down`) + reporte de memoria por tensor (Devstral: `down` con `M` bajo).  
-5. ⏳ Scheme `sign+row_scale` (barato) y luego `fp16` (`*.vals`) + metadatos `statecells.scheme/version`.  
-6. ⏳ Builder data‑aware (`||W X − Ŵ X||`) con calibration set + auto‑tune por capa/tensor.  
-7. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
-8. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
-9. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
+4. ✅ Schedule por matriz (`M/k` por `gate/up/down`).  
+5. ✅ Scheme `sign+row_scale` (`...row_scale` fp16).  
+6. ⏳ Scheme `fp16` (`*.vals`) + metadatos `statecells.scheme/version`.  
+7. ⏳ Builder data‑aware (`||W X − Ŵ X||`) con calibration set + auto‑tune por capa/tensor.  
+8. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
+9. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
+10. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
 
 ### 8) Riesgos/mitigación
 - **M demasiado grande** → no hay ahorro: auto‑tune M por capa (target M≈rows/8).  
