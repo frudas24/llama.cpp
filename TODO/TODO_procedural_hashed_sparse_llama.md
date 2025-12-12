@@ -63,6 +63,11 @@ trim_small(delta_list[row], shed_eps, watermark)
 - Overhead de reconstrucción > ahorro: usar bloques fijos y vectorizar.  
 - Calidad: si fanout muy bajo, sube ppl; exponer fanout por capa.
 
+### Compatibilidad e interacciones
+- **Backend de pesos exclusivo por capa:** no combinar con ternario/TT/StateCells en la misma capa en primera iteración.  
+- Sinergia con `--kwta` y `--event-driven`: los bloques a reconstruir deben ser `bloques_proc ∩ máscara_kwta/event` para no pedir bloques inexistentes.  
+- En atención ventana (`--win-attn`), definir fanout por ventana/head para que el patrón procedural respete la estructura.
+
 ### 8) Commits sugeridos
 - `proc-sparse: hash base + delta builder (offline)`  
 - `proc-sparse: shedding + fanout masks`  

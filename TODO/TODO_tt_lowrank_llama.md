@@ -58,6 +58,11 @@ for core in cores:           // G ∈ R^{r_{k-1}×n_k×r_k}
 - Overhead si dims no factorizables bien: permitir disable per capa.  
 - Batch pequeño: agrupar tokens para amortizar contratos.
 
+### Compatibilidad e interacciones
+- **Backend de pesos exclusivo por capa:** no combinar TT con `--q2-ternary`, `--proc-sparse` o `--statecells` sobre la misma matriz (salvo futura compresión en cascada).  
+- Compatible con KWTA/Event‑driven/StatePack, pero estas máscaras solo aportan si el kernel TT expone bloques “skippeables”; de inicio aplicar gating solo a capas densas.  
+- Instrumentar contratos TT con Nan‑Guardian para fallback si aparece NaN/Inf.
+
 ### 8) Commits sugeridos
 - `tt: add tt-cross/maxvol builder + meta`  
 - `kernels: add tt matvec path (avx2/512) + fallback`  

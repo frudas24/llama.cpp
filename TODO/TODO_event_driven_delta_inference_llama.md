@@ -83,9 +83,14 @@ if step % gap_every == 0:
 - Drift de staleness: renormalizar pesos y limitar `age_max`.  
 - Calidad sensible a tareas: exponer knobs por capa; fallback frecuente al inicio.
 
+### Compatibilidad e interacciones
+- Si `--kwta` está activo, componer: KWTA selecciona candidatos y event‑driven aplica presupuesto/top‑K final dentro de esos candidatos (una sola ordenación).  
+- StatePack puede usarse como máscara previa de ceros antes de medir Δ; no ejecutar rutas approx popcount y event‑driven sobre el mismo score sin refine denso.  
+- En atención, no mezclar con `--win-attn`/`--sdr-target=attn_light` en la misma capa salvo que event‑driven opere a nivel de ventanas y SDR sea solo filtro top‑K.  
+- Para capas TT/StateCells sin bloques claros, event‑driven debe estar off o operar a nivel de capa completa.
+
 ### 8) Commits sugeridos
 - `event: add delta-norm + block cache infra`  
 - `mlp: event-driven topk blocks under budget`  
 - `attn: event-driven heads/windows under budget`  
 - `runtime: gap checker + metrics + auto-disable`
-

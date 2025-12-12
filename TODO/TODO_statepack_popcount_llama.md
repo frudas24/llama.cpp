@@ -64,6 +64,12 @@ score_approx = mix * gamma_q * gamma_k
 - Popcount vectorial no disponible: fallback podría ser más lento; proteger con CPU feature check.  
 - Escalado gamma pobre: cap gamma y usar EMA para evitar explosiones.
 
+### Compatibilidad e interacciones
+- Reutilizar un único builder de bitsets/popcount compartido con `TODO_sdr_sparse_llama.md` para no pagar el coste dos veces.  
+- Compatible con cualquier backend de pesos (denso, ternario, TT, procedural, statecells); actúa como **máscara de activación**.  
+- Si además está activo `--kwta` o `--event-driven`, componer máscaras como: `mask_final = mask_structural ∩ mask_kwta/event ∩ mask_statepack` (StatePack solo elimina ceros, no decide top‑K).  
+- No activar simultáneamente `score_approx` de StatePack y SDR en la **misma capa de atención**; escoger un único camino aproximado por capa.
+
 ### 8) Commits sugeridos
 - `pack: add binary/ternary bitmap + popcnt helpers`  
 - `kv: optional bitmap cache + approx score path`  
