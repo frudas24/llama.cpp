@@ -69,8 +69,11 @@ cache.compact_if_needed()
 - I/O lento: batch save y blobs separados.  
 - Cambios de modelo/quant: invalidar cache por hash de config.
 
+### Compatibilidad e interacciones
+- Ortogonal a kernels/quant: compatible con todas las optimizaciones; solo requiere invalidación por hash de modelo+quant+flags activas.  
+- Si se guarda KV, respetar el formato/feature‑set de esa sesión (no cargar KV de una config distinta).
+
 ### 8) Commits sugeridos
 - `cache: add persistent exact/approx prompt store`  
 - `cli: lookup before infer + remember after infer`  
 - `cache: optional kv blobs + compaction`
-

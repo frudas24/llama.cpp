@@ -59,6 +59,11 @@ Y = local + mix * (global_score * global_val)
 - Stride grande → artefactos: usar overlap (stride<w) para suavizar.  
 - Pérdida de largo alcance: subir d_global o insertar capas densas cada M bloques.
 
+### Compatibilidad e interacciones
+- Para **capas de atención**, elegir un solo patrón entre `--win-attn`, `--sdr-target=attn_light` o `--event-driven` en atención; evitar compuestos que incrementen `gap` (event‑driven puede seguir en MLP).  
+- KWTA en atención puede operar por ventana/head, pero debe usar la misma segmentación `w/stride`.  
+- Backends de pesos (ternario/TT/procedural/statecells) siguen aplicando a proyecciones Q/K/V/O y a Pk/Pv.
+
 ### 8) Commits sugeridos
 - `attn: add windowed sparse kernel + tests`  
 - `attn: add global projection mix path`  

@@ -61,6 +61,12 @@ y *= (float)(blocks_total) / (blocks_kept)
 - Coste de ranking > ahorro: limitar a bloques y usar nth_element/partial sort.  
 - Invalida vectorización si K alto variable: agrupar bloques contiguos.
 
+### Compatibilidad e interacciones
+- Compartir la misma partición de bloques con StatePack/Event‑driven/BitAgg/Proc‑sparse para que las máscaras coincidan (`block=32/64`).  
+- Si `--event-driven` también está activo, usar KWTA como **prior de candidatos** y dejar que event‑driven aplique el presupuesto/top‑K final dentro de esa lista (no top‑K doble independiente).  
+- En capas con sparsidad estructural (`--proc-sparse` o `--win-attn`), intersectar la máscara KWTA con los bloques realmente disponibles.  
+- En capas TT/StateCells sin unidades claras de skip, dejar KWTA off inicialmente o aplicarla solo a nivel “capa completa”.
+
 ### 8) Commits sugeridos
 - `kwta: add top-k+duty mask builder (CPU)`  
 - `mlp: block-skip path using kwta mask`  

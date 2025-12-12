@@ -68,8 +68,11 @@ if (nan_guard(z, {kind:"ternary", layer:i})) return dense_fallback(...)
 - Log spam: cap por capa y “first hit wins”.  
 - Coste de branch: compilar guardias solo cuando modo low‑precision activo.
 
+### Compatibilidad e interacciones
+- Feature transversal: activarla automáticamente cuando cualquier modo low‑precision/approx esté on; no compite con otras optimizaciones.  
+- Si policy=fallback marca la capa “dense‑only”, también debe desactivar KWTA/event‑driven/SDR/ternario/TT/procedural/statecells en esa capa para evitar estados mixtos.
+
 ### 8) Commits sugeridos
 - `nan: add guardian util + metrics`  
 - `kernels: instrument lowp paths with nan_guard`  
 - `tests: nan injection + fallback validation`
-

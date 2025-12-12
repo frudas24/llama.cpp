@@ -72,6 +72,12 @@ z = (alpha * gamma / 127.0f) * acc
 - **Desbalance gamma** por fila: opcional gamma por bloque pequeño (32) en vez de fila completa.  
 - **Overhead de unpack**: usar LUT 4‑pesos/byte y desenrollado fijo.
 
+### Compatibilidad e interacciones
+- **Backend de pesos exclusivo por capa:** no combinar en la misma capa con `--tt`, `--proc-sparse` o `--statecells`; elegir uno y validar `gap`.  
+- **Componible con sparsidad runtime:** si `--kwta` o `--event-driven` están activos, usar sus máscaras para decidir qué bloques pasan por este kernel (evita doble top‑K).  
+- **StatePack/SDR:** `state-pack` puede usarse solo como máscara para saltar bloques con activación nula antes del dot ternario; evitar aplicar un segundo “dot aproximado popcount” encima del dot ternario en la misma operación.  
+- Instrumentar reescalados/sumas con `--nan-guardian` para fallback seguro.
+
 ### 8) Commits sugeridos
 - `quant: add q2 ternary pack (2bit+gamma)`  
 - `kernels: add avx2/512 ternary int8 path + fallback`  

@@ -59,6 +59,11 @@ logits = blend * score + (1-blend) * logits_dense
 - Densidad variable → beneficio incierto: clamp densidad y auto‑off.  
 - Mezcla con logits densos puede duplicar costo: usar como filtro top‑K primero.
 
+### Compatibilidad e interacciones
+- Compartir utilidades de bitset/popcount con `state-pack` (ver `TODO_statepack_popcount_llama.md`).  
+- Para **atención**, no acumular aproximaciones: si una capa usa `--win-attn` o `--event-driven` en atención, desactivar `--sdr-target=attn_light` en esa capa (SDR puede seguir en LM head).  
+- En **LM head**, SDR es un backend alternativo de scoring; no mezclar con otros backends de LM head (ternario/TT/statecells) salvo modo “filtro top‑K + refine denso”.
+
 ### 8) Commits sugeridos
 - `sdr: add sparse bitset builder + popcount helpers`  
 - `lm_head: optional sdr scorer + blend`  
