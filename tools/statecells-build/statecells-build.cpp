@@ -3,7 +3,9 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <random>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void usage(const char * argv0) {
@@ -29,6 +32,7 @@ static void usage(const char * argv0) {
     printf("  --dict-eta F         Oja learning rate (default: 0.01)\n");
     printf("  --dict-iters N       number of Oja passes (default: 3)\n");
     printf("  --dict-max-samples N max columns used to train dict (default: 2048)\n");
+    printf("  -t, --threads N      worker threads for encoding (default: nproc)\n");
     printf("  --layers A-B         restrict to layer range (default: all)\n");
     printf("  --dict-type f16|f32  output dict type (default: f16)\n");
     printf("  --row-scale          write per-output row_scale tensor (default: on)\n");
@@ -231,46 +235,137 @@ static void encode_codes_sign(
         const std::vector<float> & D,
         int64_t M,
         int k,
+        int n_threads,
         std::vector<int16_t> & codes_out,
         const std::string & tag) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
     codes_out.assign((size_t) k * n_out, 0);
 
-    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+    n_threads = std::max(1, n_threads);
+    n_threads = std::min<int>(n_threads, (int) std::max<int64_t>(1, n_out));
+
     const int64_t t0 = ggml_time_us();
 
-    std::vector<float> w;
-    std::vector<float> y(M);
+    if (n_threads == 1) {
+        const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
 
-    for (int64_t col = 0; col < n_out; ++col) {
-        read_column_f32(W, col, w);
+        std::vector<float> w;
+        std::vector<float> y(M);
 
-        for (int64_t j = 0; j < M; ++j) {
-            const float * dcol = D.data() + j * n_in;
-            float dot = 0.0f;
-            for (int64_t i = 0; i < n_in; ++i) dot += dcol[i] * w[i];
-            y[j] = dot;
-        }
+        for (int64_t col = 0; col < n_out; ++col) {
+            read_column_f32(W, col, w);
 
-        const auto topk = topk_abs_indices(y, k);
-        for (int ti = 0; ti < k; ++ti) {
-            const int j = topk[ti];
-            const float yj = y[j];
-            const int sign = yj >= 0 ? 1 : -1;
-            codes_out[(size_t) ti + (size_t) col * k] = (int16_t) (sign * (j + 1));
-        }
+            for (int64_t j = 0; j < M; ++j) {
+                const float * dcol = D.data() + j * n_in;
+                float dot = 0.0f;
+                for (int64_t i = 0; i < n_in; ++i) dot += dcol[i] * w[i];
+                y[j] = dot;
+            }
 
-        if ((col + 1) % progress_every == 0 || col + 1 == n_out) {
-            const double pct = 100.0 * double(col + 1) / double(n_out);
-            const double sec = double(ggml_time_us() - t0) / 1e6;
-            fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs",
-                    tag.c_str(), col + 1, n_out, pct, sec);
-            fflush(stderr);
-            if (col + 1 == n_out) {
-                fprintf(stderr, "\n");
+            const auto topk = topk_abs_indices(y, k);
+            for (int ti = 0; ti < k; ++ti) {
+                const int j = topk[ti];
+                const float yj = y[j];
+                const int sign = yj >= 0 ? 1 : -1;
+                codes_out[(size_t) ti + (size_t) col * (size_t) k] = (int16_t) (sign * (j + 1));
+            }
+
+            if ((col + 1) % progress_every == 0 || col + 1 == n_out) {
+                const double pct = 100.0 * double(col + 1) / double(n_out);
+                const double sec = double(ggml_time_us() - t0) / 1e6;
+                fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs",
+                        tag.c_str(), col + 1, n_out, pct, sec);
+                fflush(stderr);
+                if (col + 1 == n_out) {
+                    fprintf(stderr, "\n");
+                }
             }
         }
+        return;
+    }
+
+    std::atomic<int64_t> next_col{0};
+    std::atomic<int64_t> done_cols{0};
+
+    auto worker = [&]() {
+        std::vector<float> w;
+        std::vector<float> y(M);
+        std::vector<int> idx((size_t) M);
+
+        while (true) {
+            const int64_t col = next_col.fetch_add(1);
+            if (col >= n_out) {
+                break;
+            }
+
+            read_column_f32(W, col, w);
+
+            for (int64_t j = 0; j < M; ++j) {
+                const float * dcol = D.data() + j * n_in;
+                float dot = 0.0f;
+                for (int64_t i = 0; i < n_in; ++i) dot += dcol[i] * w[i];
+                y[j] = dot;
+            }
+
+            std::iota(idx.begin(), idx.end(), 0);
+            const int k_eff = std::min<int>(k, (int) idx.size());
+            if (k_eff > 0 && k_eff < (int) idx.size()) {
+                std::nth_element(idx.begin(), idx.begin() + k_eff, idx.end(), [&](int a, int b) {
+                    return std::fabs(y[a]) > std::fabs(y[b]);
+                });
+            }
+            if (k_eff > 0) {
+                std::sort(idx.begin(), idx.begin() + k_eff, [&](int a, int b) {
+                    return std::fabs(y[a]) > std::fabs(y[b]);
+                });
+            }
+
+            for (int ti = 0; ti < k_eff; ++ti) {
+                const int j = idx[ti];
+                const float yj = y[j];
+                const int sign = yj >= 0 ? 1 : -1;
+                codes_out[(size_t) ti + (size_t) col * (size_t) k] = (int16_t) (sign * (j + 1));
+            }
+
+            done_cols.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        threads.emplace_back(worker);
+    }
+
+    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+    int64_t last_print = 0;
+    while (true) {
+        const int64_t done = done_cols.load(std::memory_order_relaxed);
+        if (done >= n_out) {
+            break;
+        }
+
+        if (done >= last_print + progress_every) {
+            last_print = done;
+            const double pct = 100.0 * double(done) / double(n_out);
+            const double sec = double(ggml_time_us() - t0) / 1e6;
+            fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs (%d thr)",
+                    tag.c_str(), done, n_out, pct, sec, n_threads);
+            fflush(stderr);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    for (auto & t : threads) {
+        t.join();
+    }
+
+    {
+        const double sec = double(ggml_time_us() - t0) / 1e6;
+        fprintf(stderr, "\r  [%s] encoding codes %" PRId64 "/%" PRId64 " (100.0%%) elapsed %.1fs (%d thr)\n",
+                tag.c_str(), n_out, n_out, sec, n_threads);
     }
 }
 
@@ -280,6 +375,7 @@ static void compute_row_scale_sign(
         int64_t M,
         int k,
         const std::vector<int16_t> & codes,
+        int n_threads,
         std::vector<ggml_fp16_t> & row_scale_out,
         const std::string & tag) {
     const int64_t n_in  = W->ne[0];
@@ -288,62 +384,161 @@ static void compute_row_scale_sign(
     GGML_ASSERT((int64_t) codes.size() == (int64_t) k * n_out);
     row_scale_out.assign((size_t) n_out, ggml_fp32_to_fp16(1.0f));
 
-    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+    n_threads = std::max(1, n_threads);
+    n_threads = std::min<int>(n_threads, (int) std::max<int64_t>(1, n_out));
+
     const int64_t t0 = ggml_time_us();
 
-    std::vector<float> w;
-    std::vector<float> w_hat((size_t) n_in, 0.0f);
+    if (n_threads == 1) {
+        const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
 
-    for (int64_t col = 0; col < n_out; ++col) {
-        read_column_f32(W, col, w);
-        std::fill(w_hat.begin(), w_hat.end(), 0.0f);
+        std::vector<float> w;
+        std::vector<float> w_hat((size_t) n_in, 0.0f);
 
-        const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
-        for (int ti = 0; ti < k; ++ti) {
-            const int16_t code = codes_col[ti];
-            if (code == 0) {
-                continue;
+        for (int64_t col = 0; col < n_out; ++col) {
+            read_column_f32(W, col, w);
+            std::fill(w_hat.begin(), w_hat.end(), 0.0f);
+
+            const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+            for (int ti = 0; ti < k; ++ti) {
+                const int16_t code = codes_col[ti];
+                if (code == 0) {
+                    continue;
+                }
+
+                const float sign = code > 0 ? 1.0f : -1.0f;
+                const int64_t atom = (int64_t) std::abs(code) - 1;
+                if (atom < 0 || atom >= M) {
+                    continue;
+                }
+
+                const float * dcol = D.data() + atom * n_in;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    w_hat[i] += sign * dcol[i];
+                }
             }
 
-            const float sign = code > 0 ? 1.0f : -1.0f;
-            const int64_t atom = (int64_t) std::abs(code) - 1;
-            if (atom < 0 || atom >= M) {
-                continue;
-            }
-
-            const float * dcol = D.data() + atom * n_in;
+            double dot = 0.0;
+            double norm2 = 0.0;
             for (int64_t i = 0; i < n_in; ++i) {
-                w_hat[i] += sign * dcol[i];
+                const double wh = w_hat[i];
+                dot   += wh * (double) w[i];
+                norm2 += wh * wh;
+            }
+
+            float scale = 1.0f;
+            if (norm2 > 1e-20) {
+                scale = (float) (dot / norm2);
+            }
+            if (!std::isfinite(scale) || scale < 0.0f) {
+                scale = 0.0f;
+            }
+            row_scale_out[(size_t) col] = ggml_fp32_to_fp16(scale);
+
+            if ((col + 1) % progress_every == 0 || col + 1 == n_out) {
+                const double pct = 100.0 * double(col + 1) / double(n_out);
+                const double sec = double(ggml_time_us() - t0) / 1e6;
+                fprintf(stderr, "\r  [%s] computing row_scale %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs",
+                        tag.c_str(), col + 1, n_out, pct, sec);
+                fflush(stderr);
+                if (col + 1 == n_out) {
+                    fprintf(stderr, "\n");
+                }
             }
         }
+        return;
+    }
 
-        double dot = 0.0;
-        double norm2 = 0.0;
-        for (int64_t i = 0; i < n_in; ++i) {
-            const double wh = w_hat[i];
-            dot   += wh * (double) w[i];
-            norm2 += wh * wh;
+    std::atomic<int64_t> next_col{0};
+    std::atomic<int64_t> done_cols{0};
+
+    auto worker = [&]() {
+        std::vector<float> w;
+        std::vector<float> w_hat((size_t) n_in, 0.0f);
+
+        while (true) {
+            const int64_t col = next_col.fetch_add(1);
+            if (col >= n_out) {
+                break;
+            }
+
+            read_column_f32(W, col, w);
+            std::fill(w_hat.begin(), w_hat.end(), 0.0f);
+
+            const int16_t * codes_col = codes.data() + (size_t) col * (size_t) k;
+            for (int ti = 0; ti < k; ++ti) {
+                const int16_t code = codes_col[ti];
+                if (code == 0) {
+                    continue;
+                }
+
+                const float sign = code > 0 ? 1.0f : -1.0f;
+                const int64_t atom = (int64_t) std::abs(code) - 1;
+                if (atom < 0 || atom >= M) {
+                    continue;
+                }
+
+                const float * dcol = D.data() + atom * n_in;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    w_hat[i] += sign * dcol[i];
+                }
+            }
+
+            double dot = 0.0;
+            double norm2 = 0.0;
+            for (int64_t i = 0; i < n_in; ++i) {
+                const double wh = w_hat[i];
+                dot   += wh * (double) w[i];
+                norm2 += wh * wh;
+            }
+
+            float scale = 1.0f;
+            if (norm2 > 1e-20) {
+                scale = (float) (dot / norm2);
+            }
+            if (!std::isfinite(scale) || scale < 0.0f) {
+                scale = 0.0f;
+            }
+            row_scale_out[(size_t) col] = ggml_fp32_to_fp16(scale);
+
+            done_cols.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        threads.emplace_back(worker);
+    }
+
+    const int64_t progress_every = std::max<int64_t>(1, n_out / 20);
+    int64_t last_print = 0;
+    while (true) {
+        const int64_t done = done_cols.load(std::memory_order_relaxed);
+        if (done >= n_out) {
+            break;
         }
 
-        float scale = 1.0f;
-        if (norm2 > 1e-20) {
-            scale = (float) (dot / norm2);
-        }
-        if (!std::isfinite(scale) || scale < 0.0f) {
-            scale = 0.0f;
-        }
-        row_scale_out[(size_t) col] = ggml_fp32_to_fp16(scale);
-
-        if ((col + 1) % progress_every == 0 || col + 1 == n_out) {
-            const double pct = 100.0 * double(col + 1) / double(n_out);
+        if (done >= last_print + progress_every) {
+            last_print = done;
+            const double pct = 100.0 * double(done) / double(n_out);
             const double sec = double(ggml_time_us() - t0) / 1e6;
-            fprintf(stderr, "\r  [%s] computing row_scale %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs",
-                    tag.c_str(), col + 1, n_out, pct, sec);
+            fprintf(stderr, "\r  [%s] computing row_scale %" PRId64 "/%" PRId64 " (%.1f%%) elapsed %.1fs (%d thr)",
+                    tag.c_str(), done, n_out, pct, sec, n_threads);
             fflush(stderr);
-            if (col + 1 == n_out) {
-                fprintf(stderr, "\n");
-            }
         }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    for (auto & t : threads) {
+        t.join();
+    }
+
+    {
+        const double sec = double(ggml_time_us() - t0) / 1e6;
+        fprintf(stderr, "\r  [%s] computing row_scale %" PRId64 "/%" PRId64 " (100.0%%) elapsed %.1fs (%d thr)\n",
+                tag.c_str(), n_out, n_out, sec, n_threads);
     }
 }
 
@@ -473,6 +668,7 @@ int main(int argc, char ** argv) {
     float dict_eta = 0.01f;
     int dict_iters = 3;
     int64_t dict_max_samples = 2048;
+    int n_threads = (int) std::max(1u, std::thread::hardware_concurrency());
     std::string layers_range;
     std::string dict_type_str = "f16";
     bool write_row_scale = true;
@@ -497,6 +693,7 @@ int main(int argc, char ** argv) {
         if (arg == "--dict-eta" && i + 1 < argc) { dict_eta = std::stof(argv[++i]); continue; }
         if (arg == "--dict-iters" && i + 1 < argc) { dict_iters = std::stoi(argv[++i]); continue; }
         if (arg == "--dict-max-samples" && i + 1 < argc) { dict_max_samples = std::stoll(argv[++i]); continue; }
+        if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--layers" && i + 1 < argc) { layers_range = argv[++i]; continue; }
         if (arg == "--dict-type" && i + 1 < argc) { dict_type_str = argv[++i]; continue; }
         if (arg == "--row-scale") { write_row_scale = true; continue; }
@@ -672,7 +869,7 @@ int main(int argc, char ** argv) {
                 M_eff = std::min<int64_t>(dict_M_cur, n_out);
                 k_eff = std::min<int>(dict_k_cur, (int) M_eff);
 
-                encode_codes_sign(W, D, M_eff, k_eff, codes, tag);
+                encode_codes_sign(W, D, M_eff, k_eff, n_threads, codes, tag);
             } else {
                 ggml_tensor * t_dict  = ggml_get_tensor(ctx_data, dict_name.c_str());
                 ggml_tensor * t_codes = ggml_get_tensor(ctx_data, codes_name.c_str());
@@ -706,7 +903,7 @@ int main(int argc, char ** argv) {
 
             std::vector<ggml_fp16_t> row_scale;
             if (need_row_scale) {
-                compute_row_scale_sign(W, D, M_eff, k_eff, codes, row_scale, tag);
+                compute_row_scale_sign(W, D, M_eff, k_eff, codes, n_threads, row_scale, tag);
             }
 
             eval_metrics em;
