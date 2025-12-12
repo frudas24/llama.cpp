@@ -136,6 +136,30 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // StateCells sparse-dictionary backend setup (FFN only for now).
+    statecells_ctx.enabled = params.statecells;
+    statecells_ctx.gap_tol = params.statecells_gap_tol;
+    if (statecells_ctx.enabled) {
+        for (int il = 0; il < (int) hparams.n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            if (layer.ffn_gate && layer.ffn_gate_dict && layer.ffn_gate_codes) {
+                statecells_ctx.weights.emplace(layer.ffn_gate, llama_statecells_weight{ layer.ffn_gate_dict, layer.ffn_gate_codes });
+            }
+            if (layer.ffn_up && layer.ffn_up_dict && layer.ffn_up_codes) {
+                statecells_ctx.weights.emplace(layer.ffn_up, llama_statecells_weight{ layer.ffn_up_dict, layer.ffn_up_codes });
+            }
+            if (layer.ffn_down && layer.ffn_down_dict && layer.ffn_down_codes) {
+                statecells_ctx.weights.emplace(layer.ffn_down, llama_statecells_weight{ layer.ffn_down_dict, layer.ffn_down_codes });
+            }
+        }
+
+        if (statecells_ctx.weights.empty()) {
+            LLAMA_LOG_WARN("%s: statecells enabled but no dict/codes found, disabling\n", __func__);
+            statecells_ctx.enabled = false;
+        }
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -1519,6 +1543,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.statecells_ctx =*/ &statecells_ctx,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2381,6 +2406,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.statecells_gap_tol          =*/ 0.02f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -2393,6 +2419,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.statecells                  =*/ false,
     };
 
     return result;
