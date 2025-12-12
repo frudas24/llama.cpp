@@ -27,6 +27,7 @@
   - Kernel v1 (rápido): `p = Dᵀx` con `ggml_mul_mat` + custom op “gather/sum k‑esparso” sobre `codes` (+ `row_scale` opcional).
 - **Offline:**
   - Tool `llama-statecells-build` genera `*.dict` + `*.codes` (+ `*.row_scale`) y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
+  - Encoding acelerado (✅): calcula `Y = Dᵀ·Wblk` en bloques (`B=64`) usando `ggml_mul_mat` + threadpool CPU (reusa threads; evita “1 dot por columna”).
   - Iteración rápida: `--resume` (reanuda sobre `-o` existente), `--checkpoint-every N` (checkpoint por capas), `--eval-cols/--report-json` (gap report).
 - **Pendiente inmediato (para “velocidad de la luz”):**
   - Soporte `*.vals` (scheme fp16), gating offline por capa/tensor (sin fallback caliente), data‑aware builder (calibración) y kernels más vectorizados.
@@ -71,7 +72,7 @@
     - `--dict-k` átomos activos por columna/fila (p.ej. 16–48).
     - `--dict-k-gate`, `--dict-k-up`, `--dict-k-down` overrides por matriz.
     - `--dict-eta`, `--dict-iters`, `--dict-max-samples`, `--layers A-B`, `--dict-type f16|f32`.
-    - `-t, --threads N` paraleliza el encoding (default: nproc).
+    - `-t, --threads N` threads CPU para encoding/row_scale (el encoding usa `ggml_mul_mat` en bloques, no 1 dot por columna).
     - `--resume` reanuda sobre un `-o` ya creado (salta pesos con `dict+codes`).
     - `--checkpoint-every N` escribe `-o` cada N capas (I/O grande; útil para no perder progreso).
     - `--row-scale` / `--no-row-scale` emite `..._row_scale` (fp16) por salida (default: on).
@@ -233,17 +234,34 @@ for row in 0..R-1:
 
 ## 11) Ejemplos de uso (Devstral 24B Q5 → StateCells)
 
-### 11.1 Construir `devstral_sc.gguf` (capas medias primero)
+### 11.1 Construir `devstral_sc.gguf` (quick smoke → expandir)
 
-> Nota: esto **no** abre una UI; es un tool offline y puede tardar bastante. Usa `--checkpoint-every 1` para ir escribiendo progreso.
+> Nota: esto **no** abre una UI; es un tool offline. Con el encoding acelerado deberías ver `(... thr, B=64)` y tiempos de **segundos** en `encoding codes` (si no lo ves, estás usando un binario viejo o sin rebuild).
 
 ```bash
 IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
 OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
 
+# 1) quick smoke (capas 6-8) para validar rápido
 ./llama.cpp/build/bin/llama-statecells-build \
   -i "$IN" \
   -o "$OUT" \
+  -t 16 \
+  --layers 6-8 \
+  --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
+  --dict-k 32 \
+  --dict-iters 2 \
+  --dict-max-samples 2048 \
+  --row-scale \
+  --eval-cols 64 \
+  --report-json /tmp/devstral_sc_6-8.json \
+  --checkpoint-every 1
+
+# 2) expandir a capas medias (6-25)
+./llama.cpp/build/bin/llama-statecells-build \
+  -i "$IN" \
+  -o "$OUT" \
+  --resume \
   -t 16 \
   --layers 6-25 \
   --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
@@ -252,7 +270,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --dict-max-samples 2048 \
   --row-scale \
   --eval-cols 64 \
-  --report-json /tmp/devstral_sc_report.json \
+  --report-json /tmp/devstral_sc_6-25.json \
   --checkpoint-every 1
 ```
 
@@ -273,6 +291,7 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
   --dict-k 32 --dict-iters 2 \
   --row-scale \
+  --eval-cols 64 --report-json /tmp/devstral_sc_26-39.json \
   --checkpoint-every 1
 ```
 

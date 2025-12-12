@@ -71,35 +71,25 @@ static void llama_statecells_gather_sum_op(struct ggml_tensor * dst, int ith, in
 
         for (int64_t o = o0; o < o1; ++o) {
             const float scale = row_scale ? (rs_f32 ? rs_f32[o] : ggml_fp16_to_fp32(rs_f16[o])) : 1.0f;
-
-            // init y[o, :] = 0
-            for (int64_t t = 0; t < n_tokens; ++t) {
-                dst_data[o + t * n_out] = 0.0f;
-            }
-
-            // y[o,t] += sign * p[atom,t]
             const int16_t * codes_col = codes_data + o * k;
-            for (int64_t r = 0; r < k; ++r) {
-                const int16_t code = codes_col[r];
-                if (code == 0) {
-                    continue;
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                float y = 0.0f;
+                for (int64_t r = 0; r < k; ++r) {
+                    const int16_t code = codes_col[r];
+                    if (code == 0) {
+                        continue;
+                    }
+
+                    const float sign = code > 0 ? 1.0f : -1.0f;
+                    const int64_t atom = (int64_t) std::abs(code) - 1;
+                    if (atom < 0 || atom >= M) {
+                        continue;
+                    }
+
+                    y += sign * p_data[atom + t * M];
                 }
 
-                const float sign = code > 0 ? 1.0f : -1.0f;
-                const int64_t atom = (int64_t) std::abs(code) - 1;
-                if (atom < 0 || atom >= M) {
-                    continue;
-                }
-
-                for (int64_t t = 0; t < n_tokens; ++t) {
-                    dst_data[o + t * n_out] += sign * p_data[atom + t * M];
-                }
-            }
-
-            if (scale != 1.0f) {
-                for (int64_t t = 0; t < n_tokens; ++t) {
-                    dst_data[o + t * n_out] *= scale;
-                }
+                dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
             }
         }
 
@@ -114,35 +104,25 @@ static void llama_statecells_gather_sum_op(struct ggml_tensor * dst, int ith, in
     for (int64_t o = o0; o < o1; ++o) {
         const uint8_t * codes_col = codes_data + o * codes->nb[1];
         const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
-
-        // init y[o, :] = 0
         for (int64_t t = 0; t < n_tokens; ++t) {
-            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = 0.0f;
-        }
+            float y = 0.0f;
+            for (int64_t r = 0; r < k; ++r) {
+                const int16_t code = *(const int16_t *)(codes_col + r * codes->nb[0]);
+                if (code == 0) {
+                    continue;
+                }
 
-        // y[o,t] += sign * p[atom,t]
-        for (int64_t r = 0; r < k; ++r) {
-            const int16_t code = *(const int16_t *)(codes_col + r * codes->nb[0]);
-            if (code == 0) {
-                continue;
-            }
+                const float sign = code > 0 ? 1.0f : -1.0f;
+                const int64_t atom = (int64_t) std::abs(code) - 1;
+                if (atom < 0 || atom >= M) {
+                    continue;
+                }
 
-            const float sign = code > 0 ? 1.0f : -1.0f;
-            const int64_t atom = (int64_t) std::abs(code) - 1;
-            if (atom < 0 || atom >= M) {
-                continue;
-            }
-
-            for (int64_t t = 0; t < n_tokens; ++t) {
                 const float pv = read_f16_or_f32(p, p_data, atom, t);
-                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) += sign * pv;
+                y += sign * pv;
             }
-        }
 
-        if (scale != 1.0f) {
-            for (int64_t t = 0; t < n_tokens; ++t) {
-                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) *= scale;
-            }
+            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
         }
     }
 }
