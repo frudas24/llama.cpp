@@ -136,6 +136,59 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // SeedΔ weights backend setup (FFN only for now).
+    seeddelta_ctx.enabled = params.seeddelta;
+    seeddelta_ctx.gap_tol = params.seeddelta_gap_tol;
+    if (seeddelta_ctx.enabled) {
+        auto try_add_seeddelta = [&](ggml_tensor * w, ggml_tensor * d_idx, ggml_tensor * d_val, ggml_tensor * row_scale, const char * name) {
+            if (!w || !d_idx || !d_val) {
+                return;
+            }
+
+            if (ggml_n_dims(d_idx) != 2 || ggml_n_dims(d_val) != 2) {
+                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid dims\n", __func__, name);
+                return;
+            }
+            if ((d_idx->type != GGML_TYPE_I16 && d_idx->type != GGML_TYPE_I32) ||
+                (d_val->type != GGML_TYPE_F16 && d_val->type != GGML_TYPE_F32)) {
+                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid types\n", __func__, name);
+                return;
+            }
+            if (d_idx->ne[0] != d_val->ne[0] || d_idx->ne[1] != d_val->ne[1]) {
+                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched idx/val shapes\n", __func__, name);
+                return;
+            }
+            if (w->ne[1] != d_idx->ne[1]) {
+                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched shapes\n", __func__, name);
+                return;
+            }
+
+            if (row_scale) {
+                if (ggml_n_dims(row_scale) != 1 ||
+                    (row_scale->type != GGML_TYPE_F16 && row_scale->type != GGML_TYPE_F32) ||
+                    row_scale->ne[0] != w->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s row_scale due to invalid shape/type\n", __func__, name);
+                    row_scale = nullptr;
+                }
+            }
+
+            seeddelta_ctx.weights.emplace(w, llama_seeddelta_weight{ d_idx, d_val, row_scale });
+        };
+
+        for (int il = 0; il < (int) hparams.n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            try_add_seeddelta(layer.ffn_gate, layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale, "ffn_gate");
+            try_add_seeddelta(layer.ffn_up,   layer.ffn_up_d_idx,   layer.ffn_up_d_val,   layer.ffn_up_d_row_scale,   "ffn_up");
+            try_add_seeddelta(layer.ffn_down, layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale, "ffn_down");
+        }
+
+        if (seeddelta_ctx.weights.empty()) {
+            LLAMA_LOG_WARN("%s: seeddelta enabled but no d_idx/d_val found, disabling\n", __func__);
+            seeddelta_ctx.enabled = false;
+        }
+    }
+
     // StateCells sparse-dictionary backend setup (FFN only for now).
     statecells_ctx.enabled = params.statecells;
     statecells_ctx.gap_tol = params.statecells_gap_tol;
@@ -1577,6 +1630,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.seeddelta_ctx =*/ &seeddelta_ctx,
         /*.statecells_ctx =*/ &statecells_ctx,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2441,6 +2495,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.statecells_gap_tol          =*/ 0.02f,
+        /*.seeddelta_gap_tol           =*/ 0.02f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -2454,6 +2509,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.statecells                  =*/ false,
+        /*.seeddelta                   =*/ false,
     };
 
     return result;

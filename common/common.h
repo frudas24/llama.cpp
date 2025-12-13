@@ -440,6 +440,10 @@ struct common_params {
     bool  statecells         = false; // enable StateCells weights if present in GGUF
     float statecells_gap_tol = 0.02f; // fallback tolerance vs dense
 
+    // SeedΔ weights backend (EXPERIMENTAL)
+    bool  seeddelta         = false; // enable SeedΔ weights if present in GGUF
+    float seeddelta_gap_tol = 0.02f; // fallback tolerance vs dense
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

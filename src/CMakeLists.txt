@@ -29,6 +29,7 @@ add_library(llama
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-seeddelta.cpp
             llama-statecells.cpp
             llama-quant.cpp
             llama-sampling.cpp

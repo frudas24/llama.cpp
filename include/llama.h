@@ -344,6 +344,9 @@ extern "C" {
         // StateCells sparse-dictionary backend [EXPERIMENTAL]
         float    statecells_gap_tol; // tolerance for fallback to dense
 
+        // SeedΔ weights backend [EXPERIMENTAL]
+        float    seeddelta_gap_tol; // tolerance for fallback to dense
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -368,6 +371,7 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool statecells;  // enable StateCells weights if present in GGUF [EXPERIMENTAL]
+        bool seeddelta;   // enable SeedΔ weights if present in GGUF [EXPERIMENTAL]
     };
 
     // model quantization parameters
