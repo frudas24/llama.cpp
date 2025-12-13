@@ -59,7 +59,7 @@ y = W x = W_0 x + \Delta x
 
 * Fácil de implementar, pero puede ser caro si lo haces elemento-a-elemento.
 
-**Opción B (v1 performance):** `W0` estructurado tipo transformada rápida
+**Opción B (v1 performance, genérica):** `W0` estructurado tipo transformada rápida
 
 * Ejemplo estilo “Fast Hadamard / Fastfood-like”:
 
@@ -67,6 +67,47 @@ y = W x = W_0 x + \Delta x
   * requiere padding/bloques a potencias de 2 para FHT.
 
 > **Regla práctica:** si `W0` cuesta ~como un matmul denso, no sirve. `W0` debe ser “barato” o al menos **cacheable por tokens**.
+
+**Opción B.1 (recomendada, concreta):** `W0(seed, θ)` = *Stacked Fastfood / ACDC‑style* (diagonales + permutación + Hadamard)
+
+Esta familia resuelve los 2 puntos que hacen que la idea viva o muera: (1) `W0x` barato y (2) manejar matrices **rectangulares** tipo LLM sin materializar `W0`.
+
+**Definición (por bloque):**
+- Elegir `L = next_pow2(n_in)` (p.ej. 5120 → 8192).
+- Definir un operador rápido `F(θ): R^L → R^L` tipo:
+  - `F(x) = D3 · H · P2 · D2 · H · P1 · D1 · x`
+  - donde `H` es Hadamard (FHT), `D*` son diagonales (fp16/int8) y `P*` permutaciones (seed o array).
+
+**Rectangularidad — caso “tall” (FFN gate/up):**
+- `W ∈ R^{m×n}` con `m=32768`, `n=5120`.
+- `L=8192`, `B = ceil(m/L)=4`.
+- Para cada bloque `b=0..B-1`, se guarda `θ_b` y se computa:
+  1) `x̂ = pad(x, L)`
+  2) `y_b = F_b(x̂)` (en `R^L`)
+  3) `y = concat(y_0..y_{B-1})[:m]`
+
+**Rectangularidad — caso “wide” (FFN down):**
+- `W ∈ R^{m×n}` con `m=5120`, `n=32768`.
+- Partir `x` en `B=4` chunks de `L=8192` y acumular:
+  1) `ŷ = 0 ∈ R^L`
+  2) `for b: ŷ += F_b(x_b)`   (misma familia, ahora “reduce/suma”)
+  3) `y = ŷ[:m]`
+
+**Costo (orden de magnitud, gate/up Devstral):**
+- `B * L * log2(L)` ≈ `4 * 8192 * 13` ≈ `425k` ops (+ diagonales/perms lineales),
+- vs denso `m*n` ≈ `32768*5120` ≈ `167M` ops por token.
+
+**Parámetros θ (memoria)**
+- Por bloque `b`: 2–4 diagonales de longitud `L` + seeds/permutaciones.
+- Ejemplo: 3 diagonales fp16 → `3 * 8192 * 2B = 48 KB` por bloque; `B=4` → `~192 KB` por matriz gate/up.
+- Si falta capacidad, usar suma de pocos términos: `W0 = Σ_{r=1..R} W0_r` con `R` pequeño (2–8) y diagonales compartidas o separadas.
+
+**Opción C (v2 expresividad):** `W0` tipo *butterfly / factorized transforms*
+
+* Familia más expresiva que “solo Hadamard+diagonales”, pero con el mismo espíritu:
+  - producto de factores estructurados (tipo mariposa/FFT‑like),
+  - costo ~`O(d log d)` o `O(d log^2 d)` según parametrización,
+  - se puede adaptar a rectangular igual que en la opción B.1 (stacking/tiling).
 
 ### 2.3 Residual `Δ` (compacto)
 
@@ -114,6 +155,20 @@ Esto guía:
 * selección de top-K del residual,
 * búsqueda de seed/θ para `W0`.
 
+**Nota importante (para que Δ sea realmente “pequeño”):** el objetivo debe ser **funcional** (data‑aware), no solo `||W-Ŵ||` en weight‑space:
+[
+\min_{\theta,\Delta}\ \mathbb{E}_{x\sim\mathcal{D}}\ \| (W - W_0(\theta) - \Delta)\,x \|_2^2
+]
+Con imatrix lo aproximas como covarianza diagonal:
+[
+\min\ \| (W - W_0(\theta) - \Delta)\,\Sigma_x^{1/2} \|_F^2
+,\quad \Sigma_x \approx \mathrm{diag}(\mathrm{imatrix})
+]
+
+**¿De dónde sale `x` / `Σx`?**
+- v1: imatrix (diagonal) ya da una señal útil para priorizar dimensiones “importantes”.
+- v2 (mejor): recolectar **activaciones reales** `X` en los puntos exactos (entrada a `ffn_gate/up/down`) con el mismo texto de calibración, y optimizar `||WX - ŴX||` directamente. (Esto evita “ganar en W‑space y perder en PPL”.)
+
 ---
 
 ## 3) Formato GGUF propuesto
@@ -125,9 +180,13 @@ Por tensor objetivo (ej. `blk.N.ffn_gate.weight`):
 * `seeddelta.enabled` (bool)
 * `seeddelta.version` (u32)
 * `seeddelta.scheme` (u32: 0=coo, 1=block, 2=codebook_resid)
-* `seeddelta.base.kind` (u32: 0=prng_block, 1=fht_struct)
+* `seeddelta.base.kind` (u32: 0=prng_block, 1=hadamard_acdc_stack, 2=butterfly)
 * `seeddelta.base.seed` (u64)
 * `seeddelta.base.scale` (f32) (+ opcional mean/var)
+* `seeddelta.base.L` (u32) (tamaño interno, pow2)
+* `seeddelta.base.B` (u32) (número de bloques/tiles)
+* `seeddelta.base.depth` (u32) (número de etapas / diagonales en `F`)
+* `seeddelta.base.R` (u32) (número de términos en suma `Σ_r W0_r`)
 * `seeddelta.resid.K` (u32) o `seeddelta.resid.block` (u32)
 * `seeddelta.row_scale` (bool) + tipo (f16/f32)
 * imatrix provenance si aplica (`...imatrix.file`, `...power`, etc.)
@@ -137,6 +196,11 @@ Por tensor objetivo (ej. `blk.N.ffn_gate.weight`):
 **Base (mínimo):**
 
 * `blk.N.ffn_gate.base_seed` (U64) *(o en KV si prefieres)*
+* `blk.N.ffn_gate.base_d1` `[B, L]` (F16/F32) *(hadamard_acdc_stack)*
+* `blk.N.ffn_gate.base_d2` `[B, L]` (F16/F32) *(opcional)*
+* `blk.N.ffn_gate.base_d3` `[B, L]` (F16/F32) *(opcional)*
+* `blk.N.ffn_gate.base_perm1` `[B, L]` (U16/U32) *(opcional; si no, se deriva de seed al cargar)*
+* `blk.N.ffn_gate.base_perm2` `[B, L]` (U16/U32) *(opcional)*
 * `blk.N.ffn_gate.row_scale` `[n_out]` (F16/F32) *(si habilitado)*
 
 **Residual COO (scheme=0):**
@@ -167,7 +231,10 @@ Inputs:
 * `-i in.gguf -o out.gguf`
 * `--layers A-B`
 * `--targets ffn_gate,ffn_up,ffn_down`
-* `--base-kind prng_block|fht_struct`
+* `--base-kind prng_block|hadamard_acdc_stack|butterfly`
+* `--base-L N` (opcional; default `next_pow2(n_in)`)
+* `--base-depth N` (opcional; default 2–3)
+* `--base-R N` (opcional; default 1)
 * `--seed N` + `--seed-search NTRIALS` (opcional)
 * `--scheme coo|block|codebook_resid`
 * `--K 16|32|64` o `--block 32|64`
@@ -224,7 +291,7 @@ Outputs:
 
 ### Fase 1 — Builder v0 (correctness first)
 
-**Base-kind:** `prng_block` (sin FHT todavía)
+**Base-kind:** `prng_block` (solo harness) → `hadamard_acdc_stack` (camino real)
 **Scheme:** `coo` con `d_val=fp16` + `row_scale`
 
 **Entregables**
@@ -238,6 +305,19 @@ Outputs:
 **Aceptación**
 
 * PPL no explota (ΔPPL razonable) en 1–2 capas FFN de Gemma/1B
+
+---
+
+### Fase 1b — Builder v1 (base rápida real)
+
+**Base-kind:** `hadamard_acdc_stack` con `L=next_pow2(n_in)` y stacking rectangular (B.1)
+**Scheme:** `coo` (todavía) o `block` si ya existe
+
+**Entregables**
+
+* [ ] Emisión de tensores base (`base_d*`, `base_perm*`, `base.L/B/depth/R`) en GGUF
+* [ ] Kernel offline para `W0x` y para residual `Δ` (para evaluar `||WX - ŴX||`)
+* [ ] Report de costo estimado: `W0x` vs denso por tensor (MB/s, ops)
 
 ---
 
