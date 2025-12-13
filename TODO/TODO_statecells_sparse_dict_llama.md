@@ -29,9 +29,10 @@
   - Tool `llama-statecells-build` genera `*.dict` + `*.codes` (+ `*.row_scale`) y escribe `out.gguf` (✅ progreso detallado por layer/iter/sample/encoding; **no** abre “interfaz” tipo `llama-cli`).
   - Encoding acelerado (✅): calcula `Y = Dᵀ·Wblk` en bloques (`B=64`) usando `ggml_mul_mat` + threadpool CPU (reusa threads; evita “1 dot por columna”).
   - Coeficientes por code `*.vals` (✅ opcional): `--vals` genera `blk.N.*.vals` (fp16) para mejorar calidad.
+  - Builder “data-aware” v1 (✅): `--imatrix FILE` pondera entrenamiento/encoding con imatrix GGUF (aprox diagonal). Reporta métricas ponderadas `*_w` en `--eval-cols/--report-json`.
   - Iteración rápida: `--resume` (reanuda sobre `-o` existente), `--checkpoint-every N` (checkpoint por capas), `--eval-cols/--report-json` (gap report).
 - **Pendiente inmediato (para “velocidad de la luz”):**
-  - Calibración data‑aware (minimizar `||W X − Ŵ X||`), gating offline por capa/tensor (sin fallback caliente) y kernels más vectorizados.
+  - Calibración data‑aware “real” (minimizar `||W X − Ŵ X||` con activaciones reales), gating offline por capa/tensor (sin fallback caliente) y kernels más vectorizados.
 
 ---
 
@@ -80,8 +81,11 @@
     - `--row-scale` / `--no-row-scale` emite `..._row_scale` (fp16) por salida (default: on).
     - `--eval-cols N` calcula métricas de gap sobre N salidas por peso (sampling).
     - `--report-json FILE` exporta métricas por peso/capa a JSON.
+    - `--imatrix FILE` pondera entrenamiento/encoding con un imatrix GGUF (`llama-imatrix`) para mejorar calidad “funcional” (aprox diagonal).
+    - `--imatrix-eps F` clamp mínimo antes de `sqrt` (evita ceros/NaNs).
+    - `--imatrix-power F` exponente de la ponderación (1.0 = default).
     - (futuro) `--scheme sign|sign+row_scale|fp16` para controlar coeficientes de forma explícita.
-    - (futuro) `--calib-*` para builder **data‑aware** (ver sección 4).
+    - (futuro) `--calib-*` para data‑aware “real” con activaciones (ver sección 4).
   - Esquemas:
     - `sign` (actual): coeficiente implícito ±1 dentro de `codes` I16.
     - `sign+row_scale` (✅ implementado): `codes` ±1 + escala por salida (`..._row_scale` fp16) para recuperar magnitud “casi gratis”.
@@ -198,11 +202,12 @@ for row in 0..R-1:
 3. ✅ Kernel runtime rápido “sin reconstrucción” (precompute `p = Dᵀx`, sumar `k` coeficientes por salida).  
 4. ✅ Schedule por matriz (`M/k` por `gate/up/down`).  
 5. ✅ Scheme `sign+row_scale` (`...row_scale` fp16).  
-6. ⏳ Scheme `fp16` (`*.vals`) + metadatos `statecells.scheme/version`.  
-7. ⏳ Builder data‑aware (`||W X − Ŵ X||`) con calibration set + auto‑tune por capa/tensor.  
-8. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
-9. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
-10. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
+6. ✅ Scheme `sign+vals` (`*.vals`) (opcional vía `--vals`).  
+7. ✅ Builder data‑aware v1 con imatrix (diagonal) (`--imatrix`) + métricas `*_w`.  
+8. ⏳ Builder data‑aware v2 (objetivo funcional real `||W X − Ŵ X||` con activaciones) + auto‑tune por capa/tensor.  
+9. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
+10. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
+11. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
 
 ### 8) Riesgos/mitigación
 - **M demasiado grande** → no hay ahorro: auto‑tune M por capa (target M≈rows/8).  
@@ -326,4 +331,110 @@ OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
   --sc "$OUT" \
   --text /ruta/a/wikitext-2-raw/wiki.test.raw \
   --threads 16 --ctx 4096
+```
+
+### 11.5 (Recomendado) Builder “data-aware” con `--imatrix`
+
+Para mejorar la calidad, `llama-statecells-build` puede ponderar el entrenamiento/encoding usando un **imatrix** (GGUF) generado por `llama-imatrix`.
+
+1) Genera el imatrix con un dataset de calibración (texto plano):
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
+CAL="./llama.cpp/calibration/devstral_calibration.txt"
+IM="./llama.cpp/calibration/devstral_ctx512_chunks16.imatrix.gguf"
+
+./llama.cpp/build/bin/llama-imatrix \
+  -m "$IN" \
+  -f "$CAL" \
+  -o "$IM" \
+  -t 16 -c 512 \
+  --no-ppl --chunks 16 \
+  -lv 2 --output-frequency 1
+```
+
+2) Usa ese imatrix durante el build:
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/bartowski_mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF_mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf"
+OUT="/home/frudas/.cache/llama.cpp/devstral_sc.gguf"
+IM="./llama.cpp/calibration/devstral_ctx512_chunks16.imatrix.gguf"
+
+./llama.cpp/build/bin/llama-statecells-build \
+  -i "$IN" \
+  -o "$OUT" \
+  -t 16 \
+  --imatrix "$IM" \
+  --imatrix-eps 1e-8 --imatrix-power 1.0 \
+  --layers 6-8 \
+  --dict-M-gate 4096 --dict-M-up 4096 --dict-M-down 512 \
+  --dict-k 32 --dict-iters 2 --dict-max-samples 2048 \
+  --vals --row-scale \
+  --eval-cols 64 --report-json /tmp/devstral_sc_6-8.json \
+  --checkpoint-every 1
+```
+
+Nota: si usas `--imatrix`, el JSON incluye métricas ponderadas `*_w` (aproximación “funcional” con covarianza diagonal).
+
+### 11.6 Smoke test rápido con Gemma (pipeline end‑to‑end)
+
+Útil para validar que `llama-imatrix` + `llama-statecells-build --imatrix` + `llama-cli --statecells` funcionan, sin esperar horas.
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/ggml-org_gemma-3-1b-it-GGUF_gemma-3-1b-it-Q4_K_M.gguf"
+CAL="/tmp/gemma_calibration.txt"
+IM="/tmp/gemma_ctx512_chunks8.imatrix.gguf"
+OUT="/tmp/gemma_sc_imatrix.gguf"
+
+for i in $(seq 1 8000); do echo "hola mundo esto es calibracion"; done > "$CAL"
+
+./llama.cpp/build/bin/llama-imatrix \
+  -m "$IN" -f "$CAL" -o "$IM" \
+  -t 16 -c 512 \
+  --no-ppl --chunks 8 \
+  -lv 2 --output-frequency 1
+
+./llama.cpp/build/bin/llama-statecells-build \
+  -i "$IN" -o "$OUT" \
+  -t 16 \
+  --imatrix "$IM" \
+  --layers 0-1 \
+  --dict-M 256 --dict-k 16 --dict-iters 1 --dict-max-samples 512 \
+  --vals --row-scale \
+  --eval-cols 16 --report-json /tmp/gemma_sc_imatrix.json
+
+./llama.cpp/build/bin/llama-cli \
+  -m "$OUT" \
+  --statecells \
+  -t 16 -c 1024 \
+  -p "hola" -n 64 \
+  --single-turn < /dev/null
+
+# (opcional) Comparar calidad rápido (perplexity + QA) en wikitext-2 (solo 32 chunks)
+TEXT_DIR="/tmp/wikitext-2-raw"
+TEXT_FILE="$TEXT_DIR/wiki.test.raw"
+
+if [ ! -f "$TEXT_FILE" ]; then
+  wget -q -O /tmp/wikitext-2-raw-v1.zip https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+  bsdtar -xf /tmp/wikitext-2-raw-v1.zip -C /tmp
+fi
+
+./llama.cpp/scripts/statecells-eval.sh \
+  --base "$IN" \
+  --sc "$OUT" \
+  --text "$TEXT_FILE" \
+  --threads 16 --ctx 512 \
+  --chunks 32 \
+  --outdir /tmp/statecells-eval-gemma
+
+rg -n "Final estimate" /tmp/statecells-eval-gemma/perplexity_*.log
+
+# Resultado de referencia (con los settings de arriba):
+#   perplexity_base      : Final estimate: PPL = 26.7485 +/- 1.09312
+#   perplexity_statecells: Final estimate: PPL = 8017.7608 +/- 339.39514
+#
+# Interpretación: el pipeline end‑to‑end funciona, pero esta configuración
+# (muy agresiva: M=256,k=16 y encima en capas tempranas 0‑1) destruye calidad.
+# Para “calidad real”, subir M/k/iters y preferir capas medias primero +
+# calibración más fuerte (imatrix mejor / objetivo funcional).
 ```
