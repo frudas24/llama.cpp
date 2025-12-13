@@ -284,7 +284,7 @@ Outputs:
 
 * [ ] `tools/seeddelta-eval/` o modo `--report-json` en builder
 * [ ] Métricas por tensor: `rel_l2`, `cos`, `norm_ratio`, y `_w` si imatrix
-* [ ] Script A/B: `llama-perplexity base vs seeddelta` (chunks cortos)
+* [x] Script A/B: `llama-perplexity base vs seeddelta` (chunks cortos) → `scripts/seeddelta-eval.sh`
 * [ ] Unit test pequeño: compara `W0x + Δx` vs `Wx` en un tensor (tolerancias)
 
 ---

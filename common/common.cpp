@@ -1403,6 +1403,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.statecells        = params.statecells;
     cparams.statecells_gap_tol= params.statecells_gap_tol;
+    cparams.seeddelta         = params.seeddelta;
+    cparams.seeddelta_gap_tol = params.seeddelta_gap_tol;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

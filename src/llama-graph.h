@@ -19,6 +19,7 @@ struct llama_cparams;
 
 struct llama_memory_context_i;
 struct llama_statecells_context;
+struct llama_seeddelta_context;
 
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
@@ -417,6 +418,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_seeddelta_context * seeddelta_ctx;
     const llama_statecells_context * statecells_ctx;
 
     uint32_t n_outputs;
@@ -466,6 +468,7 @@ struct llm_graph_params {
             cvec      == other.cvec  &&
             loras     == other.loras &&
             cross     == other.cross &&
+            seeddelta_ctx == other.seeddelta_ctx &&
             statecells_ctx == other.statecells_ctx &&
             n_outputs == other.n_outputs;
     }
@@ -582,6 +585,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_seeddelta_context * seeddelta_ctx;
     const llama_statecells_context * statecells_ctx;
 
     const llm_graph_cb & cb_func;

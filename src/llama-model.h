@@ -281,6 +281,17 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_vals  = nullptr; // optional coefficients, shape [k, n_embd], F16/F32
     struct ggml_tensor * ffn_down_row_scale = nullptr; // optional, shape [n_embd]
 
+    // SeedΔ residual COO (optional, GGUF-provided)
+    struct ggml_tensor * ffn_gate_d_idx      = nullptr; // [K, n_ff], I16/I32
+    struct ggml_tensor * ffn_gate_d_val      = nullptr; // [K, n_ff], F16/F32
+    struct ggml_tensor * ffn_gate_d_row_scale = nullptr; // optional, [n_ff]
+    struct ggml_tensor * ffn_up_d_idx        = nullptr; // [K, n_ff], I16/I32
+    struct ggml_tensor * ffn_up_d_val        = nullptr; // [K, n_ff], F16/F32
+    struct ggml_tensor * ffn_up_d_row_scale  = nullptr; // optional, [n_ff]
+    struct ggml_tensor * ffn_down_d_idx      = nullptr; // [K, n_embd], I16/I32
+    struct ggml_tensor * ffn_down_d_val      = nullptr; // [K, n_embd], F16/F32
+    struct ggml_tensor * ffn_down_d_row_scale = nullptr; // optional, [n_embd]
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp    = nullptr;
     struct ggml_tensor * ffn_gate_exps   = nullptr;

@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-seeddelta.h"
 #include "llama-statecells.h"
 
 #include "llama-kv-cache.h"
@@ -591,6 +592,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    seeddelta_ctx    (params.seeddelta_ctx),
     statecells_ctx   (params.statecells_ctx),
     cb_func          (params.cb),
     res              (params.res),
@@ -615,6 +617,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
     ggml_tensor * res = nullptr;
+
+    if (seeddelta_ctx && seeddelta_ctx->enabled) {
+        if (const auto * sdw = seeddelta_ctx->find(w); sdw && sdw->d_idx && sdw->d_val) {
+            res = llama_seeddelta_mul_mat(ctx0, cur, sdw->d_idx, sdw->d_val, sdw->row_scale);
+        }
+    }
 
     if (statecells_ctx && statecells_ctx->enabled) {
         if (const auto * scw = statecells_ctx->find(w); scw && scw->dict && scw->codes) {
