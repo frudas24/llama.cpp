@@ -15,6 +15,7 @@ CTX="4096"
 N_PREDICT="128"
 STATECELLS_GAP="0.020"
 RUN_QA="1"
+PPL_CHUNKS="-1"
 
 OUTDIR="statecells-eval-$(date +%Y%m%d-%H%M%S)"
 
@@ -26,6 +27,7 @@ options:
   --threads N          (default: nproc)
   --ctx N              (default: 4096)
   --n-predict N        (default: 128)
+  --chunks N           max perplexity chunks (default: -1 = all)
   --statecells-gap F   (default: 0.020)
   --outdir DIR         (default: statecells-eval-YYYYmmdd-HHMMSS)
   --no-qa              skip QA generation (only perplexity)
@@ -48,6 +50,7 @@ while (( "$#" )); do
     --threads) THREADS="${2:-}"; shift 2 ;;
     --ctx) CTX="${2:-}"; shift 2 ;;
     --n-predict) N_PREDICT="${2:-}"; shift 2 ;;
+    --chunks) PPL_CHUNKS="${2:-}"; shift 2 ;;
     --statecells-gap) STATECELLS_GAP="${2:-}"; shift 2 ;;
     --outdir) OUTDIR="${2:-}"; shift 2 ;;
     --no-qa) RUN_QA="0"; shift ;;
@@ -84,8 +87,9 @@ run_perplexity() {
     -f "${TEXT_FILE}" \
     -t "${THREADS}" \
     -c "${CTX}" \
+    --chunks "${PPL_CHUNKS}" \
     --no-warmup \
-    "$@" | tee -a "${OUTDIR}/perplexity_${label}.log"
+    "$@" 2>&1 | tee -a "${OUTDIR}/perplexity_${label}.log"
   echo | tee -a "${OUTDIR}/perplexity_${label}.log"
 }
 

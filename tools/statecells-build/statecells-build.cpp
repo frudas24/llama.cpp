@@ -12,11 +12,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <regex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 static void usage(const char * argv0) {
@@ -42,6 +44,9 @@ static void usage(const char * argv0) {
     printf("  --no-row-scale       disable row_scale tensor output\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --report-json FILE   write JSON report with per-weight gap metrics (default: none)\n");
+    printf("  --imatrix FILE       use importance matrix GGUF from llama-imatrix for data-aware weighting\n");
+    printf("  --imatrix-eps F      clamp min imatrix value before sqrt (default: 1e-8)\n");
+    printf("  --imatrix-power F    exponent for imatrix weighting (default: 1.0)\n");
     printf("  --resume             resume from existing out.gguf (skip weights that already have dict+codes)\n");
     printf("  --checkpoint-every N write out.gguf every N processed layers (default: 0=off; large I/O)\n");
     printf("  --seed N             RNG seed (default: 1234)\n");
@@ -51,6 +56,296 @@ static void usage(const char * argv0) {
 static bool file_exists(const std::string & path) {
     std::ifstream ifs(path);
     return ifs.good();
+}
+
+static bool string_remove_suffix(std::string & s, const std::string & suffix) {
+    if (s.size() < suffix.size()) {
+        return false;
+    }
+    if (s.compare(s.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+    }
+    s.resize(s.size() - suffix.size());
+    return true;
+}
+
+static int load_legacy_imatrix(
+        const std::string & imatrix_file,
+        std::vector<std::string> & imatrix_datasets,
+        std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
+    std::ifstream in(imatrix_file.c_str(), std::ios::binary);
+    if (!in) {
+        fprintf(stderr, "%s: failed to open %s\n", __func__, imatrix_file.c_str());
+        return -1;
+    }
+
+    int32_t n_entries = 0;
+    in.read((char *) &n_entries, sizeof(n_entries));
+    if (in.fail() || n_entries <= 0) {
+        fprintf(stderr, "%s: no data in file %s\n", __func__, imatrix_file.c_str());
+        return -1;
+    }
+
+    imatrix_data.clear();
+    imatrix_data.reserve((size_t) n_entries);
+
+    for (int i = 0; i < n_entries; i++) {
+        int32_t len = 0;
+        in.read((char *) &len, sizeof(len));
+        if (in.fail() || len <= 0) {
+            fprintf(stderr, "%s: failed reading name for entry %d from %s\n", __func__, i + 1, imatrix_file.c_str());
+            return -1;
+        }
+
+        std::vector<char> name_as_vec((size_t) len);
+        in.read(name_as_vec.data(), len);
+        if (in.fail()) {
+            fprintf(stderr, "%s: failed reading name for entry %d from %s\n", __func__, i + 1, imatrix_file.c_str());
+            return -1;
+        }
+
+        std::string name(name_as_vec.begin(), name_as_vec.end());
+
+        int32_t ncall = 0;
+        in.read((char *) &ncall, sizeof(ncall));
+        if (in.fail() || ncall <= 0) {
+            fprintf(stderr, "%s: invalid ncall %d for entry %s\n", __func__, ncall, name.c_str());
+            return -1;
+        }
+
+        int32_t nval = 0;
+        in.read((char *) &nval, sizeof(nval));
+        if (in.fail() || nval <= 0) {
+            fprintf(stderr, "%s: invalid nval %d for entry %s\n", __func__, nval, name.c_str());
+            return -1;
+        }
+
+        auto & e = imatrix_data[name];
+        e.resize((size_t) nval);
+        in.read((char *) e.data(), (size_t) nval * sizeof(float));
+        if (in.fail()) {
+            fprintf(stderr, "%s: failed reading data for entry %s\n", __func__, name.c_str());
+            return -1;
+        }
+    }
+
+    int m_last_call = 0;
+    if (in.peek() != EOF) {
+        in.read((char *) &m_last_call, sizeof(m_last_call));
+        int dataset_len = 0;
+        in.read((char *) &dataset_len, sizeof(dataset_len));
+        if (!in.fail() && dataset_len > 0) {
+            std::vector<char> dataset_as_vec((size_t) dataset_len);
+            in.read(dataset_as_vec.data(), dataset_len);
+            if (!in.fail()) {
+                imatrix_datasets.resize(1);
+                imatrix_datasets[0].assign(dataset_as_vec.begin(), dataset_as_vec.end());
+                fprintf(stderr, "%s: imatrix dataset='%s'\n", __func__, imatrix_datasets[0].c_str());
+            }
+        }
+    }
+
+    fprintf(stderr, "%s: loaded %d importance matrix entries from %s computed on %d chunks\n",
+            __func__, int(imatrix_data.size()), imatrix_file.c_str(), m_last_call);
+
+    return m_last_call;
+}
+
+// Loads an imatrix GGUF file produced by llama-imatrix.
+// Data format matches tools/quantize loader: tensors are stored as <name>.in_sum2 and <name>.counts.
+static int load_imatrix(
+        const std::string & imatrix_file,
+        std::vector<std::string> & imatrix_datasets,
+        std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
+    static const char * const LLM_KV_IMATRIX_DATASETS    = "imatrix.datasets";
+    static const char * const LLM_KV_IMATRIX_CHUNK_COUNT = "imatrix.chunk_count";
+    static const char * const LLM_KV_IMATRIX_CHUNK_SIZE  = "imatrix.chunk_size";
+
+    struct ggml_context * ctx = nullptr;
+    struct gguf_init_params meta_gguf_params = {
+        /* .no_alloc = */ false, // the data is needed
+        /* .ctx      = */ &ctx,
+    };
+
+    struct gguf_context * ctx_gguf = gguf_init_from_file(imatrix_file.c_str(), meta_gguf_params);
+    if (!ctx_gguf) {
+        fprintf(stderr, "%s: imatrix file '%s' is using old format\n", __func__, imatrix_file.c_str());
+        return load_legacy_imatrix(imatrix_file, imatrix_datasets, imatrix_data);
+    }
+
+    const int32_t n_entries = gguf_get_n_tensors(ctx_gguf);
+    if (n_entries < 1) {
+        fprintf(stderr, "%s: no data in file %s\n", __func__, imatrix_file.c_str());
+        gguf_free(ctx_gguf);
+        ggml_free(ctx);
+        return -1;
+    }
+
+    const int dataset_idx     = gguf_find_key(ctx_gguf, LLM_KV_IMATRIX_DATASETS);
+    const int chunk_count_idx = gguf_find_key(ctx_gguf, LLM_KV_IMATRIX_CHUNK_COUNT);
+    const int chunk_size_idx  = gguf_find_key(ctx_gguf, LLM_KV_IMATRIX_CHUNK_SIZE);
+    if (dataset_idx < 0 || chunk_count_idx < 0 || chunk_size_idx < 0) {
+        fprintf(stderr, "%s: missing imatrix metadata in file %s\n", __func__, imatrix_file.c_str());
+        gguf_free(ctx_gguf);
+        ggml_free(ctx);
+        return -1;
+    }
+
+    const uint32_t chunk_size = gguf_get_val_u32(ctx_gguf, chunk_size_idx);
+    GGML_UNUSED(chunk_size);
+
+    const std::string sums_suffix{ ".in_sum2" };
+    const std::string counts_suffix{ ".counts" };
+
+    std::map<std::string, std::pair<struct ggml_tensor *, struct ggml_tensor *>> sums_counts_for;
+
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+        std::string name = cur->name;
+
+        if (name.empty()) {
+            continue;
+        }
+
+        if (string_remove_suffix(name, sums_suffix)) {
+            sums_counts_for[std::move(name)].first = cur;
+        } else if (string_remove_suffix(name, counts_suffix)) {
+            sums_counts_for[std::move(name)].second = cur;
+        }
+    }
+
+    imatrix_data.clear();
+    imatrix_data.reserve(sums_counts_for.size());
+
+    for (const auto & sc : sums_counts_for) {
+        const        std::string & name   = sc.first;
+        const struct ggml_tensor * sums   = sc.second.first;
+        const struct ggml_tensor * counts = sc.second.second;
+
+        if (!sums || !counts) {
+            fprintf(stderr, "%s: mismatched sums and counts for %s\n", __func__, name.c_str());
+            gguf_free(ctx_gguf);
+            ggml_free(ctx);
+            return -1;
+        }
+
+        const int64_t ne0 = sums->ne[0];
+        const int64_t ne1 = sums->ne[1];
+
+        auto & e = imatrix_data[name];
+        e.resize((size_t) ggml_nelements(sums));
+
+        for (int64_t j = 0; j < ne1; ++j) {
+            const float count = ((const float *) counts->data)[j];
+            if (count > 0.0f) {
+                for (int64_t i = 0; i < ne0; ++i) {
+                    e[(size_t) j * (size_t) ne0 + (size_t) i] = ((const float *) sums->data)[(size_t) j * (size_t) ne0 + (size_t) i] / count;
+                }
+            } else {
+                // Partial imatrix data, tensor never got any input during calibration.
+                for (int64_t i = 0; i < ne0; ++i) {
+                    e[(size_t) j * (size_t) ne0 + (size_t) i] = 1.0f;
+                }
+            }
+        }
+    }
+
+    const int m_last_chunk = (int) gguf_get_val_u32(ctx_gguf, chunk_count_idx);
+
+    const int64_t n_datasets = gguf_get_arr_n(ctx_gguf, dataset_idx);
+    imatrix_datasets.clear();
+    imatrix_datasets.reserve((size_t) n_datasets);
+    for (int64_t i = 0; i < n_datasets; ++i) {
+        imatrix_datasets.push_back(gguf_get_arr_str(ctx_gguf, dataset_idx, i));
+    }
+    if (!imatrix_datasets.empty()) {
+        fprintf(stderr, "%s: imatrix datasets=['%s'", __func__, imatrix_datasets[0].c_str());
+        for (size_t i = 1; i < imatrix_datasets.size(); ++i) {
+            fprintf(stderr, ", '%s'", imatrix_datasets[i].c_str());
+        }
+        fprintf(stderr, "]\n");
+    }
+
+    fprintf(stderr, "%s: loaded %d importance matrix entries from %s computed on %d chunks\n",
+            __func__, int(imatrix_data.size()), imatrix_file.c_str(), m_last_chunk);
+
+    gguf_free(ctx_gguf);
+    ggml_free(ctx);
+
+    return m_last_chunk;
+}
+
+static bool make_imatrix_sqrt_scale(
+        const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
+        const std::string & weight_name,
+        int64_t n_in,
+        float eps,
+        float power,
+        std::vector<float> & scale_out) {
+    const auto it = imatrix_data.find(weight_name);
+    if (it == imatrix_data.end()) {
+        return false;
+    }
+
+    if ((int64_t) it->second.size() < n_in) {
+        fprintf(stderr, "statecells-build: imatrix entry %s has %" PRId64 " values, expected >= %" PRId64 "\n",
+                weight_name.c_str(), (int64_t) it->second.size(), n_in);
+        return false;
+    }
+
+    eps = std::max(eps, 0.0f);
+    power = std::max(power, 0.0f);
+
+    scale_out.resize((size_t) n_in);
+    double sum = 0.0;
+    for (int64_t i = 0; i < n_in; ++i) {
+        float v = it->second[(size_t) i];
+        if (!std::isfinite(v) || v < eps) {
+            v = eps;
+        }
+
+        float s = 1.0f;
+        if (power == 0.0f) {
+            s = 1.0f;
+        } else if (power == 1.0f) {
+            s = std::sqrt(v);
+        } else {
+            s = std::pow(v, 0.5f * power);
+        }
+
+        if (!std::isfinite(s) || s <= 0.0f) {
+            s = 1.0f;
+        }
+        scale_out[(size_t) i] = s;
+        sum += (double) s;
+    }
+
+    const double mean = sum / std::max<double>(1.0, (double) n_in);
+    if (mean > 0.0) {
+        const float inv_mean = (float) (1.0 / mean);
+        for (float & s : scale_out) {
+            s *= inv_mean;
+        }
+    }
+
+    return true;
+}
+
+static void unscale_dict_inplace(
+        std::vector<float> & D,
+        int64_t n_in,
+        int64_t M,
+        const std::vector<float> & w_scale) {
+    if ((int64_t) w_scale.size() != n_in) {
+        return;
+    }
+    GGML_ASSERT((int64_t) D.size() == n_in * M);
+
+    for (int64_t j = 0; j < M; ++j) {
+        float * dcol = D.data() + j * n_in;
+        for (int64_t i = 0; i < n_in; ++i) {
+            dcol[i] /= w_scale[(size_t) i];
+        }
+    }
 }
 
 static std::vector<int64_t> parse_layer_range(const std::string & s, int64_t n_layer) {
@@ -230,7 +525,8 @@ static void train_dict_oja_kwta(
         int64_t max_samples,
         std::mt19937 & rng,
         std::vector<float> & D_out,
-        const std::string & tag) {
+        const std::string & tag,
+        const std::vector<float> * w_scale) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
 
@@ -258,6 +554,11 @@ static void train_dict_oja_kwta(
         for (int64_t s = 0; s < n_samples; ++s) {
             const int64_t col = sample_idx[s];
             read_column_f32(W, col, w);
+            if (w_scale && (int64_t) w_scale->size() == n_in) {
+                for (int64_t i = 0; i < n_in; ++i) {
+                    w[i] *= (*w_scale)[(size_t) i];
+                }
+            }
 
             // y = D^T w
             for (int64_t j = 0; j < M; ++j) {
@@ -305,7 +606,8 @@ static void encode_codes_sign(
         int n_threads,
         std::vector<int16_t> & codes_out,
         std::vector<ggml_fp16_t> * vals_out,
-        const std::string & tag) {
+        const std::string & tag,
+        const std::vector<float> * w_scale) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
 
@@ -383,6 +685,11 @@ static void encode_codes_sign(
 
         for (int64_t b = 0; b < nb; ++b) {
             read_column_f32(W, col0 + b, w);
+            if (w_scale && (int64_t) w_scale->size() == n_in) {
+                for (int64_t i = 0; i < n_in; ++i) {
+                    w[i] *= (*w_scale)[(size_t) i];
+                }
+            }
             std::memcpy(wblk_data + b * n_in, w.data(), (size_t) n_in * sizeof(float));
         }
         for (int64_t b = nb; b < B; ++b) {
@@ -453,7 +760,8 @@ static void compute_vals_sign(
         const std::vector<int16_t> & codes,
         int n_threads,
         std::vector<ggml_fp16_t> & vals_out,
-        const std::string & tag) {
+        const std::string & tag,
+        const std::vector<float> * w_scale) {
     const int64_t n_in  = W->ne[0];
     const int64_t n_out = W->ne[1];
 
@@ -526,6 +834,11 @@ static void compute_vals_sign(
 
         for (int64_t b = 0; b < nb; ++b) {
             read_column_f32(W, col0 + b, w);
+            if (w_scale && (int64_t) w_scale->size() == n_in) {
+                for (int64_t i = 0; i < n_in; ++i) {
+                    w[i] *= (*w_scale)[(size_t) i];
+                }
+            }
             std::memcpy(wblk_data + b * n_in, w.data(), (size_t) n_in * sizeof(float));
         }
         for (int64_t b = nb; b < B; ++b) {
@@ -768,6 +1081,13 @@ struct eval_metrics {
     double rel_l2_p95  = 0.0;
     double cos_mean    = 0.0;
     double cos_p05     = 0.0;
+
+    // If imatrix weighting is enabled, these are computed in the weighted space:
+    //   w' = diag(w_scale_sqrt) * w
+    double rel_l2_mean_w = 0.0;
+    double rel_l2_p95_w  = 0.0;
+    double cos_mean_w    = 0.0;
+    double cos_p05_w     = 0.0;
 };
 
 static eval_metrics eval_reconstruction_sign(
@@ -779,7 +1099,8 @@ static eval_metrics eval_reconstruction_sign(
         const std::vector<ggml_fp16_t> * vals,
         const std::vector<ggml_fp16_t> * row_scale,
         int64_t eval_cols,
-        std::mt19937 & rng) {
+        std::mt19937 & rng,
+        const std::vector<float> * w_scale_sqrt) {
     eval_metrics out;
 
     const int64_t n_in  = W->ne[0];
@@ -803,6 +1124,14 @@ static eval_metrics eval_reconstruction_sign(
     std::vector<double> cos;
     rel_l2.reserve(eval_cols);
     cos.reserve(eval_cols);
+
+    const bool do_weighted = w_scale_sqrt && (int64_t) w_scale_sqrt->size() == n_in;
+    std::vector<double> rel_l2_w;
+    std::vector<double> cos_w;
+    if (do_weighted) {
+        rel_l2_w.reserve(eval_cols);
+        cos_w.reserve(eval_cols);
+    }
 
     for (int64_t ci = 0; ci < eval_cols; ++ci) {
         const int64_t col = idx[ci];
@@ -838,6 +1167,11 @@ static eval_metrics eval_reconstruction_sign(
         double err2     = 0.0;
         double dot      = 0.0;
 
+        double w_norm2_w  = 0.0;
+        double wh_norm2_w = 0.0;
+        double err2_w     = 0.0;
+        double dot_w      = 0.0;
+
         for (int64_t i = 0; i < n_in; ++i) {
             const double wi  = w[i];
             const double wHi = scale * (double) w_hat[i];
@@ -846,12 +1180,30 @@ static eval_metrics eval_reconstruction_sign(
             wh_norm2 += wHi * wHi;
             err2     += di  * di;
             dot      += wi  * wHi;
+
+            if (do_weighted) {
+                const double s = (*w_scale_sqrt)[(size_t) i];
+                const double wi_w  = wi  * s;
+                const double wHi_w = wHi * s;
+                const double di_w  = wi_w - wHi_w;
+                w_norm2_w  += wi_w  * wi_w;
+                wh_norm2_w += wHi_w * wHi_w;
+                err2_w     += di_w  * di_w;
+                dot_w      += wi_w  * wHi_w;
+            }
         }
 
         const double denom_w = std::sqrt(std::max(w_norm2,  1e-20));
         const double denom_h = std::sqrt(std::max(wh_norm2, 1e-20));
         rel_l2.push_back(std::sqrt(std::max(err2, 0.0)) / denom_w);
         cos.push_back(dot / (denom_w * denom_h));
+
+        if (do_weighted) {
+            const double denom_w_w = std::sqrt(std::max(w_norm2_w,  1e-20));
+            const double denom_h_w = std::sqrt(std::max(wh_norm2_w, 1e-20));
+            rel_l2_w.push_back(std::sqrt(std::max(err2_w, 0.0)) / denom_w_w);
+            cos_w.push_back(dot_w / (denom_w_w * denom_h_w));
+        }
     }
 
     auto percentile = [](std::vector<double> v, double p) -> double {
@@ -873,6 +1225,18 @@ static eval_metrics eval_reconstruction_sign(
     out.rel_l2_p95  = percentile(rel_l2, 0.95);
     out.cos_mean    = cos.empty()    ? 0.0 : sum_cos / double(cos.size());
     out.cos_p05     = percentile(cos, 0.05);
+
+    if (do_weighted) {
+        double sum_rel_w = 0.0;
+        double sum_cos_w = 0.0;
+        for (size_t i = 0; i < rel_l2_w.size(); ++i) sum_rel_w += rel_l2_w[i];
+        for (size_t i = 0; i < cos_w.size();    ++i) sum_cos_w += cos_w[i];
+
+        out.rel_l2_mean_w = rel_l2_w.empty() ? 0.0 : sum_rel_w / double(rel_l2_w.size());
+        out.rel_l2_p95_w  = percentile(rel_l2_w, 0.95);
+        out.cos_mean_w    = cos_w.empty()    ? 0.0 : sum_cos_w / double(cos_w.size());
+        out.cos_p05_w     = percentile(cos_w, 0.05);
+    }
 
     return out;
 }
@@ -899,6 +1263,9 @@ int main(int argc, char ** argv) {
     bool write_row_scale = true;
     int64_t eval_cols = 0;
     std::string report_json;
+    std::string imatrix_file;
+    float imatrix_eps = 1e-8f;
+    float imatrix_power = 1.0f;
     bool resume = false;
     int64_t checkpoint_every = 0;
     int seed = 1234;
@@ -927,6 +1294,9 @@ int main(int argc, char ** argv) {
         if (arg == "--no-row-scale") { write_row_scale = false; continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
         if (arg == "--report-json" && i + 1 < argc) { report_json = argv[++i]; continue; }
+        if (arg == "--imatrix" && i + 1 < argc) { imatrix_file = argv[++i]; continue; }
+        if (arg == "--imatrix-eps" && i + 1 < argc) { imatrix_eps = std::stof(argv[++i]); continue; }
+        if (arg == "--imatrix-power" && i + 1 < argc) { imatrix_power = std::stof(argv[++i]); continue; }
         if (arg == "--resume") { resume = true; continue; }
         if (arg == "--checkpoint-every" && i + 1 < argc) { checkpoint_every = std::stoll(argv[++i]); continue; }
         if (arg == "--seed" && i + 1 < argc) { seed = std::stoi(argv[++i]); continue; }
@@ -941,6 +1311,18 @@ int main(int argc, char ** argv) {
 
     if (!report_json.empty() && eval_cols <= 0) {
         eval_cols = 64;
+    }
+
+    std::vector<std::string> imatrix_datasets;
+    std::unordered_map<std::string, std::vector<float>> imatrix_data;
+    int imatrix_chunk_count = -1;
+    if (!imatrix_file.empty()) {
+        imatrix_chunk_count = load_imatrix(imatrix_file, imatrix_datasets, imatrix_data);
+        if (imatrix_chunk_count < 0 || imatrix_data.empty()) {
+            fprintf(stderr, "statecells-build: failed to load imatrix from %s\n", imatrix_file.c_str());
+            return 1;
+        }
+        fprintf(stderr, "statecells-build: using imatrix (%zu entries)\n", imatrix_data.size());
     }
 
     const bool out_exists = file_exists(out_fname);
@@ -979,6 +1361,17 @@ int main(int argc, char ** argv) {
 
     gguf_context * dst = gguf_init_empty();
     gguf_set_kv(dst, src);
+    if (!imatrix_file.empty()) {
+        gguf_set_val_str(dst, "statecells.imatrix.file", imatrix_file.c_str());
+        if (!imatrix_datasets.empty()) {
+            gguf_set_val_str(dst, "statecells.imatrix.dataset", imatrix_datasets[0].c_str());
+        }
+        if (imatrix_chunk_count >= 0) {
+            gguf_set_val_u32(dst, "statecells.imatrix.chunks", (uint32_t) imatrix_chunk_count);
+        }
+        gguf_set_val_f32(dst, "statecells.imatrix.eps", imatrix_eps);
+        gguf_set_val_f32(dst, "statecells.imatrix.power", imatrix_power);
+    }
 
     // Add original tensors.
     for (int64_t ti = 0; ti < n_tensors; ++ti) {
@@ -1011,6 +1404,7 @@ int main(int argc, char ** argv) {
         int k_eff = 0;
         int64_t eval_cols = 0;
         eval_metrics em;
+        bool imatrix = false;
     };
     std::vector<report_row> report_rows;
 
@@ -1087,6 +1481,24 @@ int main(int argc, char ** argv) {
 
             const std::string tag = "blk." + std::to_string(il) + "." + kind;
 
+            std::vector<float> imatrix_w_scale_sqrt;
+            std::vector<float> imatrix_w_scale2;
+            const std::vector<float> * w_scale_train = nullptr;
+            const std::vector<float> * w_scale_encode = nullptr;
+
+            if (!imatrix_data.empty()) {
+                if (make_imatrix_sqrt_scale(imatrix_data, weight_name, n_in, imatrix_eps, imatrix_power, imatrix_w_scale_sqrt)) {
+                    w_scale_train = &imatrix_w_scale_sqrt;
+                    imatrix_w_scale2 = imatrix_w_scale_sqrt;
+                    for (float & v : imatrix_w_scale2) {
+                        v *= v;
+                    }
+                    w_scale_encode = &imatrix_w_scale2;
+                } else {
+                    fprintf(stderr, "statecells-build: warning: missing imatrix entry for %s; proceeding unweighted\n", weight_name.c_str());
+                }
+            }
+
             int64_t M_eff = 0;
             int k_eff = 0;
             std::vector<float> D;
@@ -1097,12 +1509,16 @@ int main(int argc, char ** argv) {
                 printf("statecells-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s M=%" PRId64 " k=%d\n",
                        il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), dict_M_cur, dict_k_cur);
 
-                train_dict_oja_kwta(W, dict_M_cur, dict_k_cur, dict_eta, dict_iters, dict_max_samples, rng, D, tag);
+                train_dict_oja_kwta(W, dict_M_cur, dict_k_cur, dict_eta, dict_iters, dict_max_samples, rng, D, tag, w_scale_train);
 
                 M_eff = std::min<int64_t>(dict_M_cur, n_out);
                 k_eff = std::min<int>(dict_k_cur, (int) M_eff);
 
-                encode_codes_sign(W, D, M_eff, k_eff, n_threads, codes, need_vals ? &vals : nullptr, tag);
+                if (w_scale_train) {
+                    unscale_dict_inplace(D, n_in, M_eff, *w_scale_train);
+                }
+
+                encode_codes_sign(W, D, M_eff, k_eff, n_threads, codes, need_vals ? &vals : nullptr, tag, w_scale_encode);
             } else {
                 ggml_tensor * t_dict  = ggml_get_tensor(ctx_data, dict_name.c_str());
                 ggml_tensor * t_codes = ggml_get_tensor(ctx_data, codes_name.c_str());
@@ -1141,7 +1557,7 @@ int main(int argc, char ** argv) {
                 std::memcpy(codes.data(), t_codes->data, codes.size() * sizeof(int16_t));
 
                 if (need_vals) {
-                    compute_vals_sign(W, D, M_eff, k_eff, codes, n_threads, vals, tag);
+                    compute_vals_sign(W, D, M_eff, k_eff, codes, n_threads, vals, tag, w_scale_encode);
                 } else if (have_vals && (need_row_scale || eval_cols > 0)) {
                     ggml_tensor * t_vals = ggml_get_tensor(ctx_data, vals_name.c_str());
                     if (!t_vals || ggml_n_dims(t_vals) != 2) {
@@ -1187,10 +1603,18 @@ int main(int argc, char ** argv) {
             eval_metrics em;
             if (eval_cols > 0) {
                 const int64_t t0 = ggml_time_us();
-                em = eval_reconstruction_sign(W, D, M_eff, k_eff, codes, vals.empty() ? nullptr : &vals, row_scale.empty() ? nullptr : &row_scale, eval_cols, rng);
+                em = eval_reconstruction_sign(W, D, M_eff, k_eff, codes, vals.empty() ? nullptr : &vals, row_scale.empty() ? nullptr : &row_scale, eval_cols, rng, w_scale_train);
                 const double sec = double(ggml_time_us() - t0) / 1e6;
-                fprintf(stderr, "  [%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f (%.1fs)\n",
-                        tag.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, sec);
+                if (w_scale_train) {
+                    fprintf(stderr, "  [%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f | rel_l2_w mean=%.4f p95=%.4f cos_w mean=%.4f p05=%.4f (%.1fs)\n",
+                            tag.c_str(), eval_cols,
+                            em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05,
+                            em.rel_l2_mean_w, em.rel_l2_p95_w, em.cos_mean_w, em.cos_p05_w,
+                            sec);
+                } else {
+                    fprintf(stderr, "  [%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f (%.1fs)\n",
+                            tag.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, sec);
+                }
             }
 
             // Allocate a dedicated ggml context for dict+codes to avoid a giant arena.
@@ -1245,7 +1669,7 @@ int main(int argc, char ** argv) {
             layer_added_any = true;
 
             if (!report_json.empty() || eval_cols > 0) {
-                report_rows.push_back(report_row{ il, kind, n_in, n_out, M_eff, k_eff, eval_cols, em });
+                report_rows.push_back(report_row{ il, kind, n_in, n_out, M_eff, k_eff, eval_cols, em, w_scale_train != nullptr });
             }
         }
 
@@ -1296,6 +1720,20 @@ int main(int argc, char ** argv) {
             ofs << "  \"resume\": "  << (resume ? "true" : "false") << ",\n";
             ofs << "  \"vals\": "    << (write_vals ? "true" : "false") << ",\n";
             ofs << "  \"row_scale\": " << (write_row_scale ? "true" : "false") << ",\n";
+            ofs << "  \"imatrix\": ";
+            if (imatrix_file.empty()) {
+                ofs << "null,\n";
+            } else {
+                ofs << "{\n";
+                ofs << "    \"file\": " << "\"" << imatrix_file << "\"" << ",\n";
+                if (!imatrix_datasets.empty()) {
+                    ofs << "    \"dataset\": " << "\"" << imatrix_datasets[0] << "\"" << ",\n";
+                }
+                ofs << "    \"chunks\": " << imatrix_chunk_count << ",\n";
+                ofs << "    \"eps\": " << imatrix_eps << ",\n";
+                ofs << "    \"power\": " << imatrix_power << "\n";
+                ofs << "  },\n";
+            }
             ofs << "  \"dict\": {\n";
             ofs << "    \"M\": " << dict_M << ",\n";
             ofs << "    \"k\": " << dict_k << ",\n";
@@ -1314,10 +1752,15 @@ int main(int argc, char ** argv) {
                 ofs << "      \"n_out\": " << r.n_out << ",\n";
                 ofs << "      \"M\": " << r.M_eff << ",\n";
                 ofs << "      \"k\": " << r.k_eff << ",\n";
+                ofs << "      \"imatrix\": " << (r.imatrix ? "true" : "false") << ",\n";
                 ofs << "      \"rel_l2_mean\": " << r.em.rel_l2_mean << ",\n";
                 ofs << "      \"rel_l2_p95\": "  << r.em.rel_l2_p95  << ",\n";
                 ofs << "      \"cos_mean\": "    << r.em.cos_mean    << ",\n";
-                ofs << "      \"cos_p05\": "     << r.em.cos_p05     << "\n";
+                ofs << "      \"cos_p05\": "     << r.em.cos_p05     << ",\n";
+                ofs << "      \"rel_l2_mean_w\": " << r.em.rel_l2_mean_w << ",\n";
+                ofs << "      \"rel_l2_p95_w\": "  << r.em.rel_l2_p95_w  << ",\n";
+                ofs << "      \"cos_mean_w\": "    << r.em.cos_mean_w    << ",\n";
+                ofs << "      \"cos_p05_w\": "     << r.em.cos_p05_w     << "\n";
                 ofs << "    }" << (i + 1 == report_rows.size() ? "\n" : ",\n");
             }
             ofs << "  ]\n";
