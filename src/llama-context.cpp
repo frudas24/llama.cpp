@@ -141,29 +141,63 @@ llama_context::llama_context(
     seeddelta_ctx.gap_tol = params.seeddelta_gap_tol;
     if (seeddelta_ctx.enabled) {
         auto try_add_seeddelta = [&](ggml_tensor * w,
-                                    ggml_tensor * d_idx, ggml_tensor * d_val, ggml_tensor * row_scale,
+                                    ggml_tensor * d_idx, ggml_tensor * d_val,
+                                    ggml_tensor * b_idx, ggml_tensor * b_val,
+                                    ggml_tensor * row_scale,
                                     ggml_tensor * base_d1, ggml_tensor * base_d2, ggml_tensor * base_d3,
                                     ggml_tensor * base_perm1, ggml_tensor * base_perm2,
                                     const char * name) {
-            if (!w || !d_idx || !d_val) {
+            if (!w) {
                 return;
             }
 
-            if (ggml_n_dims(d_idx) != 2 || ggml_n_dims(d_val) != 2) {
-                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid dims\n", __func__, name);
+            const bool have_coo   = d_idx && d_val;
+            const bool have_block = b_idx && b_val;
+            if (!have_coo && !have_block) {
                 return;
             }
-            if ((d_idx->type != GGML_TYPE_I16 && d_idx->type != GGML_TYPE_I32) ||
-                (d_val->type != GGML_TYPE_F16 && d_val->type != GGML_TYPE_F32)) {
-                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid types\n", __func__, name);
-                return;
+
+            if (have_coo) {
+                if (ggml_n_dims(d_idx) != 2 || ggml_n_dims(d_val) != 2) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid COO dims\n", __func__, name);
+                    d_idx = d_val = nullptr;
+                } else if ((d_idx->type != GGML_TYPE_I16 && d_idx->type != GGML_TYPE_I32) ||
+                           (d_val->type != GGML_TYPE_F16 && d_val->type != GGML_TYPE_F32)) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid COO types\n", __func__, name);
+                    d_idx = d_val = nullptr;
+                } else if (d_idx->ne[0] != d_val->ne[0] || d_idx->ne[1] != d_val->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched COO idx/val shapes\n", __func__, name);
+                    d_idx = d_val = nullptr;
+                } else if (w->ne[1] != d_idx->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched COO shapes\n", __func__, name);
+                    d_idx = d_val = nullptr;
+                }
             }
-            if (d_idx->ne[0] != d_val->ne[0] || d_idx->ne[1] != d_val->ne[1]) {
-                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched idx/val shapes\n", __func__, name);
-                return;
+
+            if (have_block) {
+                if (ggml_n_dims(b_idx) != 2 || ggml_n_dims(b_val) != 3) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid block dims\n", __func__, name);
+                    b_idx = b_val = nullptr;
+                } else if ((b_idx->type != GGML_TYPE_I16 && b_idx->type != GGML_TYPE_I32) ||
+                           (b_val->type != GGML_TYPE_F16 && b_val->type != GGML_TYPE_F32)) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to invalid block types\n", __func__, name);
+                    b_idx = b_val = nullptr;
+                } else if (b_val->ne[1] != b_idx->ne[0] || b_val->ne[2] != b_idx->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched block idx/val shapes\n", __func__, name);
+                    b_idx = b_val = nullptr;
+                } else if (w->ne[1] != b_idx->ne[1]) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched block shapes\n", __func__, name);
+                    b_idx = b_val = nullptr;
+                }
             }
-            if (w->ne[1] != d_idx->ne[1]) {
-                LLAMA_LOG_WARN("%s: ignoring seeddelta %s due to mismatched shapes\n", __func__, name);
+
+            if (!d_idx || !d_val) {
+                d_idx = d_val = nullptr;
+            }
+            if (!b_idx || !b_val) {
+                b_idx = b_val = nullptr;
+            }
+            if (!d_idx && !b_idx) {
                 return;
             }
 
@@ -232,7 +266,9 @@ llama_context::llama_context(
             }
 
             seeddelta_ctx.weights.emplace(w, llama_seeddelta_weight{
-                d_idx, d_val, row_scale,
+                d_idx, d_val,
+                b_idx, b_val,
+                row_scale,
                 base_d1, base_d2, base_d3,
                 base_perm1, base_perm2,
             });
@@ -242,24 +278,30 @@ llama_context::llama_context(
             const auto & layer = model.layers[il];
 
             try_add_seeddelta(layer.ffn_gate,
-                              layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale,
+                              layer.ffn_gate_d_idx, layer.ffn_gate_d_val,
+                              layer.ffn_gate_b_idx, layer.ffn_gate_b_val,
+                              layer.ffn_gate_d_row_scale,
                               layer.ffn_gate_base_d1, layer.ffn_gate_base_d2, layer.ffn_gate_base_d3,
                               layer.ffn_gate_base_perm1, layer.ffn_gate_base_perm2,
                               "ffn_gate");
             try_add_seeddelta(layer.ffn_up,
-                              layer.ffn_up_d_idx, layer.ffn_up_d_val, layer.ffn_up_d_row_scale,
+                              layer.ffn_up_d_idx, layer.ffn_up_d_val,
+                              layer.ffn_up_b_idx, layer.ffn_up_b_val,
+                              layer.ffn_up_d_row_scale,
                               layer.ffn_up_base_d1, layer.ffn_up_base_d2, layer.ffn_up_base_d3,
                               layer.ffn_up_base_perm1, layer.ffn_up_base_perm2,
                               "ffn_up");
             try_add_seeddelta(layer.ffn_down,
-                              layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale,
+                              layer.ffn_down_d_idx, layer.ffn_down_d_val,
+                              layer.ffn_down_b_idx, layer.ffn_down_b_val,
+                              layer.ffn_down_d_row_scale,
                               layer.ffn_down_base_d1, layer.ffn_down_base_d2, layer.ffn_down_base_d3,
                               layer.ffn_down_base_perm1, layer.ffn_down_base_perm2,
                               "ffn_down");
         }
 
         if (seeddelta_ctx.weights.empty()) {
-            LLAMA_LOG_WARN("%s: seeddelta enabled but no d_idx/d_val found, disabling\n", __func__);
+            LLAMA_LOG_WARN("%s: seeddelta enabled but no delta tensors found, disabling\n", __func__);
             seeddelta_ctx.enabled = false;
         }
     }
