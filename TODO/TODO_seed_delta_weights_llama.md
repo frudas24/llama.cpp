@@ -238,6 +238,7 @@ Inputs:
 * `--seed N` + `--seed-search NTRIALS` (opcional)
 * `--scheme coo|block|codebook_resid`
 * `--K 16|32|64` o `--block 32|64`
+* `--K-gate N --K-up N --K-down N` *(overrides por matriz; útil para probar “down más alto” barato)*
 * `--vals fp16|int8` + escalas
 * `--row-scale`
 * `--imatrix file --imatrix-power p --imatrix-eps eps`
@@ -620,7 +621,7 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
 ./llama.cpp/build/bin/llama-seeddelta-build \
   -i "$IN" -o "$OUT" \
   --layers 0-1 \
-  --K 64 \
+  --K-gate 64 --K-up 64 --K-down 128 \
   --base --base-max-samples 2048 --base-perm-trials 4 \
   --row-scale \
   --imatrix "$IM" \

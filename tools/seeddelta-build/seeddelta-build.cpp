@@ -24,6 +24,9 @@ static void usage(const char * argv0) {
     printf("options:\n");
     printf("  --layers A-B         restrict to layer range (default: all)\n");
     printf("  --K N                top-K residual entries per output (default: 32)\n");
+    printf("  --K-gate N           override top-K for ffn_gate\n");
+    printf("  --K-up N             override top-K for ffn_up\n");
+    printf("  --K-down N           override top-K for ffn_down\n");
     printf("  --idx-type i16|i32   index tensor type (default: i16)\n");
     printf("  --val-type f16|f32   value tensor type (default: f16)\n");
     printf("  --row-scale          write per-output d_row_scale tensor (default: off)\n");
@@ -1272,6 +1275,9 @@ int main(int argc, char ** argv) {
     std::string report_json;
 
     int64_t K = 32;
+    int64_t K_gate = -1;
+    int64_t K_up   = -1;
+    int64_t K_down = -1;
     std::string idx_type_str = "i16";
     std::string val_type_str = "f16";
     bool write_row_scale = false;
@@ -1291,6 +1297,9 @@ int main(int argc, char ** argv) {
         if ((arg == "-o" || arg == "--output") && i + 1 < argc) { out_fname = argv[++i]; continue; }
         if (arg == "--layers" && i + 1 < argc) { layers_range = argv[++i]; continue; }
         if (arg == "--K" && i + 1 < argc) { K = std::stoll(argv[++i]); continue; }
+        if (arg == "--K-gate" && i + 1 < argc) { K_gate = std::stoll(argv[++i]); continue; }
+        if (arg == "--K-up"   && i + 1 < argc) { K_up   = std::stoll(argv[++i]); continue; }
+        if (arg == "--K-down" && i + 1 < argc) { K_down = std::stoll(argv[++i]); continue; }
         if (arg == "--idx-type" && i + 1 < argc) { idx_type_str = argv[++i]; continue; }
         if (arg == "--val-type" && i + 1 < argc) { val_type_str = argv[++i]; continue; }
         if (arg == "--row-scale") { write_row_scale = true; continue; }
@@ -1385,6 +1394,12 @@ int main(int argc, char ** argv) {
     int64_t n_added = 0;
     std::vector<report_entry> report;
 
+    const int64_t K_default = std::max<int64_t>(1, K);
+    const int64_t K_gate_eff = (K_gate > 0 ? K_gate : K_default);
+    const int64_t K_up_eff   = (K_up   > 0 ? K_up   : K_default);
+    const int64_t K_down_eff = (K_down > 0 ? K_down : K_default);
+    const bool K_variable = (K_gate_eff != K_default) || (K_up_eff != K_default) || (K_down_eff != K_default);
+
     for (const int64_t il : layers) {
         for (const auto & kind : kinds) {
             const std::string weight_name = "blk." + std::to_string(il) + "." + kind + ".weight";
@@ -1408,7 +1423,11 @@ int main(int argc, char ** argv) {
 
             const int64_t n_in  = W->ne[0];
             const int64_t n_out = W->ne[1];
-            const int64_t K_eff = std::max<int64_t>(1, std::min<int64_t>(K, n_in));
+            const int64_t K_kind =
+                    kind == "ffn_gate" ? K_gate_eff :
+                    kind == "ffn_up"   ? K_up_eff   :
+                                        K_down_eff;
+            const int64_t K_eff = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
             const bool is_tall = n_out >= n_in;
 
             std::vector<float> w_scale;
@@ -1734,7 +1753,13 @@ int main(int argc, char ** argv) {
     gguf_set_val_u32(dst, "seeddelta.version", 1);
     gguf_set_val_u32(dst, "seeddelta.scheme", 0); // COO residual
     gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
-    gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K);
+    gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
+    gguf_set_val_bool(dst, "seeddelta.resid.K_variable", K_variable);
+    if (K_variable) {
+        gguf_set_val_u32(dst, "seeddelta.resid.K_gate", (uint32_t) K_gate_eff);
+        gguf_set_val_u32(dst, "seeddelta.resid.K_up",   (uint32_t) K_up_eff);
+        gguf_set_val_u32(dst, "seeddelta.resid.K_down", (uint32_t) K_down_eff);
+    }
     gguf_set_val_bool(dst, "seeddelta.base.enabled", write_base);
     if (write_base) {
         gguf_set_val_u32(dst, "seeddelta.base.kind", 1);  // hadamard_acdc_stack
@@ -1795,7 +1820,10 @@ int main(int argc, char ** argv) {
             out << "],\n";
         }
         out << "  \"resid\": {\n";
-        out << "    \"K\": " << K << ",\n";
+        out << "    \"K\": " << K_default << ",\n";
+        out << "    \"K_gate\": " << K_gate_eff << ",\n";
+        out << "    \"K_up\": " << K_up_eff << ",\n";
+        out << "    \"K_down\": " << K_down_eff << ",\n";
         out << "    \"idx_type\": \"" << json_escape(idx_type_str) << "\",\n";
         out << "    \"val_type\": \"" << json_escape(val_type_str) << "\",\n";
         out << "    \"row_scale\": " << (write_row_scale ? "true" : "false") << "\n";
