@@ -554,3 +554,56 @@ TEXT="calibration/gemma_calibration.txt"
   --text "$TEXT" \
   --threads 16 --ctx 512 --chunks 16 --no-qa
 ```
+
+### 10.5 Prueba intermedia (Gemma 3 4B IT) antes de Devstral
+
+> Objetivo: validar que el pipeline (imatrix → seeddelta-build → runtime) funciona en un modelo más grande.
+
+#### 10.5.1 Generar imatrix (Gemma 4B)
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf"
+CAL="llama.cpp/calibration/gemma_calibration.txt"
+IM="llama.cpp/calibration/gemma4b.imatrix.gguf"
+
+./llama.cpp/build/bin/llama-imatrix \
+  -m "$IN" -f "$CAL" -o "$IM" \
+  -t 16 -c 512 --no-ppl --chunks 8
+```
+
+#### 10.5.2 Build SeedΔ (capas medias 16–17)
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf"
+IM="llama.cpp/calibration/gemma4b.imatrix.gguf"
+OUT="llama.cpp/calibration/gemma4b_sd_mid_16-17_block16_k64.gguf"
+
+./llama.cpp/build/bin/llama-seeddelta-build \
+  -i "$IN" -o "$OUT" \
+  --layers 16-17 \
+  --scheme block --block 16 \
+  --K-gate 64 --K-up 64 --K-down 128 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
+  --row-scale --imatrix "$IM" \
+  -t 16 --eval-cols 64 --eval-x 16 \
+  --report-json llama.cpp/calibration/gemma4b_sd_mid_16-17_block16_k64.json
+```
+
+#### 10.5.3 Comparar PPL (A/B)
+
+```bash
+./llama.cpp/scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   "$OUT" \
+  --text "$CAL" \
+  --threads 16 --ctx 512 --chunks 16 --no-qa \
+  --outdir llama.cpp/calibration/seeddelta-eval-gemma4b-mid_16-17-block16_k64
+```
+
+#### 10.5.4 Resultado esperado (sanity)
+
+* Este harness usa `gemma_calibration.txt` (placeholder), así que la PPL absoluta no es un gate; solo sirve para ver que **no explota**.
+* En mi corrida (misma máquina, `ctx=512`, `chunks=16`):
+  * base: `PPL ≈ 1.0001`, prompt `≈ 61.7 tok/s`
+  * seeddelta(block16): `PPL ≈ 1.0022`, prompt `≈ 51.8 tok/s`
+* Nota: en esta etapa el GGUF output aún incluye pesos densos + tensores SeedΔ (sirve para iterar/fallback). El ahorro de RAM real requiere la fase “strip/skip dense”.
