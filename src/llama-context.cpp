@@ -140,7 +140,11 @@ llama_context::llama_context(
     seeddelta_ctx.enabled = params.seeddelta;
     seeddelta_ctx.gap_tol = params.seeddelta_gap_tol;
     if (seeddelta_ctx.enabled) {
-        auto try_add_seeddelta = [&](ggml_tensor * w, ggml_tensor * d_idx, ggml_tensor * d_val, ggml_tensor * row_scale, const char * name) {
+        auto try_add_seeddelta = [&](ggml_tensor * w,
+                                    ggml_tensor * d_idx, ggml_tensor * d_val, ggml_tensor * row_scale,
+                                    ggml_tensor * base_d1, ggml_tensor * base_d2, ggml_tensor * base_d3,
+                                    ggml_tensor * base_perm1, ggml_tensor * base_perm2,
+                                    const char * name) {
             if (!w || !d_idx || !d_val) {
                 return;
             }
@@ -172,15 +176,86 @@ llama_context::llama_context(
                 }
             }
 
-            seeddelta_ctx.weights.emplace(w, llama_seeddelta_weight{ d_idx, d_val, row_scale });
+            const int64_t n_in  = w->ne[0];
+            const int64_t n_out = w->ne[1];
+
+            const bool have_base = base_d1 || base_d2 || base_d3 || base_perm1 || base_perm2;
+            if (have_base) {
+                if (!base_d1 || ggml_n_dims(base_d1) != 2 ||
+                    (base_d1->type != GGML_TYPE_F16 && base_d1->type != GGML_TYPE_F32)) {
+                    LLAMA_LOG_WARN("%s: ignoring seeddelta %s base due to invalid base_d1\n", __func__, name);
+                    base_d1 = base_d2 = base_d3 = base_perm1 = base_perm2 = nullptr;
+                } else {
+                    const int64_t L = base_d1->ne[0];
+                    const int64_t B = base_d1->ne[1];
+
+                    const bool is_pow2 = (L > 0) && ((L & (L - 1)) == 0);
+                    const int64_t need_L = std::min(n_in, n_out);
+                    const int64_t need_B = (std::max(n_in, n_out) + L - 1) / L;
+
+                    if (!is_pow2 || L < need_L || B < need_B) {
+                        LLAMA_LOG_WARN("%s: ignoring seeddelta %s base due to invalid L/B (L=%" PRId64 ", B=%" PRId64 ", need_L=%" PRId64 ", need_B=%" PRId64 ")\n",
+                                       __func__, name, L, B, need_L, need_B);
+                        base_d1 = base_d2 = base_d3 = base_perm1 = base_perm2 = nullptr;
+                    }
+                }
+
+                auto validate_base_same = [&](ggml_tensor *& t, const char * tname, bool is_perm) {
+                    if (!t || !base_d1) return;
+                    if (ggml_n_dims(t) != 2) {
+                        LLAMA_LOG_WARN("%s: ignoring seeddelta %s %s due to invalid dims\n", __func__, name, tname);
+                        t = nullptr;
+                        return;
+                    }
+                    if (t->ne[0] != base_d1->ne[0] || t->ne[1] != base_d1->ne[1]) {
+                        LLAMA_LOG_WARN("%s: ignoring seeddelta %s %s due to mismatched shape\n", __func__, name, tname);
+                        t = nullptr;
+                        return;
+                    }
+                    if (is_perm) {
+                        if (t->type != GGML_TYPE_I16 && t->type != GGML_TYPE_I32) {
+                            LLAMA_LOG_WARN("%s: ignoring seeddelta %s %s due to invalid type\n", __func__, name, tname);
+                            t = nullptr;
+                        }
+                    } else {
+                        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32) {
+                            LLAMA_LOG_WARN("%s: ignoring seeddelta %s %s due to invalid type\n", __func__, name, tname);
+                            t = nullptr;
+                        }
+                    }
+                };
+
+                validate_base_same(base_d2,    "base_d2",    false);
+                validate_base_same(base_d3,    "base_d3",    false);
+                validate_base_same(base_perm1, "base_perm1", true);
+                validate_base_same(base_perm2, "base_perm2", true);
+            }
+
+            seeddelta_ctx.weights.emplace(w, llama_seeddelta_weight{
+                d_idx, d_val, row_scale,
+                base_d1, base_d2, base_d3,
+                base_perm1, base_perm2,
+            });
         };
 
         for (int il = 0; il < (int) hparams.n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            try_add_seeddelta(layer.ffn_gate, layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale, "ffn_gate");
-            try_add_seeddelta(layer.ffn_up,   layer.ffn_up_d_idx,   layer.ffn_up_d_val,   layer.ffn_up_d_row_scale,   "ffn_up");
-            try_add_seeddelta(layer.ffn_down, layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale, "ffn_down");
+            try_add_seeddelta(layer.ffn_gate,
+                              layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale,
+                              layer.ffn_gate_base_d1, layer.ffn_gate_base_d2, layer.ffn_gate_base_d3,
+                              layer.ffn_gate_base_perm1, layer.ffn_gate_base_perm2,
+                              "ffn_gate");
+            try_add_seeddelta(layer.ffn_up,
+                              layer.ffn_up_d_idx, layer.ffn_up_d_val, layer.ffn_up_d_row_scale,
+                              layer.ffn_up_base_d1, layer.ffn_up_base_d2, layer.ffn_up_base_d3,
+                              layer.ffn_up_base_perm1, layer.ffn_up_base_perm2,
+                              "ffn_up");
+            try_add_seeddelta(layer.ffn_down,
+                              layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale,
+                              layer.ffn_down_base_d1, layer.ffn_down_base_d2, layer.ffn_down_base_d3,
+                              layer.ffn_down_base_perm1, layer.ffn_down_base_perm2,
+                              "ffn_down");
         }
 
         if (seeddelta_ctx.weights.empty()) {

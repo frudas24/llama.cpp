@@ -285,12 +285,27 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_d_idx      = nullptr; // [K, n_ff], I16/I32
     struct ggml_tensor * ffn_gate_d_val      = nullptr; // [K, n_ff], F16/F32
     struct ggml_tensor * ffn_gate_d_row_scale = nullptr; // optional, [n_ff]
+    struct ggml_tensor * ffn_gate_base_d1    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_gate_base_d2    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_gate_base_d3    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_gate_base_perm1 = nullptr; // [L, B], I16/I32
+    struct ggml_tensor * ffn_gate_base_perm2 = nullptr; // [L, B], I16/I32
     struct ggml_tensor * ffn_up_d_idx        = nullptr; // [K, n_ff], I16/I32
     struct ggml_tensor * ffn_up_d_val        = nullptr; // [K, n_ff], F16/F32
     struct ggml_tensor * ffn_up_d_row_scale  = nullptr; // optional, [n_ff]
+    struct ggml_tensor * ffn_up_base_d1      = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_up_base_d2      = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_up_base_d3      = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_up_base_perm1   = nullptr; // [L, B], I16/I32
+    struct ggml_tensor * ffn_up_base_perm2   = nullptr; // [L, B], I16/I32
     struct ggml_tensor * ffn_down_d_idx      = nullptr; // [K, n_embd], I16/I32
     struct ggml_tensor * ffn_down_d_val      = nullptr; // [K, n_embd], F16/F32
     struct ggml_tensor * ffn_down_d_row_scale = nullptr; // optional, [n_embd]
+    struct ggml_tensor * ffn_down_base_d1    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_down_base_d2    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_down_base_d3    = nullptr; // [L, B], F16/F32
+    struct ggml_tensor * ffn_down_base_perm1 = nullptr; // [L, B], I16/I32
+    struct ggml_tensor * ffn_down_base_perm2 = nullptr; // [L, B], I16/I32
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp    = nullptr;

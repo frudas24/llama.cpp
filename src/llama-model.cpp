@@ -2680,8 +2680,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_vals,   layer.ffn_up_row_scale);
                             try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_vals, layer.ffn_down_row_scale);
 
-                            // Optional SeedΔ residual COO tensors, if present in GGUF.
-                            auto try_seeddelta = [&](llm_tensor t, ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale) {
+                            // Optional SeedΔ tensors, if present in GGUF.
+                            // These must be created to keep tensor counts consistent when using extended GGUFs.
+                            auto try_seeddelta = [&](llm_tensor t,
+                                                    ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale,
+                                                    ggml_tensor *& base_d1, ggml_tensor *& base_d2, ggml_tensor *& base_d3,
+                                                    ggml_tensor *& base_perm1, ggml_tensor *& base_perm2) {
                                 const auto tn_d_idx = tn(t, "d_idx", i);
                                 if (auto * meta_d_idx = ml.get_tensor_meta(tn_d_idx.str().c_str())) {
                                     d_idx = create_tensor(tn_d_idx, { meta_d_idx->ne[0], meta_d_idx->ne[1], meta_d_idx->ne[2], meta_d_idx->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -2696,10 +2700,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 if (auto * meta_d_row_scale = ml.get_tensor_meta(tn_d_row_scale.str().c_str())) {
                                     d_row_scale = create_tensor(tn_d_row_scale, { meta_d_row_scale->ne[0], meta_d_row_scale->ne[1], meta_d_row_scale->ne[2], meta_d_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
                                 }
+
+                                const auto tn_base_d1 = tn(t, "base_d1", i);
+                                if (auto * meta_base_d1 = ml.get_tensor_meta(tn_base_d1.str().c_str())) {
+                                    base_d1 = create_tensor(tn_base_d1, { meta_base_d1->ne[0], meta_base_d1->ne[1], meta_base_d1->ne[2], meta_base_d1->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+
+                                const auto tn_base_d2 = tn(t, "base_d2", i);
+                                if (auto * meta_base_d2 = ml.get_tensor_meta(tn_base_d2.str().c_str())) {
+                                    base_d2 = create_tensor(tn_base_d2, { meta_base_d2->ne[0], meta_base_d2->ne[1], meta_base_d2->ne[2], meta_base_d2->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+
+                                const auto tn_base_d3 = tn(t, "base_d3", i);
+                                if (auto * meta_base_d3 = ml.get_tensor_meta(tn_base_d3.str().c_str())) {
+                                    base_d3 = create_tensor(tn_base_d3, { meta_base_d3->ne[0], meta_base_d3->ne[1], meta_base_d3->ne[2], meta_base_d3->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+
+                                const auto tn_base_perm1 = tn(t, "base_perm1", i);
+                                if (auto * meta_base_perm1 = ml.get_tensor_meta(tn_base_perm1.str().c_str())) {
+                                    base_perm1 = create_tensor(tn_base_perm1, { meta_base_perm1->ne[0], meta_base_perm1->ne[1], meta_base_perm1->ne[2], meta_base_perm1->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
+
+                                const auto tn_base_perm2 = tn(t, "base_perm2", i);
+                                if (auto * meta_base_perm2 = ml.get_tensor_meta(tn_base_perm2.str().c_str())) {
+                                    base_perm2 = create_tensor(tn_base_perm2, { meta_base_perm2->ne[0], meta_base_perm2->ne[1], meta_base_perm2->ne[2], meta_base_perm2->ne[3] }, TENSOR_NOT_REQUIRED);
+                                }
                             };
-                            try_seeddelta(LLM_TENSOR_FFN_GATE, layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale);
-                            try_seeddelta(LLM_TENSOR_FFN_UP,   layer.ffn_up_d_idx,   layer.ffn_up_d_val,   layer.ffn_up_d_row_scale);
-                            try_seeddelta(LLM_TENSOR_FFN_DOWN, layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale);
+                            try_seeddelta(LLM_TENSOR_FFN_GATE,
+                                          layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale,
+                                          layer.ffn_gate_base_d1, layer.ffn_gate_base_d2, layer.ffn_gate_base_d3,
+                                          layer.ffn_gate_base_perm1, layer.ffn_gate_base_perm2);
+                            try_seeddelta(LLM_TENSOR_FFN_UP,
+                                          layer.ffn_up_d_idx, layer.ffn_up_d_val, layer.ffn_up_d_row_scale,
+                                          layer.ffn_up_base_d1, layer.ffn_up_base_d2, layer.ffn_up_base_d3,
+                                          layer.ffn_up_base_perm1, layer.ffn_up_base_perm2);
+                            try_seeddelta(LLM_TENSOR_FFN_DOWN,
+                                          layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale,
+                                          layer.ffn_down_base_d1, layer.ffn_down_base_d2, layer.ffn_down_base_d3,
+                                          layer.ffn_down_base_perm1, layer.ffn_down_base_perm2);
 
                             // optional MLP bias
                             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
@@ -4010,8 +4048,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_vals,   layer.ffn_up_row_scale);
                         try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_vals, layer.ffn_down_row_scale);
 
-                        // Optional SeedΔ residual COO tensors, if present in GGUF.
-                        auto try_seeddelta = [&](llm_tensor t, ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale) {
+                        // Optional SeedΔ tensors, if present in GGUF.
+                        // These must be created to keep tensor counts consistent when using extended GGUFs.
+                        auto try_seeddelta = [&](llm_tensor t,
+                                                ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale,
+                                                ggml_tensor *& base_d1, ggml_tensor *& base_d2, ggml_tensor *& base_d3,
+                                                ggml_tensor *& base_perm1, ggml_tensor *& base_perm2) {
                             const auto tn_d_idx = tn(t, "d_idx", i);
                             if (auto * meta_d_idx = ml.get_tensor_meta(tn_d_idx.str().c_str())) {
                                 d_idx = create_tensor(tn_d_idx, { meta_d_idx->ne[0], meta_d_idx->ne[1], meta_d_idx->ne[2], meta_d_idx->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -4026,10 +4068,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_d_row_scale = ml.get_tensor_meta(tn_d_row_scale.str().c_str())) {
                                 d_row_scale = create_tensor(tn_d_row_scale, { meta_d_row_scale->ne[0], meta_d_row_scale->ne[1], meta_d_row_scale->ne[2], meta_d_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_base_d1 = tn(t, "base_d1", i);
+                            if (auto * meta_base_d1 = ml.get_tensor_meta(tn_base_d1.str().c_str())) {
+                                base_d1 = create_tensor(tn_base_d1, { meta_base_d1->ne[0], meta_base_d1->ne[1], meta_base_d1->ne[2], meta_base_d1->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_d2 = tn(t, "base_d2", i);
+                            if (auto * meta_base_d2 = ml.get_tensor_meta(tn_base_d2.str().c_str())) {
+                                base_d2 = create_tensor(tn_base_d2, { meta_base_d2->ne[0], meta_base_d2->ne[1], meta_base_d2->ne[2], meta_base_d2->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_d3 = tn(t, "base_d3", i);
+                            if (auto * meta_base_d3 = ml.get_tensor_meta(tn_base_d3.str().c_str())) {
+                                base_d3 = create_tensor(tn_base_d3, { meta_base_d3->ne[0], meta_base_d3->ne[1], meta_base_d3->ne[2], meta_base_d3->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_perm1 = tn(t, "base_perm1", i);
+                            if (auto * meta_base_perm1 = ml.get_tensor_meta(tn_base_perm1.str().c_str())) {
+                                base_perm1 = create_tensor(tn_base_perm1, { meta_base_perm1->ne[0], meta_base_perm1->ne[1], meta_base_perm1->ne[2], meta_base_perm1->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_perm2 = tn(t, "base_perm2", i);
+                            if (auto * meta_base_perm2 = ml.get_tensor_meta(tn_base_perm2.str().c_str())) {
+                                base_perm2 = create_tensor(tn_base_perm2, { meta_base_perm2->ne[0], meta_base_perm2->ne[1], meta_base_perm2->ne[2], meta_base_perm2->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_seeddelta(LLM_TENSOR_FFN_GATE, layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale);
-                        try_seeddelta(LLM_TENSOR_FFN_UP,   layer.ffn_up_d_idx,   layer.ffn_up_d_val,   layer.ffn_up_d_row_scale);
-                        try_seeddelta(LLM_TENSOR_FFN_DOWN, layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale);
+                        try_seeddelta(LLM_TENSOR_FFN_GATE,
+                                      layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale,
+                                      layer.ffn_gate_base_d1, layer.ffn_gate_base_d2, layer.ffn_gate_base_d3,
+                                      layer.ffn_gate_base_perm1, layer.ffn_gate_base_perm2);
+                        try_seeddelta(LLM_TENSOR_FFN_UP,
+                                      layer.ffn_up_d_idx, layer.ffn_up_d_val, layer.ffn_up_d_row_scale,
+                                      layer.ffn_up_base_d1, layer.ffn_up_base_d2, layer.ffn_up_base_d3,
+                                      layer.ffn_up_base_perm1, layer.ffn_up_base_perm2);
+                        try_seeddelta(LLM_TENSOR_FFN_DOWN,
+                                      layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale,
+                                      layer.ffn_down_base_d1, layer.ffn_down_base_d2, layer.ffn_down_base_d3,
+                                      layer.ffn_down_base_perm1, layer.ffn_down_base_perm2);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
                     }
                 } break;
@@ -4098,8 +4174,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         try_statecells(LLM_TENSOR_FFN_UP,   layer.ffn_up_dict,   layer.ffn_up_codes,   layer.ffn_up_vals,   layer.ffn_up_row_scale);
                         try_statecells(LLM_TENSOR_FFN_DOWN, layer.ffn_down_dict, layer.ffn_down_codes, layer.ffn_down_vals, layer.ffn_down_row_scale);
 
-                        // Optional SeedΔ residual COO tensors, if present in GGUF.
-                        auto try_seeddelta = [&](llm_tensor t, ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale) {
+                        // Optional SeedΔ tensors, if present in GGUF.
+                        // These must be created to keep tensor counts consistent when using extended GGUFs.
+                        auto try_seeddelta = [&](llm_tensor t,
+                                                ggml_tensor *& d_idx, ggml_tensor *& d_val, ggml_tensor *& d_row_scale,
+                                                ggml_tensor *& base_d1, ggml_tensor *& base_d2, ggml_tensor *& base_d3,
+                                                ggml_tensor *& base_perm1, ggml_tensor *& base_perm2) {
                             const auto tn_d_idx = tn(t, "d_idx", i);
                             if (auto * meta_d_idx = ml.get_tensor_meta(tn_d_idx.str().c_str())) {
                                 d_idx = create_tensor(tn_d_idx, { meta_d_idx->ne[0], meta_d_idx->ne[1], meta_d_idx->ne[2], meta_d_idx->ne[3] }, TENSOR_NOT_REQUIRED);
@@ -4114,10 +4194,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             if (auto * meta_d_row_scale = ml.get_tensor_meta(tn_d_row_scale.str().c_str())) {
                                 d_row_scale = create_tensor(tn_d_row_scale, { meta_d_row_scale->ne[0], meta_d_row_scale->ne[1], meta_d_row_scale->ne[2], meta_d_row_scale->ne[3] }, TENSOR_NOT_REQUIRED);
                             }
+
+                            const auto tn_base_d1 = tn(t, "base_d1", i);
+                            if (auto * meta_base_d1 = ml.get_tensor_meta(tn_base_d1.str().c_str())) {
+                                base_d1 = create_tensor(tn_base_d1, { meta_base_d1->ne[0], meta_base_d1->ne[1], meta_base_d1->ne[2], meta_base_d1->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_d2 = tn(t, "base_d2", i);
+                            if (auto * meta_base_d2 = ml.get_tensor_meta(tn_base_d2.str().c_str())) {
+                                base_d2 = create_tensor(tn_base_d2, { meta_base_d2->ne[0], meta_base_d2->ne[1], meta_base_d2->ne[2], meta_base_d2->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_d3 = tn(t, "base_d3", i);
+                            if (auto * meta_base_d3 = ml.get_tensor_meta(tn_base_d3.str().c_str())) {
+                                base_d3 = create_tensor(tn_base_d3, { meta_base_d3->ne[0], meta_base_d3->ne[1], meta_base_d3->ne[2], meta_base_d3->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_perm1 = tn(t, "base_perm1", i);
+                            if (auto * meta_base_perm1 = ml.get_tensor_meta(tn_base_perm1.str().c_str())) {
+                                base_perm1 = create_tensor(tn_base_perm1, { meta_base_perm1->ne[0], meta_base_perm1->ne[1], meta_base_perm1->ne[2], meta_base_perm1->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
+
+                            const auto tn_base_perm2 = tn(t, "base_perm2", i);
+                            if (auto * meta_base_perm2 = ml.get_tensor_meta(tn_base_perm2.str().c_str())) {
+                                base_perm2 = create_tensor(tn_base_perm2, { meta_base_perm2->ne[0], meta_base_perm2->ne[1], meta_base_perm2->ne[2], meta_base_perm2->ne[3] }, TENSOR_NOT_REQUIRED);
+                            }
                         };
-                        try_seeddelta(LLM_TENSOR_FFN_GATE, layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale);
-                        try_seeddelta(LLM_TENSOR_FFN_UP,   layer.ffn_up_d_idx,   layer.ffn_up_d_val,   layer.ffn_up_d_row_scale);
-                        try_seeddelta(LLM_TENSOR_FFN_DOWN, layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale);
+                        try_seeddelta(LLM_TENSOR_FFN_GATE,
+                                      layer.ffn_gate_d_idx, layer.ffn_gate_d_val, layer.ffn_gate_d_row_scale,
+                                      layer.ffn_gate_base_d1, layer.ffn_gate_base_d2, layer.ffn_gate_base_d3,
+                                      layer.ffn_gate_base_perm1, layer.ffn_gate_base_perm2);
+                        try_seeddelta(LLM_TENSOR_FFN_UP,
+                                      layer.ffn_up_d_idx, layer.ffn_up_d_val, layer.ffn_up_d_row_scale,
+                                      layer.ffn_up_base_d1, layer.ffn_up_base_d2, layer.ffn_up_base_d3,
+                                      layer.ffn_up_base_perm1, layer.ffn_up_base_perm2);
+                        try_seeddelta(LLM_TENSOR_FFN_DOWN,
+                                      layer.ffn_down_d_idx, layer.ffn_down_d_val, layer.ffn_down_d_row_scale,
+                                      layer.ffn_down_base_d1, layer.ffn_down_base_d2, layer.ffn_down_base_d3,
+                                      layer.ffn_down_base_perm1, layer.ffn_down_base_perm2);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
                     }
                 } break;

@@ -282,8 +282,8 @@ Outputs:
 
 **Entregables**
 
-* [ ] `tools/seeddelta-eval/` o modo `--report-json` en builder
-* [ ] Métricas por tensor: `rel_l2`, `cos`, `norm_ratio`, y `_w` si imatrix
+* [x] `tools/seeddelta-eval/` o modo `--report-json` en builder
+* [x] Métricas por tensor: `rel_l2`, `cos`, `norm_ratio`, y `_w` si imatrix
 * [x] Script A/B: `llama-perplexity base vs seeddelta` (chunks cortos) → `scripts/seeddelta-eval.sh`
 * [ ] Unit test pequeño: compara `W0x + Δx` vs `Wx` en un tensor (tolerancias)
 
@@ -296,11 +296,11 @@ Outputs:
 
 **Entregables**
 
-* [ ] `llama-seeddelta-build` lee GGUF y escribe GGUF extendido
-* [ ] Generación de `W0` por bloque sin materializar todo W
-* [ ] Residual top-K por fila con `fp16 vals`
-* [ ] `row_scale` por fila (mínimo)
-* [ ] JSON report por tensor
+* [x] `llama-seeddelta-build` lee GGUF y escribe GGUF extendido
+* [x] Generación de `W0` por bloque sin materializar todo W *(v1: base Hadamard XOR-circulant, `base_d1/d2/d3`)*
+* [x] Residual top-K por fila con `fp16 vals` (COO)
+* [x] `row_scale` por fila (mínimo) *(nota: en COO puro suele quedar ~1.0)*
+* [x] JSON report por tensor (`--report-json`)
 
 **Aceptación**
 
@@ -315,7 +315,7 @@ Outputs:
 
 **Entregables**
 
-* [ ] Emisión de tensores base (`base_d*`, `base_perm*`, `base.L/B/depth/R`) en GGUF
+* [x] Emisión de tensores base (`base_d1/base_d2/base_d3`, `base.depth/R/*`) en GGUF *(permutaciones `base_perm*` pendiente)*
 * [ ] Kernel offline para `W0x` y para residual `Δ` (para evaluar `||WX - ŴX||`)
 * [ ] Report de costo estimado: `W0x` vs denso por tensor (MB/s, ops)
 
@@ -327,10 +327,11 @@ Outputs:
 
 **Entregables**
 
-* [ ] `src/llama-seeddelta.{h,cpp}` + `llama_seeddelta_context`
-* [ ] Loader opcional de tensores GGUF seeddelta
-* [ ] Hook en `build_lora_mm` igual a StateCells
-* [ ] Custom op ggml: `y = W0x + Δx`
+* [x] `src/llama-seeddelta.{h,cpp}` + `llama_seeddelta_context`
+* [x] Loader opcional de tensores GGUF seeddelta (COO residual)
+* [x] Hook en `build_lora_mm` igual a StateCells
+* [x] Custom op ggml: `y = Δx` (COO residual v0)
+* [x] Custom op ggml: `y = W0x + Δx` (base procedural real)
 * [ ] Nan-Guardian integrado para fallback
 
 **Aceptación**
@@ -600,3 +601,44 @@ Para **migrar a residual-codebook**:
 ---
 
 Esto debe permitirte una migración suave y escalonada hacia el uso de **Seed+Residual** como pesos implícitos, manteniendo la calidad y reduciendo la memoria en `llama.cpp` en cada fase.
+
+---
+
+## 10) Smoke test end-to-end (Gemma 3 1B)
+
+> Objetivo: validar que `W0x + Δx` corre en runtime (`llama-perplexity`) sin explotar la PPL.
+
+### 10.1 Build SeedΔ GGUF (2 capas para iterar rápido)
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/ggml-org_gemma-3-1b-it-GGUF_gemma-3-1b-it-Q4_K_M.gguf"
+IM="llama.cpp/calibration/gemma.imatrix.gguf"
+OUT="llama.cpp/calibration/gemma_sd_base.gguf"
+
+./llama.cpp/build/bin/llama-seeddelta-build \
+  -i "$IN" -o "$OUT" \
+  --layers 0-1 \
+  --K 64 \
+  --base --base-max-samples 2048 \
+  --row-scale \
+  --imatrix "$IM" \
+  -t 16 \
+  --eval-cols 64 --report-json llama.cpp/calibration/gemma_sd_0-1.json
+```
+
+### 10.2 Comparar PPL (A/B)
+
+```bash
+./llama.cpp/scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   "$OUT" \
+  --text "/home/frudas/synapp2/llama.cpp/calibration/gemma_calibration.txt" \
+  --threads 16 --ctx 512 --chunks 32 --no-qa
+```
+
+### 10.3 Resultados esperados (sanity)
+
+* La PPL de `--seeddelta` debe ser peor que base, pero **no** debe “explotar”.
+* Ejemplo real (misma máquina, `ctx=512`, `chunks=32`, capas 0–1):
+  * base: `PPL ≈ 1.0049`
+  * seeddelta: `PPL ≈ 1.1151`
