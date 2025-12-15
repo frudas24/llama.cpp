@@ -620,7 +620,16 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     if (seeddelta_ctx && seeddelta_ctx->enabled) {
         if (const auto * sdw = seeddelta_ctx->find(w); sdw && sdw->d_idx && sdw->d_val) {
-            res = llama_seeddelta_mul_mat(ctx0, cur, sdw->d_idx, sdw->d_val, sdw->row_scale);
+            if (sdw->base_d1) {
+                res = llama_seeddelta_mul_mat_base(
+                        ctx0, cur,
+                        sdw->base_d1, sdw->base_d2, sdw->base_d3,
+                        sdw->base_perm1, sdw->base_perm2,
+                        sdw->d_idx, sdw->d_val,
+                        sdw->row_scale);
+            } else {
+                res = llama_seeddelta_mul_mat(ctx0, cur, sdw->d_idx, sdw->d_val, sdw->row_scale);
+            }
         }
     }
 
