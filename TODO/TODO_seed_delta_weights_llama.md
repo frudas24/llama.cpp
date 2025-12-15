@@ -196,23 +196,24 @@ Por tensor objetivo (ej. `blk.N.ffn_gate.weight`):
 **Base (mínimo):**
 
 * `blk.N.ffn_gate.base_seed` (U64) *(o en KV si prefieres)*
-* `blk.N.ffn_gate.base_d1` `[B, L]` (F16/F32) *(hadamard_acdc_stack)*
-* `blk.N.ffn_gate.base_d2` `[B, L]` (F16/F32) *(opcional)*
-* `blk.N.ffn_gate.base_d3` `[B, L]` (F16/F32) *(opcional)*
-* `blk.N.ffn_gate.base_perm1` `[B, L]` (U16/U32) *(opcional; si no, se deriva de seed al cargar)*
-* `blk.N.ffn_gate.base_perm2` `[B, L]` (U16/U32) *(opcional)*
-* `blk.N.ffn_gate.row_scale` `[n_out]` (F16/F32) *(si habilitado)*
+* `blk.N.ffn_gate.base_d1` `[L, B]` (F16/F32) *(hadamard_acdc_stack)*
+* `blk.N.ffn_gate.base_d2` `[L, B]` (F16/F32) *(opcional)*
+* `blk.N.ffn_gate.base_d3` `[L, B]` (F16/F32) *(opcional)*
+* `blk.N.ffn_gate.base_perm1` `[L, B]` (I16/I32) *(opcional; si no, se deriva de seed al cargar)*
+* `blk.N.ffn_gate.base_perm2` `[L, B]` (I16/I32) *(opcional)*
+* `blk.N.ffn_gate.d_row_scale` `[n_out]` (F16/F32) *(si habilitado)*
 
 **Residual COO (scheme=0):**
 
-* `blk.N.ffn_gate.d_idx` `[K, n_out]` (U16/U32)
-* `blk.N.ffn_gate.d_val` `[K, n_out]` (F16 o I8 + escala)
+* `blk.N.ffn_gate.d_idx` `[K, n_out]` (I16/I32)
+* `blk.N.ffn_gate.d_val` `[K, n_out]` (F16/F32)
+* `blk.N.ffn_gate.d_row_scale` `[n_out]` (F16/F32) *(opcional)*
 
 **Residual block-sparse (scheme=1):**
 
-* `blk.N.ffn_gate.b_idx` `[n_blocks, n_out]` (U16/U32) (índice de bloque en `[0, n_in/block)`)
-* `blk.N.ffn_gate.b_val` `[block, n_blocks, n_out]` (I8/F16)
-* `blk.N.ffn_gate.b_scale` `[n_blocks, n_out]` (F16/F32) *(si int8)*
+* `blk.N.ffn_gate.b_idx` `[n_blocks, n_out]` (I16/I32) (índice de bloque en `[0, n_in/block)`)
+* `blk.N.ffn_gate.b_val` `[block, n_blocks, n_out]` (F16/F32)
+* `blk.N.ffn_gate.d_row_scale` `[n_out]` (F16/F32) *(opcional)*
 
 **Residual codebook (scheme=2, opcional):**
 
@@ -230,19 +231,14 @@ Inputs:
 
 * `-i in.gguf -o out.gguf`
 * `--layers A-B`
-* `--targets ffn_gate,ffn_up,ffn_down`
-* `--base-kind prng_block|hadamard_acdc_stack|butterfly`
-* `--base-L N` (opcional; default `next_pow2(n_in)`)
-* `--base-depth N` (opcional; default 2–3)
-* `--base-R N` (opcional; default 1)
-* `--seed N` + `--seed-search NTRIALS` (opcional)
-* `--scheme coo|block|codebook_resid`
-* `--K 16|32|64` o `--block 32|64`
-* `--K-gate N --K-up N --K-down N` *(overrides por matriz; útil para probar “down más alto” barato)*
-* `--vals fp16|int8` + escalas
-* `--row-scale`
+* `--scheme coo|block` *(v1: `codebook_resid` queda para v2)*
+* `--block N` *(solo si `--scheme block`)*
+* `--K N` + overrides `--K-gate/--K-up/--K-down`
+* `--idx-type i16|i32 --val-type f16|f32`
+* `--row-scale` / `--no-row-scale`
 * `--imatrix file --imatrix-power p --imatrix-eps eps`
-* `--base-perm-trials N` *(búsqueda de P1 por bloque; default 1)*
+* `--base --base-max-samples N --base-perm-trials N`
+* `-t/--threads N`
 * `--eval-cols N --eval-x N --report-json path`
 
 Outputs:
@@ -314,7 +310,7 @@ Outputs:
 ### Fase 1b — Builder v1 (base rápida real)
 
 **Base-kind:** `hadamard_acdc_stack` con `L=next_pow2(n_in)` y stacking rectangular (B.1)
-**Scheme:** `coo` (todavía) o `block` si ya existe
+**Scheme:** `block` (preferido) / `coo` (smoke)
 
 **Entregables**
 
@@ -332,10 +328,10 @@ Outputs:
 **Entregables**
 
 * [x] `src/llama-seeddelta.{h,cpp}` + `llama_seeddelta_context`
-* [x] Loader opcional de tensores GGUF seeddelta (COO residual)
+* [x] Loader opcional de tensores GGUF seeddelta (COO + block residual)
 * [x] Hook en `build_lora_mm` igual a StateCells
-* [x] Custom op ggml: `y = Δx` (COO residual v0)
-* [x] Custom op ggml: `y = W0x + Δx` (base procedural real)
+* [x] Custom op ggml: `y = Δx` (COO + block)
+* [x] Custom op ggml: `y = W0x + Δx` (base + COO + block)
 * [ ] Nan-Guardian integrado para fallback
 
 **Aceptación**
@@ -351,10 +347,10 @@ Outputs:
 
 **Entregables**
 
-* [ ] Scheme block-sparse (bloques 32/64) end-to-end (builder+runtime) para reemplazar COO (COO es solo smoke; es muy malo para CPU)
+* [x] Scheme block-sparse (bloques 32/64) end-to-end (builder+runtime) para reemplazar COO (COO es solo smoke; es muy malo para CPU)
 * [ ] `W0` optimizado (cache por token/batch, layout-friendly)
 * [ ] Reducir overhead de indices (U16 cuando posible)
-* [ ] Bench `llama-bench` prompt+gen
+* [ ] Bench: `llama-cli` (prompt+gen) + `llama-perplexity` tok/s *(opcional: extender `llama-bench` con `--seeddelta`)*
 
 **Aceptación**
 
@@ -451,6 +447,7 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
 ./llama.cpp/build/bin/llama-seeddelta-build \
   -i "$IN" -o "$OUT" \
   --layers 0-1 \
+  --scheme block --block 32 \
   --K-gate 64 --K-up 64 --K-down 128 \
   --base --base-max-samples 2048 --base-perm-trials 4 \
   --row-scale \
@@ -474,6 +471,51 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
 
 * La PPL de `--seeddelta` no debe “explotar” vs base (este harness usa `gemma_calibration.txt`, no wikitext).
 * Nota: con residual **COO** el prompt eval puede verse peor; el gate real de performance es *gen batch=1* y requiere scheme **block-sparse**.
-* Ejemplo real (misma máquina, `ctx=512`, `chunks=16`, capas 10–11):
-  * base: `PPL ≈ 1.0050`, prompt `≈ 173 tok/s`
-  * seeddelta(coo): `PPL ≈ 1.0039`, prompt `≈ 119 tok/s`
+
+Ejemplo real (misma máquina, `ctx=512`, `chunks=16`, capas 10–11, `K_gate=64 K_up=64 K_down=128`):
+* base: `PPL ≈ 1.0050`, prompt `≈ 158 tok/s`
+* seeddelta(coo): `PPL ≈ 1.0039`, prompt `≈ 114 tok/s`
+* seeddelta(block32): `PPL ≈ 1.0536`, prompt `≈ 120 tok/s`
+
+Interpretación:
+* `block32` mejora throughput vs COO en prompt, pero con ese budget pierde calidad; normalmente requiere **más budget** y/o `--block 16` para recuperar PPL.
+
+### 10.4 Capas medias (10–11) + comparación COO vs block
+
+```bash
+IN="/home/frudas/.cache/llama.cpp/ggml-org_gemma-3-1b-it-GGUF_gemma-3-1b-it-Q4_K_M.gguf"
+IM="calibration/gemma.imatrix.gguf"
+TEXT="calibration/gemma_calibration.txt"
+
+./build/bin/llama-seeddelta-build \
+  -i "$IN" -o calibration/gemma_sd_mid_10-11_coo.gguf \
+  --layers 10-11 \
+  --scheme coo \
+  --K-gate 64 --K-up 64 --K-down 128 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
+  --row-scale --imatrix "$IM" \
+  -t 16 --eval-cols 64 --eval-x 16 \
+  --report-json calibration/gemma_sd_mid_10-11_coo.json
+
+./build/bin/llama-seeddelta-build \
+  -i "$IN" -o calibration/gemma_sd_mid_10-11_block32.gguf \
+  --layers 10-11 \
+  --scheme block --block 32 \
+  --K-gate 64 --K-up 64 --K-down 128 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
+  --row-scale --imatrix "$IM" \
+  -t 16 --eval-cols 64 --eval-x 16 \
+  --report-json calibration/gemma_sd_mid_10-11_block32.json
+
+./scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   calibration/gemma_sd_mid_10-11_coo.gguf \
+  --text "$TEXT" \
+  --threads 16 --ctx 512 --chunks 16 --no-qa
+
+./scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   calibration/gemma_sd_mid_10-11_block32.gguf \
+  --text "$TEXT" \
+  --threads 16 --ctx 512 --chunks 16 --no-qa
+```
