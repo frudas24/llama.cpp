@@ -23,6 +23,8 @@ static void usage(const char * argv0) {
     printf("usage: %s -i in.gguf -o out.gguf [options]\n\n", argv0);
     printf("options:\n");
     printf("  --layers A-B         restrict to layer range (default: all)\n");
+    printf("  --scheme coo|block   residual encoding (default: coo)\n");
+    printf("  --block N            block size for --scheme block (default: 32)\n");
     printf("  --K N                top-K residual entries per output (default: 32)\n");
     printf("  --K-gate N           override top-K for ffn_gate\n");
     printf("  --K-up N             override top-K for ffn_up\n");
@@ -117,6 +119,55 @@ static void topk_abs_weighted(
     idx_out = idx;
 }
 
+// Select top blocks by residual energy (sum (v[i]*w)^2 within block).
+static void topk_blocks_energy_weighted(
+        const std::vector<float> & v,
+        const std::vector<float> * w_scale,
+        int64_t block,
+        int64_t n_blocks_keep,
+        std::vector<int32_t> & idx_out) {
+    const int64_t n = (int64_t) v.size();
+    if (n <= 0 || block <= 0 || n_blocks_keep <= 0) {
+        idx_out.clear();
+        return;
+    }
+
+    const int64_t n_blocks = (n + block - 1) / block;
+    n_blocks_keep = std::min<int64_t>(n_blocks_keep, n_blocks);
+
+    std::vector<double> energy((size_t) n_blocks, 0.0);
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        const int64_t i0 = b * block;
+        const int64_t i1 = std::min<int64_t>(n, i0 + block);
+        double e = 0.0;
+        for (int64_t i = i0; i < i1; ++i) {
+            const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+            const double x = (double) v[(size_t) i] * ws;
+            e += x * x;
+        }
+        energy[(size_t) b] = e;
+    }
+
+    std::vector<int32_t> idx((size_t) n_blocks);
+    std::iota(idx.begin(), idx.end(), 0);
+    auto score = [&](int32_t b) -> double {
+        return energy[(size_t) b];
+    };
+
+    if (n_blocks_keep < n_blocks) {
+        std::nth_element(idx.begin(), idx.begin() + n_blocks_keep, idx.end(), [&](int32_t a, int32_t b) {
+            return score(a) > score(b);
+        });
+        idx.resize((size_t) n_blocks_keep);
+    }
+
+    std::sort(idx.begin(), idx.end(), [&](int32_t a, int32_t b) {
+        return score(a) > score(b);
+    });
+
+    idx_out = idx;
+}
+
 struct eval_metrics {
     double rel_l2_mean = 0.0;
     double rel_l2_p95  = 0.0;
@@ -199,6 +250,119 @@ static eval_metrics eval_sparse_residual(
             const double whs = wh * ws;
             wh_norm2 += whs * whs;
             dot      += (double) w[(size_t) ii] * ws * whs;
+        }
+
+        const double err2 = std::max(w_norm2 + wh_norm2 - 2.0 * dot, 0.0);
+
+        const double denom_w = std::sqrt(std::max(w_norm2,  1e-20));
+        const double denom_h = std::sqrt(std::max(wh_norm2, 1e-20));
+
+        rel_l2.push_back(std::sqrt(err2) / denom_w);
+        cos.push_back(dot / (denom_w * denom_h));
+        norm_ratio.push_back(denom_h / denom_w);
+    }
+
+    auto percentile = [](std::vector<double> v, double p) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const double x = p * double(v.size() - 1);
+        const size_t i = (size_t) x;
+        const size_t j = std::min(i + 1, v.size() - 1);
+        const double a = x - double(i);
+        return v[i] * (1.0 - a) + v[j] * a;
+    };
+
+    double sum_rel = 0.0;
+    double sum_cos = 0.0;
+    double sum_nr  = 0.0;
+    for (size_t i = 0; i < rel_l2.size(); ++i) sum_rel += rel_l2[i];
+    for (size_t i = 0; i < cos.size();    ++i) sum_cos += cos[i];
+    for (size_t i = 0; i < norm_ratio.size(); ++i) sum_nr += norm_ratio[i];
+
+    out.rel_l2_mean = rel_l2.empty() ? 0.0 : sum_rel / double(rel_l2.size());
+    out.rel_l2_p95  = percentile(rel_l2, 0.95);
+    out.cos_mean    = cos.empty()    ? 0.0 : sum_cos / double(cos.size());
+    out.cos_p05     = percentile(cos, 0.05);
+    out.norm_ratio_mean = norm_ratio.empty() ? 0.0 : sum_nr / double(norm_ratio.size());
+
+    return out;
+}
+
+static eval_metrics eval_block_residual(
+        const ggml_tensor * W,
+        const std::vector<int32_t> & b_idx,
+        const std::vector<float> & b_val,
+        int64_t block,
+        int64_t n_blocks,
+        const std::vector<float> * d_row_scale,
+        const std::vector<float> * w_scale,
+        int64_t eval_cols,
+        std::mt19937 & rng) {
+    eval_metrics out;
+
+    const int64_t n_in  = W->ne[0];
+    const int64_t n_out = W->ne[1];
+
+    if (eval_cols <= 0 || n_out <= 0 || n_in <= 0 || block <= 0 || n_blocks <= 0) {
+        return out;
+    }
+    if ((int64_t) b_idx.size() != n_blocks * n_out) {
+        return out;
+    }
+    if ((int64_t) b_val.size() != block * n_blocks * n_out) {
+        return out;
+    }
+
+    eval_cols = std::min<int64_t>(eval_cols, n_out);
+
+    std::vector<int64_t> idx(n_out);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::shuffle(idx.begin(), idx.end(), rng);
+    idx.resize((size_t) eval_cols);
+
+    std::vector<float> w;
+    std::vector<double> rel_l2;
+    std::vector<double> cos;
+    std::vector<double> norm_ratio;
+    rel_l2.reserve((size_t) eval_cols);
+    cos.reserve((size_t) eval_cols);
+    norm_ratio.reserve((size_t) eval_cols);
+
+    for (int64_t ci = 0; ci < eval_cols; ++ci) {
+        const int64_t col = idx[(size_t) ci];
+
+        read_column_f32(W, col, w);
+
+        const double scale = d_row_scale ? (double) (*d_row_scale)[(size_t) col] : 1.0;
+
+        double w_norm2  = 0.0;
+        for (int64_t i = 0; i < n_in; ++i) {
+            const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+            const double wi = (double) w[(size_t) i] * ws;
+            w_norm2 += wi * wi;
+        }
+
+        double wh_norm2 = 0.0;
+        double dot      = 0.0;
+
+        const int32_t * idx_col = b_idx.data() + (size_t) col * (size_t) n_blocks;
+        const float *   val_col = b_val.data() + (size_t) col * (size_t) n_blocks * (size_t) block;
+
+        for (int64_t bi = 0; bi < n_blocks; ++bi) {
+            const int32_t blk = idx_col[bi];
+            if (blk < 0) {
+                continue;
+            }
+            const int64_t in0 = (int64_t) blk * block;
+            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+            for (int64_t i = in0; i < in1; ++i) {
+                const int64_t t = i - in0;
+                const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+                const double wh = scale * (double) val_col[(size_t) bi * (size_t) block + (size_t) t];
+                const double whs = wh * ws;
+                wh_norm2 += whs * whs;
+                dot      += (double) w[(size_t) i] * ws * whs;
+            }
         }
 
         const double err2 = std::max(w_norm2 + wh_norm2 - 2.0 * dot, 0.0);
@@ -772,6 +936,182 @@ static eval_metrics eval_seeddelta_base_residual(
     return out;
 }
 
+static eval_metrics eval_seeddelta_base_block_residual(
+        const ggml_tensor * W,
+        const base_fit & base,
+        const std::vector<int32_t> & b_idx,
+        const std::vector<float> & b_val,
+        int64_t block,
+        int64_t n_blocks,
+        const std::vector<float> * d_row_scale,
+        const std::vector<float> * w_scale,
+        int64_t eval_cols,
+        std::mt19937 & rng) {
+    eval_metrics out;
+
+    const int64_t n_in  = W->ne[0];
+    const int64_t n_out = W->ne[1];
+
+    if (eval_cols <= 0 || n_out <= 0 || n_in <= 0 || base.L <= 0 || base.B <= 0 || block <= 0 || n_blocks <= 0) {
+        return out;
+    }
+    if ((int64_t) b_idx.size() != n_blocks * n_out) {
+        return out;
+    }
+    if ((int64_t) b_val.size() != block * n_blocks * n_out) {
+        return out;
+    }
+
+    eval_cols = std::min<int64_t>(eval_cols, n_out);
+
+    std::vector<int64_t> idx(n_out);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::shuffle(idx.begin(), idx.end(), rng);
+    idx.resize((size_t) eval_cols);
+
+    const int64_t L = base.L;
+    const bool is_tall = n_out >= n_in;
+
+    std::vector<float> w;
+    std::vector<double> rel_l2;
+    std::vector<double> cos;
+    std::vector<double> norm_ratio;
+    rel_l2.reserve((size_t) eval_cols);
+    cos.reserve((size_t) eval_cols);
+    norm_ratio.reserve((size_t) eval_cols);
+
+    for (int64_t ci = 0; ci < eval_cols; ++ci) {
+        const int64_t col = idx[(size_t) ci];
+        read_column_f32(W, col, w);
+
+        const double scale = d_row_scale ? (double) (*d_row_scale)[(size_t) col] : 1.0;
+
+        double w_norm2 = 0.0;
+        double wh_norm2_hat = 0.0;
+        double dot_hat = 0.0;
+
+        if (is_tall) {
+            const int64_t b = col / L;
+            const int64_t p = col - b * L;
+            const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+            const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+
+            for (int64_t i = 0; i < n_in; ++i) {
+                const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+                const double wi = (double) w[(size_t) i] * ws;
+                w_norm2 += wi * wi;
+
+                const int64_t j = inv ? (int64_t) inv[(size_t) i] : i;
+                const int64_t u = (p ^ j) & (L - 1);
+                const double base_w = (double) h2[(size_t) u];
+                const double base_s = base_w * ws;
+                wh_norm2_hat += base_s * base_s;
+                dot_hat += wi * base_s;
+            }
+        } else {
+            const int64_t p = col;
+            for (int64_t i = 0; i < n_in; ++i) {
+                const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+                const double wi = (double) w[(size_t) i] * ws;
+                w_norm2 += wi * wi;
+
+                const int64_t b = i / L;
+                const int64_t q = i - b * L;
+                const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                const int64_t j = inv ? (int64_t) inv[(size_t) q] : q;
+                const int64_t u = (p ^ j) & (L - 1);
+                const double base_w = (double) h2[(size_t) u];
+                const double base_s = base_w * ws;
+                wh_norm2_hat += base_s * base_s;
+                dot_hat += wi * base_s;
+            }
+        }
+
+        const int32_t * idx_col = b_idx.data() + (size_t) col * (size_t) n_blocks;
+        const float *   val_col = b_val.data() + (size_t) col * (size_t) n_blocks * (size_t) block;
+
+        for (int64_t bi = 0; bi < n_blocks; ++bi) {
+            const int32_t blk = idx_col[bi];
+            if (blk < 0) {
+                continue;
+            }
+            const int64_t in0 = (int64_t) blk * block;
+            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+            for (int64_t i = in0; i < in1; ++i) {
+                const int64_t t = i - in0;
+                const double ws = w_scale ? (double) (*w_scale)[(size_t) i] : 1.0;
+                const double wi = (double) w[(size_t) i] * ws;
+
+                const double delta = (double) val_col[(size_t) bi * (size_t) block + (size_t) t];
+                const double delta_s = delta * ws;
+
+                double base_w = 0.0;
+                if (is_tall) {
+                    const int64_t b = col / L;
+                    const int64_t p = col - b * L;
+                    const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                    const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                    const int64_t j = inv ? (int64_t) inv[(size_t) i] : (int64_t) i;
+                    const int64_t u = (p ^ j) & (L - 1);
+                    base_w = (double) h2[(size_t) u];
+                } else {
+                    const int64_t p = col;
+                    const int64_t b = i / L;
+                    const int64_t q = i - b * L;
+                    const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                    const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                    const int64_t j = inv ? (int64_t) inv[(size_t) q] : q;
+                    const int64_t u = (p ^ j) & (L - 1);
+                    base_w = (double) h2[(size_t) u];
+                }
+
+                const double base_s = base_w * ws;
+
+                dot_hat += wi * delta_s;
+                wh_norm2_hat += 2.0 * base_s * delta_s + delta_s * delta_s;
+            }
+        }
+
+        const double dot = scale * dot_hat;
+        const double wh_norm2 = scale * scale * wh_norm2_hat;
+
+        const double err2 = std::max(w_norm2 + wh_norm2 - 2.0 * dot, 0.0);
+
+        const double denom_w = std::sqrt(std::max(w_norm2,  1e-20));
+        const double denom_h = std::sqrt(std::max(wh_norm2, 1e-20));
+
+        rel_l2.push_back(std::sqrt(err2) / denom_w);
+        cos.push_back(dot / (denom_w * denom_h));
+        norm_ratio.push_back(denom_h / denom_w);
+    }
+
+    auto percentile = [](std::vector<double> v, double p) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const double x = p * double(v.size() - 1);
+        const size_t i = (size_t) x;
+        const size_t j = std::min(i + 1, v.size() - 1);
+        const double a = x - double(i);
+        return v[i] * (1.0 - a) + v[j] * a;
+    };
+
+    double sum_rel = 0.0;
+    double sum_cos = 0.0;
+    double sum_nr  = 0.0;
+    for (size_t i = 0; i < rel_l2.size(); ++i) sum_rel += rel_l2[i];
+    for (size_t i = 0; i < cos.size();    ++i) sum_cos += cos[i];
+    for (size_t i = 0; i < norm_ratio.size(); ++i) sum_nr += norm_ratio[i];
+
+    out.rel_l2_mean = rel_l2.empty() ? 0.0 : sum_rel / double(rel_l2.size());
+    out.rel_l2_p95  = percentile(rel_l2, 0.95);
+    out.cos_mean    = cos.empty()    ? 0.0 : sum_cos / double(cos.size());
+    out.cos_p05     = percentile(cos, 0.05);
+    out.norm_ratio_mean = norm_ratio.empty() ? 0.0 : sum_nr / double(norm_ratio.size());
+
+    return out;
+}
+
 static eval_metrics eval_seeddelta_x(
         const ggml_tensor * W,
         const base_fit * base,
@@ -926,6 +1266,224 @@ static eval_metrics eval_seeddelta_x(
                     continue;
                 }
                 y += (double) val_col[r] * (double) x[(size_t) ii];
+            }
+
+            const double scale = d_row_scale ? (double) (*d_row_scale)[(size_t) col] : 1.0;
+            y_hat[(size_t) ci] = y * scale;
+        }
+
+        double y_norm2 = 0.0;
+        double yh_norm2 = 0.0;
+        double dot = 0.0;
+        for (int64_t ci = 0; ci < eval_cols; ++ci) {
+            const double a = y_true[(size_t) ci];
+            const double b = y_hat[(size_t) ci];
+            y_norm2  += a * a;
+            yh_norm2 += b * b;
+            dot      += a * b;
+        }
+
+        const double err2 = std::max(y_norm2 + yh_norm2 - 2.0 * dot, 0.0);
+        const double denom_y  = std::sqrt(std::max(y_norm2,  1e-20));
+        const double denom_yh = std::sqrt(std::max(yh_norm2, 1e-20));
+
+        rel_l2.push_back(std::sqrt(err2) / denom_y);
+        cos.push_back(dot / (denom_y * denom_yh));
+        norm_ratio.push_back(denom_yh / denom_y);
+    }
+
+    auto percentile = [](std::vector<double> v, double p) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const double x = p * double(v.size() - 1);
+        const size_t i = (size_t) x;
+        const size_t j = std::min(i + 1, v.size() - 1);
+        const double a = x - double(i);
+        return v[i] * (1.0 - a) + v[j] * a;
+    };
+
+    double sum_rel = 0.0;
+    double sum_cos = 0.0;
+    double sum_nr  = 0.0;
+    for (size_t i = 0; i < rel_l2.size(); ++i) sum_rel += rel_l2[i];
+    for (size_t i = 0; i < cos.size();    ++i) sum_cos += cos[i];
+    for (size_t i = 0; i < norm_ratio.size(); ++i) sum_nr += norm_ratio[i];
+
+    out.rel_l2_mean = rel_l2.empty() ? 0.0 : sum_rel / double(rel_l2.size());
+    out.rel_l2_p95  = percentile(rel_l2, 0.95);
+    out.cos_mean    = cos.empty()    ? 0.0 : sum_cos / double(cos.size());
+    out.cos_p05     = percentile(cos, 0.05);
+    out.norm_ratio_mean = norm_ratio.empty() ? 0.0 : sum_nr / double(norm_ratio.size());
+
+    return out;
+}
+
+static eval_metrics eval_seeddelta_x_block(
+        const ggml_tensor * W,
+        const base_fit * base,
+        const std::vector<int32_t> & b_idx,
+        const std::vector<float> & b_val,
+        int64_t block,
+        int64_t n_blocks,
+        const std::vector<float> * d_row_scale,
+        const std::vector<float> * x_scale,
+        int64_t eval_cols,
+        int64_t eval_x,
+        std::mt19937 & rng) {
+    eval_metrics out;
+
+    const int64_t n_in  = W->ne[0];
+    const int64_t n_out = W->ne[1];
+
+    if (eval_cols <= 0 || eval_x <= 0 || n_out <= 0 || n_in <= 0 || block <= 0 || n_blocks <= 0) {
+        return out;
+    }
+    if ((int64_t) b_idx.size() != n_blocks * n_out) {
+        return out;
+    }
+    if ((int64_t) b_val.size() != block * n_blocks * n_out) {
+        return out;
+    }
+
+    eval_cols = std::min<int64_t>(eval_cols, n_out);
+
+    std::vector<int64_t> cols(n_out);
+    std::iota(cols.begin(), cols.end(), 0);
+    std::shuffle(cols.begin(), cols.end(), rng);
+    cols.resize((size_t) eval_cols);
+
+    // Pre-read the sampled columns so we can reuse them across eval_x vectors.
+    std::vector<float> wcols((size_t) eval_cols * (size_t) n_in);
+    std::vector<float> w;
+    for (int64_t ci = 0; ci < eval_cols; ++ci) {
+        const int64_t col = cols[(size_t) ci];
+        read_column_f32(W, col, w);
+        std::memcpy(wcols.data() + (size_t) ci * (size_t) n_in, w.data(), (size_t) n_in * sizeof(float));
+    }
+
+    const bool have_base = base && base->L > 0 && base->B > 0;
+    const bool is_tall = n_out >= n_in;
+    const int64_t L = have_base ? base->L : 0;
+    const int64_t B = have_base ? base->B : 0;
+
+    std::vector<std::vector<int64_t>> cols_in_block;
+    std::vector<int64_t> pos_in_block;
+    if (have_base && is_tall) {
+        cols_in_block.resize((size_t) B);
+        pos_in_block.resize((size_t) eval_cols);
+        for (int64_t ci = 0; ci < eval_cols; ++ci) {
+            const int64_t col = cols[(size_t) ci];
+            const int64_t b = col / L;
+            if (b >= 0 && b < B) {
+                cols_in_block[(size_t) b].push_back(ci);
+                pos_in_block[(size_t) ci] = col - b * L;
+            }
+        }
+    }
+
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    std::vector<float> x((size_t) n_in);
+    std::vector<float> x_hat;
+    std::vector<float> x_chunk;
+    std::vector<float> v;
+    std::vector<float> tmp;
+    std::vector<float> y_base;
+
+    if (have_base) {
+        tmp.resize((size_t) L);
+        v.resize((size_t) L);
+        y_base.resize((size_t) L);
+        if (is_tall) {
+            x_hat.resize((size_t) L);
+        } else {
+            x_chunk.resize((size_t) L);
+        }
+    }
+
+    std::vector<double> rel_l2;
+    std::vector<double> cos;
+    std::vector<double> norm_ratio;
+    rel_l2.reserve((size_t) eval_x);
+    cos.reserve((size_t) eval_x);
+    norm_ratio.reserve((size_t) eval_x);
+
+    std::vector<double> y_true((size_t) eval_cols);
+    std::vector<double> y_hat((size_t) eval_cols);
+
+    for (int64_t xi = 0; xi < eval_x; ++xi) {
+        for (int64_t i = 0; i < n_in; ++i) {
+            const float s = x_scale ? (*x_scale)[(size_t) i] : 1.0f;
+            x[(size_t) i] = nd(rng) * s;
+        }
+
+        // y_true = W^T x for sampled outputs.
+        for (int64_t ci = 0; ci < eval_cols; ++ci) {
+            const float * wc = wcols.data() + (size_t) ci * (size_t) n_in;
+            double acc = 0.0;
+            for (int64_t i = 0; i < n_in; ++i) {
+                acc += (double) wc[(size_t) i] * (double) x[(size_t) i];
+            }
+            y_true[(size_t) ci] = acc;
+        }
+
+        std::fill(y_hat.begin(), y_hat.end(), 0.0);
+
+        // Base output (if enabled).
+        if (have_base) {
+            if (is_tall) {
+                for (int64_t i = 0; i < n_in; ++i) x_hat[(size_t) i] = x[(size_t) i];
+                for (int64_t i = n_in; i < L; ++i) x_hat[(size_t) i] = 0.0f;
+
+                for (int64_t b = 0; b < B; ++b) {
+                    if (cols_in_block[(size_t) b].empty()) {
+                        continue;
+                    }
+
+                    apply_base_block_f32(x_hat.data(), v.data(), tmp.data(), *base, b);
+                    for (int64_t ci : cols_in_block[(size_t) b]) {
+                        const int64_t p = pos_in_block[(size_t) ci];
+                        y_hat[(size_t) ci] = (p >= 0 && p < L) ? (double) v[(size_t) p] : 0.0;
+                    }
+                }
+            } else {
+                std::fill(y_base.begin(), y_base.end(), 0.0f);
+
+                for (int64_t b = 0; b < B; ++b) {
+                    const int64_t in0 = b * L;
+                    const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
+                    for (int64_t i = 0; i < in1 - in0; ++i) x_chunk[(size_t) i] = x[(size_t) (in0 + i)];
+                    for (int64_t i = in1 - in0; i < L; ++i) x_chunk[(size_t) i] = 0.0f;
+
+                    apply_base_block_f32(x_chunk.data(), v.data(), tmp.data(), *base, b);
+                    for (int64_t i = 0; i < L; ++i) y_base[(size_t) i] += v[(size_t) i];
+                }
+
+                for (int64_t ci = 0; ci < eval_cols; ++ci) {
+                    const int64_t col = cols[(size_t) ci];
+                    y_hat[(size_t) ci] = (col >= 0 && col < L) ? (double) y_base[(size_t) col] : 0.0;
+                }
+            }
+        }
+
+        // Add Δx and apply row_scale.
+        for (int64_t ci = 0; ci < eval_cols; ++ci) {
+            const int64_t col = cols[(size_t) ci];
+            double y = y_hat[(size_t) ci];
+
+            const int32_t * idx_col = b_idx.data() + (size_t) col * (size_t) n_blocks;
+            const float *   val_col = b_val.data() + (size_t) col * (size_t) n_blocks * (size_t) block;
+            for (int64_t bi = 0; bi < n_blocks; ++bi) {
+                const int32_t blk = idx_col[bi];
+                if (blk < 0) {
+                    continue;
+                }
+                const int64_t in0 = (int64_t) blk * block;
+                const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                for (int64_t i = in0; i < in1; ++i) {
+                    const int64_t t = i - in0;
+                    y += (double) val_col[(size_t) bi * (size_t) block + (size_t) t] * (double) x[(size_t) i];
+                }
             }
 
             const double scale = d_row_scale ? (double) (*d_row_scale)[(size_t) col] : 1.0;
@@ -1257,6 +1815,8 @@ struct report_entry {
     int64_t n_in = 0;
     int64_t n_out = 0;
     int64_t K = 0;
+    int64_t block = 0;
+    int64_t n_blocks = 0;
     eval_metrics em;
     eval_metrics em_w;
     eval_metrics em_x;
@@ -1273,6 +1833,9 @@ int main(int argc, char ** argv) {
     std::string layers_range;
     std::string imatrix_file;
     std::string report_json;
+
+    std::string scheme_str = "coo";
+    int64_t block = 32;
 
     int64_t K = 32;
     int64_t K_gate = -1;
@@ -1296,6 +1859,8 @@ int main(int argc, char ** argv) {
         if ((arg == "-i" || arg == "--input") && i + 1 < argc) { in_fname = argv[++i]; continue; }
         if ((arg == "-o" || arg == "--output") && i + 1 < argc) { out_fname = argv[++i]; continue; }
         if (arg == "--layers" && i + 1 < argc) { layers_range = argv[++i]; continue; }
+        if (arg == "--scheme" && i + 1 < argc) { scheme_str = argv[++i]; continue; }
+        if (arg == "--block" && i + 1 < argc) { block = std::stoll(argv[++i]); continue; }
         if (arg == "--K" && i + 1 < argc) { K = std::stoll(argv[++i]); continue; }
         if (arg == "--K-gate" && i + 1 < argc) { K_gate = std::stoll(argv[++i]); continue; }
         if (arg == "--K-up"   && i + 1 < argc) { K_up   = std::stoll(argv[++i]); continue; }
@@ -1324,6 +1889,25 @@ int main(int argc, char ** argv) {
 
     if (in_fname.empty() || out_fname.empty()) {
         usage(argv[0]);
+    }
+
+    enum resid_scheme {
+        RESID_COO   = 0,
+        RESID_BLOCK = 1,
+    };
+
+    resid_scheme scheme = RESID_COO;
+    if (scheme_str == "coo") {
+        scheme = RESID_COO;
+    } else if (scheme_str == "block") {
+        scheme = RESID_BLOCK;
+    } else {
+        throw std::runtime_error("invalid --scheme (expected: coo|block)");
+    }
+    if (scheme == RESID_BLOCK) {
+        if (block <= 0 || block > 4096) {
+            throw std::runtime_error("invalid --block (expected: 1..4096)");
+        }
     }
 
     ggml_type idx_type = GGML_TYPE_I16;
@@ -1410,9 +1994,12 @@ int main(int argc, char ** argv) {
             const std::string d_idx_name      = "blk." + std::to_string(il) + "." + kind + ".d_idx";
             const std::string d_val_name      = "blk." + std::to_string(il) + "." + kind + ".d_val";
             const std::string d_row_scale_name = "blk." + std::to_string(il) + "." + kind + ".d_row_scale";
+            const std::string b_idx_name      = "blk." + std::to_string(il) + "." + kind + ".b_idx";
+            const std::string b_val_name      = "blk." + std::to_string(il) + "." + kind + ".b_val";
 
-            if (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1) {
-                fprintf(stderr, "seeddelta-build: %s already has d_idx/d_val, skipping\n", weight_name.c_str());
+            if (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1 ||
+                gguf_find_tensor(src, b_idx_name.c_str()) != -1 || gguf_find_tensor(src, b_val_name.c_str()) != -1) {
+                fprintf(stderr, "seeddelta-build: %s already has delta tensors, skipping\n", weight_name.c_str());
                 continue;
             }
 
@@ -1427,15 +2014,29 @@ int main(int argc, char ** argv) {
                     kind == "ffn_gate" ? K_gate_eff :
                     kind == "ffn_up"   ? K_up_eff   :
                                         K_down_eff;
-            const int64_t K_eff = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
+            const int64_t K_budget = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
             const bool is_tall = n_out >= n_in;
 
             std::vector<float> w_scale;
             const bool have_w = have_imatrix && make_imatrix_sqrt_scale(imatrix_data, weight_name, n_in, imatrix_eps, imatrix_power, w_scale);
 
-            printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s K=%" PRId64 "%s\n",
-                   il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), K_eff,
-                   have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+            int64_t n_blocks_keep = 0;
+            int64_t K_eff = K_budget;
+            if (scheme == RESID_BLOCK) {
+                const int64_t n_blocks_total = (n_in + block - 1) / block;
+                n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget + block - 1) / block, n_blocks_total));
+                K_eff = n_blocks_keep * block;
+            }
+
+            if (scheme == RESID_BLOCK) {
+                printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=block block=%" PRId64 " nb=%" PRId64 " K=%" PRId64 " (budget=%" PRId64 ")%s\n",
+                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block, n_blocks_keep, K_eff, K_budget,
+                       have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+            } else {
+                printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=coo K=%" PRId64 "%s\n",
+                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), K_eff,
+                       have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+            }
 
             base_fit base;
             if (write_base) {
@@ -1446,9 +2047,19 @@ int main(int argc, char ** argv) {
                         il, kind.c_str(), base.L, base.B, base_max_samples, base_perm_trials, have_w ? " imatrix=on" : "", sec);
             }
 
-            std::vector<int32_t> d_idx((size_t) K_eff * (size_t) n_out, -1);
-            std::vector<float>   d_val((size_t) K_eff * (size_t) n_out, 0.0f);
+            std::vector<int32_t> d_idx;
+            std::vector<float>   d_val;
+            std::vector<int32_t> b_idx;
+            std::vector<float>   b_val;
             std::vector<float>   d_row_scale;
+            if (scheme == RESID_BLOCK) {
+                GGML_ASSERT(n_blocks_keep > 0);
+                b_idx.assign((size_t) n_blocks_keep * (size_t) n_out, -1);
+                b_val.assign((size_t) block * (size_t) n_blocks_keep * (size_t) n_out, 0.0f);
+            } else {
+                d_idx.assign((size_t) K_eff * (size_t) n_out, -1);
+                d_val.assign((size_t) K_eff * (size_t) n_out, 0.0f);
+            }
             if (write_row_scale) {
                 d_row_scale.resize((size_t) n_out, 1.0f);
             }
@@ -1466,6 +2077,7 @@ int main(int argc, char ** argv) {
                     std::vector<float> w;
                     std::vector<float> r;
                     std::vector<int32_t> topk;
+                    std::vector<int32_t> top_blocks;
                     while (true) {
                         const int64_t col0 = next_col.fetch_add(chunk);
                         if (col0 >= n_out) {
@@ -1526,55 +2138,120 @@ int main(int argc, char ** argv) {
                                         }
                                     }
                                 }
+                            }
 
-                                topk_abs_weighted(r, have_w ? &w_scale : nullptr, K_eff, topk);
+                            if (scheme == RESID_BLOCK) {
+                                const std::vector<float> & src = write_base ? r : w;
+                                topk_blocks_energy_weighted(src, have_w ? &w_scale : nullptr, block, n_blocks_keep, top_blocks);
+
+                                float ss = 1.0f;
+                                if (write_row_scale) {
+                                    if (write_base) {
+                                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                            const int32_t blk = top_blocks[(size_t) bi];
+                                            if (blk < 0) {
+                                                continue;
+                                            }
+                                            const int64_t in0 = (int64_t) blk * block;
+                                            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                            for (int64_t ii = in0; ii < in1; ++ii) {
+                                                const double wi = (double) w[(size_t) ii];
+                                                const double di = (double) r[(size_t) ii];
+                                                const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+                                                dot += wi * di * ws * ws;
+                                                nn  += (2.0 * wi * di - di * di) * ws * ws;
+                                            }
+                                        }
+                                    } else {
+                                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                            const int32_t blk = top_blocks[(size_t) bi];
+                                            if (blk < 0) {
+                                                continue;
+                                            }
+                                            const int64_t in0 = (int64_t) blk * block;
+                                            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                            for (int64_t ii = in0; ii < in1; ++ii) {
+                                                const double wi  = (double) w[(size_t) ii];
+                                                const double whi = (double) w[(size_t) ii];
+                                                const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+                                                dot += wi * whi * ws * ws;
+                                                nn  += whi * whi * ws * ws;
+                                            }
+                                        }
+                                    }
+
+                                    if (nn > 1e-30) {
+                                        ss = (float) (dot / nn);
+                                    }
+                                    d_row_scale[(size_t) col] = ss;
+                                }
+
+                                for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                    const int32_t blk = bi < (int64_t) top_blocks.size() ? top_blocks[(size_t) bi] : -1;
+                                    b_idx[(size_t) col * (size_t) n_blocks_keep + (size_t) bi] = blk;
+
+                                    const int64_t in0 = (blk >= 0) ? (int64_t) blk * block : 0;
+                                    for (int64_t t = 0; t < block; ++t) {
+                                        const int64_t ii = in0 + t;
+                                        float vv = 0.0f;
+                                        if (blk >= 0 && ii >= 0 && ii < n_in) {
+                                            vv = write_base ? r[(size_t) ii] : w[(size_t) ii];
+                                        }
+                                        b_val[((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block + (size_t) t] = vv;
+                                    }
+                                }
                             } else {
-                                topk_abs_weighted(w, have_w ? &w_scale : nullptr, K_eff, topk);
-                            }
-
-                            float ss = 1.0f;
-                            if (write_row_scale) {
                                 if (write_base) {
-                                    for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                        const int32_t ii = topk[(size_t) rr];
-                                        if (ii < 0 || ii >= (int32_t) n_in) {
-                                            continue;
-                                        }
-
-                                        const double wi = (double) w[(size_t) ii];
-                                        const double di = (double) r[(size_t) ii];
-                                        const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
-
-                                        dot += wi * di * ws * ws;
-                                        nn  += (2.0 * wi * di - di * di) * ws * ws;
-                                    }
+                                    topk_abs_weighted(r, have_w ? &w_scale : nullptr, K_eff, topk);
                                 } else {
-                                    for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                        const int32_t ii = topk[(size_t) rr];
-                                        if (ii < 0 || ii >= (int32_t) n_in) {
-                                            continue;
-                                        }
-                                        const double wi  = (double) w[(size_t) ii];
-                                        const double whi = (double) w[(size_t) ii];
-                                        dot += wi * whi;
-                                        nn  += whi * whi;
-                                    }
+                                    topk_abs_weighted(w, have_w ? &w_scale : nullptr, K_eff, topk);
                                 }
 
-                                if (nn > 1e-30) {
-                                    ss = (float) (dot / nn);
+                                float ss = 1.0f;
+                                if (write_row_scale) {
+                                    if (write_base) {
+                                        for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                            const int32_t ii = topk[(size_t) rr];
+                                            if (ii < 0 || ii >= (int32_t) n_in) {
+                                                continue;
+                                            }
+
+                                            const double wi = (double) w[(size_t) ii];
+                                            const double di = (double) r[(size_t) ii];
+                                            const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+
+                                            dot += wi * di * ws * ws;
+                                            nn  += (2.0 * wi * di - di * di) * ws * ws;
+                                        }
+                                    } else {
+                                        for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                            const int32_t ii = topk[(size_t) rr];
+                                            if (ii < 0 || ii >= (int32_t) n_in) {
+                                                continue;
+                                            }
+                                            const double wi  = (double) w[(size_t) ii];
+                                            const double whi = (double) w[(size_t) ii];
+                                            const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+                                            dot += wi * whi * ws * ws;
+                                            nn  += whi * whi * ws * ws;
+                                        }
+                                    }
+
+                                    if (nn > 1e-30) {
+                                        ss = (float) (dot / nn);
+                                    }
+                                    d_row_scale[(size_t) col] = ss;
                                 }
-                                d_row_scale[(size_t) col] = ss;
-                            }
 
-                            for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                const int32_t ii = topk[(size_t) rr];
-                                d_idx[(size_t) col * (size_t) K_eff + (size_t) rr] = ii;
+                                for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                    const int32_t ii = topk[(size_t) rr];
+                                    d_idx[(size_t) col * (size_t) K_eff + (size_t) rr] = ii;
 
-                                if (ii >= 0 && ii < (int32_t) n_in) {
-                                    d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = write_base ? r[(size_t) ii] : w[(size_t) ii];
-                                } else {
-                                    d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = 0.0f;
+                                    if (ii >= 0 && ii < (int32_t) n_in) {
+                                        d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = write_base ? r[(size_t) ii] : w[(size_t) ii];
+                                    } else {
+                                        d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = 0.0f;
+                                    }
                                 }
                             }
                         }
@@ -1592,6 +2269,8 @@ int main(int argc, char ** argv) {
             re.n_in = n_in;
             re.n_out = n_out;
             re.K = K_eff;
+            re.block = (scheme == RESID_BLOCK) ? block : 0;
+            re.n_blocks = (scheme == RESID_BLOCK) ? n_blocks_keep : 0;
             re.has_w = have_w;
             re.cost = estimate_cost(write_base ? &base : nullptr, n_in, n_out, K_eff, write_row_scale);
 
@@ -1610,9 +2289,16 @@ int main(int argc, char ** argv) {
 
             if (eval_cols > 0) {
                 const int64_t t0 = ggml_time_us();
-                eval_metrics em = write_base
-                        ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng)
-                        : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng);
+                eval_metrics em;
+                if (scheme == RESID_BLOCK) {
+                    em = write_base
+                            ? eval_seeddelta_base_block_residual(W, base, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, rng)
+                            : eval_block_residual(W, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, rng);
+                } else {
+                    em = write_base
+                            ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng)
+                            : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng);
+                }
                 const double sec = double(ggml_time_us() - t0) / 1e6;
                 fprintf(stderr, "  [blk.%" PRId64 ".%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
                         il, kind.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, em.norm_ratio_mean, sec);
@@ -1620,9 +2306,16 @@ int main(int argc, char ** argv) {
                 re.em = em;
 
                 if (have_w) {
-                    eval_metrics em_w = write_base
-                            ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng)
-                            : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng);
+                    eval_metrics em_w;
+                    if (scheme == RESID_BLOCK) {
+                        em_w = write_base
+                                ? eval_seeddelta_base_block_residual(W, base, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, rng)
+                                : eval_block_residual(W, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, rng);
+                    } else {
+                        em_w = write_base
+                                ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng)
+                                : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng);
+                    }
                     re.em_w = em_w;
                     fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_w cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
                             il, kind.c_str(), eval_cols, em_w.rel_l2_mean, em_w.rel_l2_p95, em_w.cos_mean, em_w.cos_p05, em_w.norm_ratio_mean);
@@ -1631,7 +2324,12 @@ int main(int argc, char ** argv) {
 
             if (eval_cols > 0 && eval_x > 0) {
                 const int64_t t0 = ggml_time_us();
-                eval_metrics emx = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, eval_x, rng);
+                eval_metrics emx;
+                if (scheme == RESID_BLOCK) {
+                    emx = eval_seeddelta_x_block(W, write_base ? &base : nullptr, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, eval_x, rng);
+                } else {
+                    emx = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, eval_x, rng);
+                }
                 const double sec = double(ggml_time_us() - t0) / 1e6;
                 fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
                         il, kind.c_str(), eval_x, eval_cols, emx.rel_l2_mean, emx.rel_l2_p95, emx.cos_mean, emx.cos_p05, emx.norm_ratio_mean, sec);
@@ -1639,7 +2337,12 @@ int main(int argc, char ** argv) {
                 re.has_x = true;
 
                 if (have_w) {
-                    eval_metrics emx_w = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, eval_x, rng);
+                    eval_metrics emx_w;
+                    if (scheme == RESID_BLOCK) {
+                        emx_w = eval_seeddelta_x_block(W, write_base ? &base : nullptr, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, eval_x, rng);
+                    } else {
+                        emx_w = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, eval_x, rng);
+                    }
                     re.em_x_w = emx_w;
                     fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x_w x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
                             il, kind.c_str(), eval_x, eval_cols, emx_w.rel_l2_mean, emx_w.rel_l2_p95, emx_w.cos_mean, emx_w.cos_p05, emx_w.norm_ratio_mean);
@@ -1651,8 +2354,12 @@ int main(int argc, char ** argv) {
             }
 
             // Allocate a dedicated ggml context for new tensors to avoid a giant arena.
-            const size_t size_idx = (size_t) K_eff * (size_t) n_out * ggml_type_size(idx_type);
-            const size_t size_val = (size_t) K_eff * (size_t) n_out * ggml_type_size(val_type);
+            const size_t size_idx = scheme == RESID_BLOCK
+                    ? (size_t) n_blocks_keep * (size_t) n_out * ggml_type_size(idx_type)
+                    : (size_t) K_eff * (size_t) n_out * ggml_type_size(idx_type);
+            const size_t size_val = scheme == RESID_BLOCK
+                    ? (size_t) block * (size_t) n_blocks_keep * (size_t) n_out * ggml_type_size(val_type)
+                    : (size_t) K_eff * (size_t) n_out * ggml_type_size(val_type);
             const size_t size_row_scale = write_row_scale ? (size_t) n_out * sizeof(ggml_fp16_t) : 0;
             const ggml_type perm_type = write_base ? (base.L <= 32768 ? GGML_TYPE_I16 : GGML_TYPE_I32) : GGML_TYPE_I16;
             const size_t size_base_diag = write_base ? (size_t) base.L * (size_t) base.B * sizeof(ggml_fp16_t) * 3 : 0;
@@ -1665,29 +2372,63 @@ int main(int argc, char ** argv) {
             ggml_context * ctx_sd = ggml_init(sd_params);
             sd_contexts.push_back(ctx_sd);
 
-            ggml_tensor * t_idx = ggml_new_tensor_2d(ctx_sd, idx_type, K_eff, n_out);
-            ggml_set_name(t_idx, d_idx_name.c_str());
-            if (idx_type == GGML_TYPE_I16) {
-                auto * dst_i16 = (int16_t *) t_idx->data;
-                for (int64_t col = 0; col < n_out; ++col) {
-                    for (int64_t r = 0; r < K_eff; ++r) {
-                        const int32_t ii = d_idx[(size_t) col * (size_t) K_eff + (size_t) r];
-                        dst_i16[col * K_eff + r] = (ii < -32768 || ii > 32767) ? (int16_t) -1 : (int16_t) ii;
+            ggml_tensor * t_idx = nullptr;
+            ggml_tensor * t_val = nullptr;
+            if (scheme == RESID_BLOCK) {
+                t_idx = ggml_new_tensor_2d(ctx_sd, idx_type, n_blocks_keep, n_out);
+                ggml_set_name(t_idx, b_idx_name.c_str());
+                if (idx_type == GGML_TYPE_I16) {
+                    auto * dst_i16 = (int16_t *) t_idx->data;
+                    for (int64_t col = 0; col < n_out; ++col) {
+                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                            const int32_t blk = b_idx[(size_t) col * (size_t) n_blocks_keep + (size_t) bi];
+                            dst_i16[col * n_blocks_keep + bi] = (blk < -32768 || blk > 32767) ? (int16_t) -1 : (int16_t) blk;
+                        }
                     }
+                } else {
+                    std::memcpy(t_idx->data, b_idx.data(), b_idx.size() * sizeof(int32_t));
                 }
-            } else {
-                std::memcpy(t_idx->data, d_idx.data(), d_idx.size() * sizeof(int32_t));
-            }
 
-            ggml_tensor * t_val = ggml_new_tensor_2d(ctx_sd, val_type, K_eff, n_out);
-            ggml_set_name(t_val, d_val_name.c_str());
-            if (val_type == GGML_TYPE_F16) {
-                auto * dst_f16 = (ggml_fp16_t *) t_val->data;
-                for (int64_t col = 0; col < n_out; ++col) {
-                    ggml_fp32_to_fp16_row(d_val.data() + (size_t) col * (size_t) K_eff, dst_f16 + (size_t) col * (size_t) K_eff, K_eff);
+                t_val = ggml_new_tensor_3d(ctx_sd, val_type, block, n_blocks_keep, n_out);
+                ggml_set_name(t_val, b_val_name.c_str());
+                if (val_type == GGML_TYPE_F16) {
+                    auto * dst_f16 = (ggml_fp16_t *) t_val->data;
+                    for (int64_t col = 0; col < n_out; ++col) {
+                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                            ggml_fp32_to_fp16_row(
+                                    b_val.data() + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block,
+                                    dst_f16 + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block,
+                                    (int) block);
+                        }
+                    }
+                } else {
+                    std::memcpy(t_val->data, b_val.data(), b_val.size() * sizeof(float));
                 }
             } else {
-                std::memcpy(t_val->data, d_val.data(), d_val.size() * sizeof(float));
+                t_idx = ggml_new_tensor_2d(ctx_sd, idx_type, K_eff, n_out);
+                ggml_set_name(t_idx, d_idx_name.c_str());
+                if (idx_type == GGML_TYPE_I16) {
+                    auto * dst_i16 = (int16_t *) t_idx->data;
+                    for (int64_t col = 0; col < n_out; ++col) {
+                        for (int64_t r = 0; r < K_eff; ++r) {
+                            const int32_t ii = d_idx[(size_t) col * (size_t) K_eff + (size_t) r];
+                            dst_i16[col * K_eff + r] = (ii < -32768 || ii > 32767) ? (int16_t) -1 : (int16_t) ii;
+                        }
+                    }
+                } else {
+                    std::memcpy(t_idx->data, d_idx.data(), d_idx.size() * sizeof(int32_t));
+                }
+
+                t_val = ggml_new_tensor_2d(ctx_sd, val_type, K_eff, n_out);
+                ggml_set_name(t_val, d_val_name.c_str());
+                if (val_type == GGML_TYPE_F16) {
+                    auto * dst_f16 = (ggml_fp16_t *) t_val->data;
+                    for (int64_t col = 0; col < n_out; ++col) {
+                        ggml_fp32_to_fp16_row(d_val.data() + (size_t) col * (size_t) K_eff, dst_f16 + (size_t) col * (size_t) K_eff, (int) K_eff);
+                    }
+                } else {
+                    std::memcpy(t_val->data, d_val.data(), d_val.size() * sizeof(float));
+                }
             }
 
             gguf_add_tensor(dst, t_idx);
@@ -1751,9 +2492,12 @@ int main(int argc, char ** argv) {
 
     gguf_set_val_bool(dst, "seeddelta.enabled", n_added > 0);
     gguf_set_val_u32(dst, "seeddelta.version", 1);
-    gguf_set_val_u32(dst, "seeddelta.scheme", 0); // COO residual
+    gguf_set_val_u32(dst, "seeddelta.scheme", (uint32_t) scheme);
     gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
     gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
+    if (scheme == RESID_BLOCK) {
+        gguf_set_val_u32(dst, "seeddelta.resid.block", (uint32_t) block);
+    }
     gguf_set_val_bool(dst, "seeddelta.resid.K_variable", K_variable);
     if (K_variable) {
         gguf_set_val_u32(dst, "seeddelta.resid.K_gate", (uint32_t) K_gate_eff);
@@ -1820,6 +2564,10 @@ int main(int argc, char ** argv) {
             out << "],\n";
         }
         out << "  \"resid\": {\n";
+        out << "    \"scheme\": \"" << (scheme == RESID_BLOCK ? "block" : "coo") << "\",\n";
+        if (scheme == RESID_BLOCK) {
+            out << "    \"block\": " << block << ",\n";
+        }
         out << "    \"K\": " << K_default << ",\n";
         out << "    \"K_gate\": " << K_gate_eff << ",\n";
         out << "    \"K_up\": " << K_up_eff << ",\n";
@@ -1840,6 +2588,8 @@ int main(int argc, char ** argv) {
             out << "      \"n_in\": " << e.n_in << ",\n";
             out << "      \"n_out\": " << e.n_out << ",\n";
             out << "      \"K\": " << e.K << ",\n";
+            out << "      \"block\": " << e.block << ",\n";
+            out << "      \"n_blocks\": " << e.n_blocks << ",\n";
             out << "      \"has_w\": " << (e.has_w ? "true" : "false") << ",\n";
             out << "      \"has_x\": " << (e.has_x ? "true" : "false") << ",\n";
             out << "      \"base_L\": " << e.cost.L << ",\n";
