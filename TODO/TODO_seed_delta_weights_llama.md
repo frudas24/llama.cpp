@@ -210,9 +210,9 @@ Por tensor objetivo (ej. `blk.N.ffn_gate.weight`):
 
 **Residual block-sparse (scheme=1):**
 
-* `blk.N.ffn_gate.b_map` `[n_out, n_blocks_kept]` (U16) (índices de bloque)
-* `blk.N.ffn_gate.b_val` `[n_out, n_blocks_kept, block]` (I8/F16)
-* `blk.N.ffn_gate.b_scale` `[n_out, n_blocks_kept]` (F16/F32) *(si int8)*
+* `blk.N.ffn_gate.b_idx` `[n_blocks, n_out]` (U16/U32) (índice de bloque en `[0, n_in/block)`)
+* `blk.N.ffn_gate.b_val` `[block, n_blocks, n_out]` (I8/F16)
+* `blk.N.ffn_gate.b_scale` `[n_blocks, n_out]` (F16/F32) *(si int8)*
 
 **Residual codebook (scheme=2, opcional):**
 
@@ -321,6 +321,7 @@ Outputs:
 * [x] Emisión de tensores base (`base_d1/base_d2/base_d3/base_perm1`, `base.depth/R/*`) en GGUF *(base_perm2 pendiente)*
 * [x] Kernel offline para `W0x` y para residual `Δ` (para evaluar `||WX - ŴX||`) vía `--eval-x`
 * [x] Report de costo estimado por tensor (`ops_dense/base/delta/total`, `ops_ratio`)
+* [x] Overrides por matriz para residual budget (`--K-gate/--K-up/--K-down`) + metadata/JSON
 
 ---
 
@@ -350,7 +351,7 @@ Outputs:
 
 **Entregables**
 
-* [ ] Scheme block-sparse (bloques 32/64) + AVX2 para `Δx`
+* [ ] Scheme block-sparse (bloques 32/64) end-to-end (builder+runtime) para reemplazar COO (COO es solo smoke; es muy malo para CPU)
 * [ ] `W0` optimizado (cache por token/batch, layout-friendly)
 * [ ] Reducir overhead de indices (U16 cuando posible)
 * [ ] Bench `llama-bench` prompt+gen
@@ -394,7 +395,8 @@ Outputs:
 ## 6) Métricas de éxito (gates)
 
 * **Memoria pesos (host):** ↓ ≥ 30–60% (según layers cubiertas) sin “pagar” repack
-* **Speed:** no peor que base más de un margen tolerable (o mejorar)
+* **Speed (gen, batch=1):** no peor que base más de un margen tolerable (o mejorar)
+* **Speed (prompt, batch>1):** puede empeorar al principio; no usarlo como único gate mientras no exista kernel block-sparse/GEMM-friendly
 * **Calidad:** ΔPPL controlada (por target)
 * **Estabilidad:** 0 NaNs, fallback funciona
 
@@ -406,6 +408,7 @@ Outputs:
 * **Residual sin escala** → PPL se va al espacio: `vals` y `row_scale` son obligatorios.
 * **Top-K muy agresivo** → colapso: empezar con K moderado y autotune.
 * **No todas las matrices se dejan** → policy por capa + fallback.
+* **Prompt phase engañosa** → medir gen (batch=1) por separado; prompt usa GEMM denso ultra-tuneado y puede “castigar” custom ops.
 
 ---
 
@@ -428,182 +431,9 @@ Outputs:
 
 ---
 
-aquí te dejo el **plan de implementación** en formato "patch-ready", con los detalles exactos de los **nombres de flags**, **structs C++**, puntos de integración y el **plan de migración** de **StateCells → residual-codebook**. Este plan estará organizado para que puedas integrarlo directamente en tu flujo de trabajo con `llama.cpp`.
-
----
-
-# Patch-Ready Plan para Implementación `SeedΔ Weights` en `llama.cpp`
-
-## 1) **Flags de Configuración**
-
-### 1.1 Flags para el **Builder**
-
-* **`--seeddelta`**: habilita la descomposición de pesos en `seed` y `residual`.
-
-  * **Ejemplo**: `--seeddelta`
-  * **Acción**: Cuando este flag esté presente, el builder generará un archivo GGUF con los pesos descompuestos (semilla + residual).
-
-* **`--seeddelta-gap`**: umbral de tolerancia para la diferencia entre el modelo original y el modelo reducido.
-
-  * **Ejemplo**: `--seeddelta-gap 0.01`
-  * **Acción**: Este parámetro ajusta cuánto se puede permitir que el residual difiera de los pesos originales.
-
-* **`--seeddelta-scheme`**: tipo de esquema de residual.
-
-  * **Ejemplo**: `--seeddelta-scheme coo`
-  * **Opciones**:
-
-    * `coo`: Residual sparse por fila (top-K).
-    * `block`: Residual block-sparse (bloques de 32/64).
-    * `codebook`: Residual basado en código de libros (Codebook para compresión).
-
-* **`--seeddelta-vals`**: tipo de valores para el residual (e.g., `fp16`, `int8`).
-
-  * **Ejemplo**: `--seeddelta-vals fp16`
-  * **Acción**: Define el tipo de valores para el residual (si está usando `block-sparse` o `codebook`).
-
-* **`--seeddelta-row-scale`**: habilita la escala por fila (aplicable si el residual está por fila o bloque).
-
-  * **Ejemplo**: `--seeddelta-row-scale`
-  * **Acción**: Aplica la escala por fila a los pesos de salida en la descomposición.
-
-### 1.2 Flags para el **Runtime**
-
-* **`--statecells`**: habilita el uso de StateCells (esto es solo un fallback para modelos que no tienen `seed-delta`).
-
-  * **Ejemplo**: `--statecells`
-  * **Acción**: Cuando este flag está presente, `llama.cpp` utilizará StateCells en lugar de `seeddelta` si no se encuentra `seeddelta` en los pesos.
-* **`--seeddelta-fallback`**: habilita el fallback de `seeddelta` a denso si se detecta un problema de memoria o calidad.
-
-  * **Ejemplo**: `--seeddelta-fallback`
-  * **Acción**: Si el modelo encuentra que `seeddelta` no es viable (por ejemplo, por NaNs), el modelo usa la matriz densa original.
-
----
-
-## 2) **Estructuras de Datos C++**
-
-### 2.1 `seeddelta_ctx` — Contexto de Residuos Seed-Delta
-
-Esta estructura contendrá los metadatos y tensores necesarios para el cálculo de los pesos.
-
-```cpp
-struct seeddelta_ctx {
-    bool enabled;                 // Si el modelo usa Seed-Delta
-    uint32_t scheme;              // Esquema (0 = COO, 1 = Block, 2 = Codebook)
-    uint32_t residual_size;       // Tamaño de residual por fila o bloque
-    float* base_seed;             // Semilla base para generar W0
-    float* residual_vals;         // Valores del residual
-    uint16_t* residual_indices;   // Índices de las conexiones activas
-    float* row_scale;             // Escala por fila (si aplica)
-    uint32_t block_size;          // Tamaño del bloque (si aplica)
-    float tolerance_gap;          // Tolerancia para comparación con W0
-};
-```
-
-### 2.2 Funciones para Manipular `seeddelta_ctx`
-
-#### `seeddelta_load_weights`
-
-* **Propósito**: Cargar la semilla y el residual desde el archivo GGUF.
-
-```cpp
-int seeddelta_load_weights(seeddelta_ctx& ctx, const char* file_path) {
-    // Cargar los tensores desde el archivo GGUF
-    // Configurar ctx.base_seed, ctx.residual_vals, ctx.residual_indices, etc.
-}
-```
-
-#### `seeddelta_compute`
-
-* **Propósito**: Ejecutar la operación `W0 * x + Δ * x` usando la semilla base y el residual.
-
-```cpp
-void seeddelta_compute(const seeddelta_ctx& ctx, const float* input, float* output, size_t num_elements) {
-    // Realizar la multiplicación de matrices (por fila/bloque), considerando la semilla y el residual
-}
-```
-
----
-
-## 3) **Puntos de Integración en `llama.cpp`**
-
-### 3.1 Carga de Tensores Seed-Delta
-
-* En la función `llama_load_weights`, añade un bloque condicional para cargar la semilla y el residual si el flag `--seeddelta` está activado.
-
-```cpp
-if (ctx.seeddelta_enabled) {
-    // Llamar a seeddelta_load_weights
-    seeddelta_load_weights(ctx.seeddelta_ctx, file_path);
-}
-```
-
-### 3.2 Ejecución de la Multiplicación `W * x` con Seed-Delta
-
-* En la función `llama_compute`, cuando `--seeddelta` está activado, usar `seeddelta_compute` para la multiplicación de pesos.
-
-```cpp
-if (ctx.seeddelta_enabled) {
-    // Usar la función seeddelta_compute para ejecutar el modelo con Seed-Delta
-    seeddelta_compute(ctx.seeddelta_ctx, input, output, num_elements);
-} else {
-    // Fallback a la multiplicación convencional si no se usa Seed-Delta
-    ggml_mul_mat(ctx, input, output, num_elements);
-}
-```
-
----
-
-## 4) **Plan de Migración: StateCells → Residual-Codebook**
-
-### 4.1 **Migración de StateCells**
-
-* **StateCells** es el enfoque actual basado en memoria externa, y se utiliza para almacenar las conexiones explícitas.
-
-Para **migrar a residual-codebook**:
-
-1. **StateCells → Residual**: En lugar de almacenar la matriz completa `W`, almacenamos solo los residuos `Δ` como **sparse blocks** o **codebook**.
-2. **Fallback**: Si el modelo se encuentra con problemas de memoria, puede volver a usar `StateCells` mediante el flag `--statecells` como modo de compatibilidad.
-
-### 4.2 **Pasos de Migración**:
-
-1. **Fase 1**: Implementación de `seeddelta` básico usando `COO` o `block-sparse`.
-
-   * **Entregables**: Implementación de la carga de semillas, cálculo de `W0` y `Δ`, integración con el sistema.
-
-2. **Fase 2**: Sustitución de `StateCells` por la nueva estructura `seeddelta_ctx` donde los pesos se calculan dinámicamente.
-
-   * **Entregables**: Refactorización del código que depende de `StateCells` para que utilice el nuevo esquema `seeddelta_ctx`.
-
-3. **Fase 3**: Optimización de `seeddelta` y evaluación del impacto en memoria, velocidad y calidad de la inferencia.
-
-   * **Entregables**: Benchmarking de `PPL` y rendimiento comparando `StateCells` vs `seeddelta`.
-
-4. **Fase 4**: Implementación de código de libro y búsqueda automática de residuos por capa.
-
-   * **Entregables**: Búsqueda de `Δ` más eficiente por capa utilizando técnicas de optimización.
-
----
-
-## 5) **Pruebas y Evaluación**
-
-1. **Test de Calidad (PPL)**: Compara `PPL` entre la implementación tradicional (sin `--seeddelta`) y la nueva (`--seeddelta`).
-2. **Test de Memoria**: Mide el uso de memoria comparando el tamaño de los tensores y la carga de los modelos.
-3. **Test de Rendimiento**: Evalúa la latencia por token con `llama-perplexity` usando entradas representativas.
-
----
-
-### 6) **Commits sugeridos**
-
-1. `seeddelta: introduce Seed+Residual weights (initial implementation)`
-2. `runtime: add support for seeddelta weights computation`
-3. `builder: implement --seeddelta flag and memory optimizations`
-4. `kernels: add custom op for seeddelta weights calculation`
-5. `test: add PPL benchmarks for seed-residual vs dense`
-
----
-
-Esto debe permitirte una migración suave y escalonada hacia el uso de **Seed+Residual** como pesos implícitos, manteniendo la calidad y reduciendo la memoria en `llama.cpp` en cada fase.
+Nota: el “Patch-Ready Plan” anterior se removió para evitar drift. La fuente de verdad ahora es:
+- Builder: `tools/seeddelta-build/seeddelta-build.cpp` (`./build/bin/llama-seeddelta-build --help`)
+- Runtime: `src/llama-seeddelta.{h,cpp}` + flags `--seeddelta/--seeddelta-gap` en `common/arg.cpp`.
 
 ---
 
@@ -637,12 +467,13 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
   --base "$IN" \
   --sd   "$OUT" \
   --text "/home/frudas/synapp2/llama.cpp/calibration/gemma_calibration.txt" \
-  --threads 16 --ctx 512 --chunks 32 --no-qa
+  --threads 16 --ctx 512 --chunks 16 --no-qa
 ```
 
 ### 10.3 Resultados esperados (sanity)
 
-* La PPL de `--seeddelta` debe ser peor que base, pero **no** debe “explotar”.
-* Ejemplo real (misma máquina, `ctx=512`, `chunks=32`, capas 0–1):
-  * base: `PPL ≈ 1.0049`
-  * seeddelta: `PPL ≈ 1.1151`
+* La PPL de `--seeddelta` no debe “explotar” vs base (este harness usa `gemma_calibration.txt`, no wikitext).
+* Nota: con residual **COO** el prompt eval puede verse peor; el gate real de performance es *gen batch=1* y requiere scheme **block-sparse**.
+* Ejemplo real (misma máquina, `ctx=512`, `chunks=16`, capas 10–11):
+  * base: `PPL ≈ 1.0050`, prompt `≈ 173 tok/s`
+  * seeddelta(coo): `PPL ≈ 1.0039`, prompt `≈ 119 tok/s`
