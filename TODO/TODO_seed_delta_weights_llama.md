@@ -241,7 +241,8 @@ Inputs:
 * `--vals fp16|int8` + escalas
 * `--row-scale`
 * `--imatrix file --imatrix-power p --imatrix-eps eps`
-* `--eval-cols N --report-json path`
+* `--base-perm-trials N` *(búsqueda de P1 por bloque; default 1)*
+* `--eval-cols N --eval-x N --report-json path`
 
 Outputs:
 
@@ -249,8 +250,9 @@ Outputs:
 * JSON con métricas por tensor:
 
   * `rel_l2`, `cos`, y versiones ponderadas `*_w`
+  * `*_x` (gap funcional en output-space: `||WX - ŴX||`, requiere `--eval-x`)
   * `norm_ratio` (importantísimo)
-  * estimación de RAM y costo compute
+  * estimación de costo compute: `ops_*`, `ops_ratio`
 
 ### 4.2 Runtime
 
@@ -315,9 +317,9 @@ Outputs:
 
 **Entregables**
 
-* [x] Emisión de tensores base (`base_d1/base_d2/base_d3`, `base.depth/R/*`) en GGUF *(permutaciones `base_perm*` pendiente)*
-* [ ] Kernel offline para `W0x` y para residual `Δ` (para evaluar `||WX - ŴX||`)
-* [ ] Report de costo estimado: `W0x` vs denso por tensor (MB/s, ops)
+* [x] Emisión de tensores base (`base_d1/base_d2/base_d3/base_perm1`, `base.depth/R/*`) en GGUF *(base_perm2 pendiente)*
+* [x] Kernel offline para `W0x` y para residual `Δ` (para evaluar `||WX - ŴX||`) vía `--eval-x`
+* [x] Report de costo estimado por tensor (`ops_dense/base/delta/total`, `ops_ratio`)
 
 ---
 
@@ -619,11 +621,12 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
   -i "$IN" -o "$OUT" \
   --layers 0-1 \
   --K 64 \
-  --base --base-max-samples 2048 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
   --row-scale \
   --imatrix "$IM" \
   -t 16 \
-  --eval-cols 64 --report-json llama.cpp/calibration/gemma_sd_0-1.json
+  --eval-cols 64 --eval-x 16 \
+  --report-json llama.cpp/calibration/gemma_sd_0-1.json
 ```
 
 ### 10.2 Comparar PPL (A/B)
