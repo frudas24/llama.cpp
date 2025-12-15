@@ -447,7 +447,7 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
 ./llama.cpp/build/bin/llama-seeddelta-build \
   -i "$IN" -o "$OUT" \
   --layers 0-1 \
-  --scheme block --block 32 \
+  --scheme block --block 16 \
   --K-gate 64 --K-up 64 --K-down 128 \
   --base --base-max-samples 2048 --base-perm-trials 4 \
   --row-scale \
@@ -473,12 +473,13 @@ OUT="llama.cpp/calibration/gemma_sd_base.gguf"
 * Nota: con residual **COO** el prompt eval puede verse peor; el gate real de performance es *gen batch=1* y requiere scheme **block-sparse**.
 
 Ejemplo real (misma máquina, `ctx=512`, `chunks=16`, capas 10–11, `K_gate=64 K_up=64 K_down=128`):
-* base: `PPL ≈ 1.0050`, prompt `≈ 158 tok/s`
+* base: `PPL ≈ 1.0050`, prompt `≈ 161 tok/s`
 * seeddelta(coo): `PPL ≈ 1.0039`, prompt `≈ 114 tok/s`
-* seeddelta(block32): `PPL ≈ 1.0536`, prompt `≈ 120 tok/s`
+* seeddelta(block16): `PPL ≈ 1.0018`, prompt `≈ 123 tok/s`
 
 Interpretación:
-* `block32` mejora throughput vs COO en prompt, pero con ese budget pierde calidad; normalmente requiere **más budget** y/o `--block 16` para recuperar PPL.
+* `block16` suele recuperar calidad mejor que `block32` con el mismo budget.
+* `block32` con budget bajo puede perder calidad; para recuperarla suele requerir más budget (p.ej. `K_gate/up=128`, `K_down=256`).
 
 ### 10.4 Capas medias (10–11) + comparación COO vs block
 
@@ -516,6 +517,40 @@ TEXT="calibration/gemma_calibration.txt"
 ./scripts/seeddelta-eval.sh \
   --base "$IN" \
   --sd   calibration/gemma_sd_mid_10-11_block32.gguf \
+  --text "$TEXT" \
+  --threads 16 --ctx 512 --chunks 16 --no-qa
+
+# Variante de calidad (block32 + más budget):
+./build/bin/llama-seeddelta-build \
+  -i "$IN" -o calibration/gemma_sd_mid_10-11_block32_k128.gguf \
+  --layers 10-11 \
+  --scheme block --block 32 \
+  --K-gate 128 --K-up 128 --K-down 256 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
+  --row-scale --imatrix "$IM" \
+  -t 16 --eval-cols 64 --eval-x 16 \
+  --report-json calibration/gemma_sd_mid_10-11_block32_k128.json
+
+./scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   calibration/gemma_sd_mid_10-11_block32_k128.gguf \
+  --text "$TEXT" \
+  --threads 16 --ctx 512 --chunks 16 --no-qa
+
+# Variante recomendada (block16 + mismo budget):
+./build/bin/llama-seeddelta-build \
+  -i "$IN" -o calibration/gemma_sd_mid_10-11_block16_k64.gguf \
+  --layers 10-11 \
+  --scheme block --block 16 \
+  --K-gate 64 --K-up 64 --K-down 128 \
+  --base --base-max-samples 2048 --base-perm-trials 4 \
+  --row-scale --imatrix "$IM" \
+  -t 16 --eval-cols 64 --eval-x 16 \
+  --report-json calibration/gemma_sd_mid_10-11_block16_k64.json
+
+./scripts/seeddelta-eval.sh \
+  --base "$IN" \
+  --sd   calibration/gemma_sd_mid_10-11_block16_k64.gguf \
   --text "$TEXT" \
   --threads 16 --ctx 512 --chunks 16 --no-qa
 ```
