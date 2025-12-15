@@ -8,6 +8,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 static inline float read_f16_or_f32(const ggml_tensor * t, const uint8_t * base, int64_t i0, int64_t i1) {
     const size_t off = i0 * t->nb[0] + i1 * t->nb[1];
     if (t->type == GGML_TYPE_F16) {
@@ -63,6 +67,29 @@ static inline int32_t read_base_i16_i32(const ggml_tensor * t, const uint8_t * b
 }
 
 static inline void hadamard_transform(float * data, int64_t n) {
+#if defined(__AVX2__)
+    // AVX2 path: vectorize the inner butterfly.
+    // n is expected to be a power of two.
+    for (int64_t len = 1; len < n; len <<= 1) {
+        for (int64_t i = 0; i < n; i += (len << 1)) {
+            int64_t j = 0;
+            const int64_t vstep = 8;
+            const int64_t j_end = len - (len % vstep);
+            for (; j < j_end; j += vstep) {
+                const __m256 u = _mm256_loadu_ps(data + i + j);
+                const __m256 v = _mm256_loadu_ps(data + i + j + len);
+                _mm256_storeu_ps(data + i + j,       _mm256_add_ps(u, v));
+                _mm256_storeu_ps(data + i + j + len, _mm256_sub_ps(u, v));
+            }
+            for (; j < len; ++j) {
+                const float u = data[i + j];
+                const float v = data[i + j + len];
+                data[i + j]       = u + v;
+                data[i + j + len] = u - v;
+            }
+        }
+    }
+#else
     for (int64_t len = 1; len < n; len <<= 1) {
         for (int64_t i = 0; i < n; i += (len << 1)) {
             for (int64_t j = 0; j < len; ++j) {
@@ -73,6 +100,7 @@ static inline void hadamard_transform(float * data, int64_t n) {
             }
         }
     }
+#endif
 }
 
 static void apply_base_block(
@@ -560,6 +588,7 @@ ggml_tensor * llama_seeddelta_mul_mat_block(
 struct llama_seeddelta_scratch {
     std::vector<float> x_hat;
     std::vector<float> x_chunk;
+    std::vector<float> x_full;
     std::vector<float> v;
     std::vector<float> tmp;
     std::vector<float> y_hat;
@@ -618,6 +647,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
 
     auto & x_hat   = llama_seeddelta_scratch_tls.x_hat;
     auto & x_chunk = llama_seeddelta_scratch_tls.x_chunk;
+    auto & x_full  = llama_seeddelta_scratch_tls.x_full;
     auto & v       = llama_seeddelta_scratch_tls.v;
     auto & tmp     = llama_seeddelta_scratch_tls.tmp;
     auto & y_hat   = llama_seeddelta_scratch_tls.y_hat;
@@ -630,6 +660,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
         x_hat.resize((size_t) L);
     } else {
         x_chunk.resize((size_t) L);
+        x_full.resize((size_t) n_in);
         y_hat.resize((size_t) L);
     }
 
@@ -667,7 +698,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                             continue;
                         }
                         const float vv = read_f16_or_f32(d_val, val_col, r, 0);
-                        const float xv = read_x_f16_or_f32(x, x_data, ii, t);
+                        const float xv = x_hat[(size_t) ii];
                         y += vv * xv;
                     }
 
@@ -683,7 +714,9 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                 const int64_t in0 = b * L;
                 const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
                 for (int64_t i = 0; i < in1 - in0; ++i) {
-                    x_chunk[(size_t) i] = read_x_f16_or_f32(x, x_data, in0 + i, t);
+                    const float xv = read_x_f16_or_f32(x, x_data, in0 + i, t);
+                    x_chunk[(size_t) i] = xv;
+                    x_full[(size_t) (in0 + i)] = xv;
                 }
                 for (int64_t i = in1 - in0; i < L; ++i) {
                     x_chunk[(size_t) i] = 0.0f;
@@ -706,7 +739,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                         continue;
                     }
                     const float vv = read_f16_or_f32(d_val, val_col, r, 0);
-                    const float xv = read_x_f16_or_f32(x, x_data, ii, t);
+                    const float xv = x_full[(size_t) ii];
                     y += vv * xv;
                 }
 
@@ -772,6 +805,7 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
 
     auto & x_hat   = llama_seeddelta_scratch_tls.x_hat;
     auto & x_chunk = llama_seeddelta_scratch_tls.x_chunk;
+    auto & x_full  = llama_seeddelta_scratch_tls.x_full;
     auto & v       = llama_seeddelta_scratch_tls.v;
     auto & tmp     = llama_seeddelta_scratch_tls.tmp;
     auto & y_hat   = llama_seeddelta_scratch_tls.y_hat;
@@ -784,6 +818,7 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
         x_hat.resize((size_t) L);
     } else {
         x_chunk.resize((size_t) L);
+        x_full.resize((size_t) n_in);
         y_hat.resize((size_t) L);
     }
 
@@ -825,12 +860,11 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                             continue;
                         }
                         const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                        const int64_t len = in1 - in0;
                         const uint8_t * val_blk = val_col + bi * b_val->nb[1];
-                        for (int64_t ii = in0; ii < in1; ++ii) {
-                            const int64_t j = ii - in0;
-                            const float vv = read_f16_or_f32_1d(b_val, val_blk, j);
-                            const float xv = read_x_f16_or_f32(x, x_data, ii, t);
-                            y += vv * xv;
+                        const float * x_blk = x_hat.data() + in0;
+                        for (int64_t j = 0; j < len; ++j) {
+                            y += read_f16_or_f32_1d(b_val, val_blk, j) * x_blk[j];
                         }
                     }
 
@@ -846,7 +880,9 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                 const int64_t in0 = b * L;
                 const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
                 for (int64_t i = 0; i < in1 - in0; ++i) {
-                    x_chunk[(size_t) i] = read_x_f16_or_f32(x, x_data, in0 + i, t);
+                    const float xv = read_x_f16_or_f32(x, x_data, in0 + i, t);
+                    x_chunk[(size_t) i] = xv;
+                    x_full[(size_t) (in0 + i)] = xv;
                 }
                 for (int64_t i = in1 - in0; i < L; ++i) {
                     x_chunk[(size_t) i] = 0.0f;
@@ -873,12 +909,11 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                         continue;
                     }
                     const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                    const int64_t len = in1 - in0;
                     const uint8_t * val_blk = val_col + bi * b_val->nb[1];
-                    for (int64_t ii = in0; ii < in1; ++ii) {
-                        const int64_t j = ii - in0;
-                        const float vv = read_f16_or_f32_1d(b_val, val_blk, j);
-                        const float xv = read_x_f16_or_f32(x, x_data, ii, t);
-                        y += vv * xv;
+                    const float * x_blk = x_full.data() + in0;
+                    for (int64_t j = 0; j < len; ++j) {
+                        y += read_f16_or_f32_1d(b_val, val_blk, j) * x_blk[j];
                     }
                 }
 
