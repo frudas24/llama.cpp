@@ -456,6 +456,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool seeddelta_strip_dense = false;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -515,6 +516,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
         ml.get_key(LLM_KV_CONVNEXT_EMBEDDING_LENGTH, hparams.convnext.n_embd);
         ml.get_key(LLM_KV_CONVNEXT_BLOCK_COUNT,      hparams.convnext.n_layer);
+    }
+
+    // optional flags
+    {
+        const int kid_strip = gguf_find_key(ctx, "seeddelta.strip_dense");
+        if (kid_strip >= 0 && gguf_get_kv_type(ctx, kid_strip) == GGUF_TYPE_BOOL) {
+            pimpl->seeddelta_strip_dense = gguf_get_val_bool(ctx, kid_strip);
+        }
     }
 
     GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
@@ -2461,14 +2470,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
         ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+        auto allow_missing_strip = [&](const LLM_TN_IMPL & tn) -> bool {
+            if (!pimpl->seeddelta_strip_dense) {
+                return false;
+            }
+            if (tn.suffix == nullptr || strcmp(tn.suffix, "weight") != 0) {
+                return false;
+            }
+            return tn.tensor == LLM_TENSOR_FFN_GATE ||
+                   tn.tensor == LLM_TENSOR_FFN_UP   ||
+                   tn.tensor == LLM_TENSOR_FFN_DOWN;
+        };
+
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             ggml_tensor * t_meta = ml.get_tensor_meta(tn.str().c_str());
 
             if (!t_meta) {
-                if (flags & TENSOR_NOT_REQUIRED) {
+                if ((flags & TENSOR_NOT_REQUIRED) && !allow_missing_strip(tn)) {
                     return nullptr;
                 }
-                throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+                if (!allow_missing_strip(tn)) {
+                    throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+                }
             }
 
             // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
@@ -2535,6 +2558,29 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+            }
+
+            if (!t_meta && allow_missing_strip(tn)) {
+                ggml_backend_buffer_type_t buft = nullptr;
+                if (buft_list && !buft_list->empty()) {
+                    buft = buft_list->front().second;
+                }
+                if (!buft) {
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    if (!cpu_dev) {
+                        throw std::runtime_error("no CPU backend found for strip-dense stub");
+                    }
+                    buft = ggml_backend_dev_buffer_type(cpu_dev);
+                }
+                ggml_context * ctx = ctx_for_buft(buft);
+                std::array<int64_t, GGML_MAX_DIMS> dims = {1, 1, 1, 1};
+                size_t di = 0;
+                for (int64_t v : ne) {
+                    dims[di++] = v;
+                }
+                ggml_tensor * t_stub = ggml_new_tensor(ctx, GGML_TYPE_F32, (int) ne.size(), dims.data());
+                ggml_set_name(t_stub, tn.str().c_str());
+                return t_stub;
             }
 
             ggml_backend_buffer_type_t buft = nullptr;
