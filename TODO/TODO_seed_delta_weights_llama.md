@@ -609,3 +609,13 @@ OUT="llama.cpp/calibration/gemma4b_sd_mid_16-17_block16_k64.gguf"
   * base: `PPL ≈ 1.0001`, prompt `≈ 61.7 tok/s`
   * seeddelta(block16): `PPL ≈ 1.0022`, prompt `≈ 51.8 tok/s`
 * Variante strip (sin pesos densos): `gemma4b_sd_mid_16-17_block16_k64_strip.gguf` — tamaño ~2.24 GiB (vs 2.31 GiB), PPL ≈ 1.0022, prompt eval ≈ 49.4 tok/s. Carga y ejecuta SeedΔ sin fallback denso.
+
+### 10.6 Notas de repro y memoria (Devstral strip, `-t 8`)
+
+- Fecha: 2025-12-16T14:22:45Z
+- Comando: `/usr/bin/time -v ./build/bin/llama-perplexity -m calibration/devstral_sd_mid_18-20_block16_k64_strip.gguf -f calibration/devstral_calibration.txt --chunks 1 -t 8 -c 512 --seeddelta`
+- Resultado: `PPL = 1.0010 +/- 0.00010`, prompt eval ≈ 182.5 ms/tok (5.48 tok/s), sin crash.
+- Memoria:
+  - Max RSS: 16,229,220 kB (~15.48 GiB) (strip, sin pesos densos).
+  - Breakdown llama: Host ≈ 15,586 MiB (modelo 15,000 + ctx 320 + compute 266), CPU_REPACK 5,760 MiB.
+- Observación: con el op SeedΔ fijado a backend CPU ya no se reproduce el `cur_backend_id == -1` en strip con `-t 8`.
