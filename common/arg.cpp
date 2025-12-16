@@ -335,7 +335,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         std::string value;
         if (opt.get_value_from_env(value)) {
             try {
-                if (opt.handler_void && (value == "1" || value == "true")) {
+                if (opt.handler_void && is_truthy(value)) {
                     opt.handler_void(params);
                 }
                 if (opt.handler_int) {
@@ -465,10 +465,20 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     if (!params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
+
+        const size_t ntbo = llama_max_tensor_buft_overrides();
+        if (params.tensor_buft_overrides.size() < ntbo) {
+            params.tensor_buft_overrides.resize(ntbo, {nullptr, nullptr});
+        }
     }
 
     if (!params.speculative.tensor_buft_overrides.empty()) {
         params.speculative.tensor_buft_overrides.push_back({nullptr, nullptr});
+
+        const size_t ntbo = llama_max_tensor_buft_overrides();
+        if (params.speculative.tensor_buft_overrides.size() < ntbo) {
+            params.speculative.tensor_buft_overrides.resize(ntbo, {nullptr, nullptr});
+        }
     }
 
     if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
@@ -750,11 +760,11 @@ static std::string list_builtin_chat_templates() {
 }
 
 bool common_arg_utils::is_truthy(const std::string & value) {
-    return value == "on" || value == "enabled" || value == "1";
+    return value == "on" || value == "enabled" || value == "1" || value == "true";
 }
 
 bool common_arg_utils::is_falsey(const std::string & value) {
-    return value == "off" || value == "disabled" || value == "0";
+    return value == "off" || value == "disabled" || value == "0" || value == "false";
 }
 
 bool common_arg_utils::is_autoy(const std::string & value) {
