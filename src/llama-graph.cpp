@@ -646,7 +646,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
     }
 
-    if (statecells_ctx && statecells_ctx->enabled) {
+    if (!res && statecells_ctx && statecells_ctx->enabled) {
         if (const auto * scw = statecells_ctx->find(w); scw && scw->dict && scw->codes) {
             res = llama_statecells_mul_mat(ctx0, cur, scw->dict, scw->codes, scw->vals, scw->row_scale);
         }
