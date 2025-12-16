@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 static void usage(const char * argv0) {
@@ -39,6 +40,7 @@ static void usage(const char * argv0) {
     printf("  --base               write Hadamard base tensors (base_d1/base_d2/base_d3/base_perm1) and store residual vs base\n");
     printf("  --base-max-samples N max sampled outputs per block for base fit (default: 2048, 0=all)\n");
     printf("  --base-perm-trials N random P1 trials per base block (default: 1)\n");
+    printf("  --strip-dense        drop original dense weights for layers processed (reduces GGUF size; disables dense fallback)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -1845,6 +1847,7 @@ int main(int argc, char ** argv) {
     std::string val_type_str = "f16";
     bool write_row_scale = false;
     bool write_base = false;
+    bool strip_dense = false;
     int64_t base_max_samples = 2048;
     int base_perm_trials = 1;
     int n_threads = (int) std::max(1u, std::thread::hardware_concurrency());
@@ -1875,6 +1878,7 @@ int main(int argc, char ** argv) {
         if (arg == "--base") { write_base = true; continue; }
         if (arg == "--base-max-samples" && i + 1 < argc) { base_max_samples = std::stoll(argv[++i]); continue; }
         if (arg == "--base-perm-trials" && i + 1 < argc) { base_perm_trials = std::max(1, std::stoi(argv[++i])); continue; }
+        if (arg == "--strip-dense") { strip_dense = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
         if (arg == "--eval-x" && i + 1 < argc) { eval_x = std::stoll(argv[++i]); continue; }
@@ -1954,12 +1958,25 @@ int main(int argc, char ** argv) {
     const int64_t n_layer = max_layer_id + 1;
     auto layers = parse_layer_range(layers_range, n_layer);
 
+    const std::vector<std::string> kinds = { "ffn_gate", "ffn_up", "ffn_down" };
+    std::unordered_set<std::string> strip_weights;
+    if (strip_dense) {
+        for (const int64_t il : layers) {
+            for (const auto & kind : kinds) {
+                strip_weights.insert("blk." + std::to_string(il) + "." + kind + ".weight");
+            }
+        }
+    }
+
     gguf_context * dst = gguf_init_empty();
     gguf_set_kv(dst, src);
 
     // Add original tensors.
     for (int64_t ti = 0; ti < n_tensors; ++ti) {
         const char * name = gguf_get_tensor_name(src, ti);
+        if (strip_dense && strip_weights.count(name) > 0) {
+            continue;
+        }
         ggml_tensor * t = ggml_get_tensor(ctx_data, name);
         if (!t) {
             fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
@@ -1972,8 +1989,6 @@ int main(int argc, char ** argv) {
 
     // Keep per-weight ggml contexts alive until we write the output.
     std::vector<ggml_context *> sd_contexts;
-
-    const std::vector<std::string> kinds = { "ffn_gate", "ffn_up", "ffn_down" };
 
     int64_t n_added = 0;
     std::vector<report_entry> report;
@@ -2495,6 +2510,7 @@ int main(int argc, char ** argv) {
     gguf_set_val_u32(dst, "seeddelta.scheme", (uint32_t) scheme);
     gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
     gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
+    gguf_set_val_bool(dst, "seeddelta.strip_dense", strip_dense);
     if (scheme == RESID_BLOCK) {
         gguf_set_val_u32(dst, "seeddelta.resid.block", (uint32_t) block);
     }
