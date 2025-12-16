@@ -619,3 +619,35 @@ OUT="llama.cpp/calibration/gemma4b_sd_mid_16-17_block16_k64.gguf"
   - Max RSS: 16,229,220 kB (~15.48 GiB) (strip, sin pesos densos).
   - Breakdown llama: Host ≈ 15,586 MiB (modelo 15,000 + ctx 320 + compute 266), CPU_REPACK 5,760 MiB.
 - Observación: con el op SeedΔ fijado a backend CPU ya no se reproduce el `cur_backend_id == -1` en strip con `-t 8`.
+
+### 10.7 Smoke Qwen2.5 7B (capas 8–10, block16 k64, `--chunks 16`)
+
+Comando base (PPL/RSS):
+```
+/usr/bin/time -v ./build/bin/llama-perplexity \
+  -m /home/frudas/.cache/llama.cpp/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  -f calibration/gemma_calibration.txt --chunks 16 -t 8 -c 512
+```
+- PPL: `1.0010 ± 0.00003`
+- Prompt eval: ~25.21 ms/tok (≈39.7 tok/s)
+- Memoria: Max RSS ≈ 8,736,028 kB (~8.34 GiB); Host ≈ 4.46 GiB, CPU_REPACK ≈ 2.98 GiB
+
+SeedΔ (no strip) capas 8–10, block16 k64:
+```
+/usr/bin/time -v ./build/bin/llama-perplexity \
+  -m calibration/qwen2_5_7b_sd_mid_8-10_block16_k64_v2.gguf \
+  -f calibration/gemma_calibration.txt --chunks 16 -t 8 -c 512 --seeddelta
+```
+- PPL: `1.0010 ± 0.00002`
+- Prompt eval: ~28.14 ms/tok (≈35.5 tok/s)
+- Memoria: Max RSS ≈ 8,757,580 kB (~8.36 GiB); Host ≈ 4.48 GiB, CPU_REPACK ≈ 2.98 GiB
+
+Entrada lista en el script:
+```
+./scripts/seeddelta-eval.sh \
+  --base /home/frudas/.cache/llama.cpp/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  --sd   calibration/qwen2_5_7b_sd_mid_8-10_block16_k64_v2.gguf \
+  --text calibration/gemma_calibration.txt \
+  --threads 8 --ctx 512 --chunks 16 --no-qa \
+  --outdir calibration/seeddelta-eval-qwen2_5_7b-mid_8-10-block16_k64
+```
