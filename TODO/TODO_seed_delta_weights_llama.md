@@ -329,6 +329,7 @@ Outputs:
 
 * [x] `src/llama-seeddelta.{h,cpp}` + `llama_seeddelta_context`
 * [x] Loader opcional de tensores GGUF seeddelta (COO + block residual)
+* [x] Carga e inferencia SeedΔ aun cuando los pesos densos se strippean (`seeddelta.strip_dense` + stubs en loader)
 * [x] Hook en `build_lora_mm` igual a StateCells
 * [x] Custom op ggml: `y = Δx` (COO + block)
 * [x] Custom op ggml: `y = W0x + Δx` (base + COO + block)
@@ -348,6 +349,7 @@ Outputs:
 **Entregables**
 
 * [x] Scheme block-sparse (bloques 32/64) end-to-end (builder+runtime) para reemplazar COO (COO es solo smoke; es muy malo para CPU)
+* [x] Strip-dense en builder + soporte de loader/runtime para correr SeedΔ sin pesos densos (GGUF más chico, sin fallback denso)
 * [ ] `W0` optimizado (cache por token/batch, layout-friendly)
 * [ ] Reducir overhead de indices (U16 cuando posible)
 * [ ] Bench: `llama-cli` (prompt+gen) + `llama-perplexity` tok/s *(opcional: extender `llama-bench` con `--seeddelta`)*
@@ -606,4 +608,4 @@ OUT="llama.cpp/calibration/gemma4b_sd_mid_16-17_block16_k64.gguf"
 * En mi corrida (misma máquina, `ctx=512`, `chunks=16`):
   * base: `PPL ≈ 1.0001`, prompt `≈ 61.7 tok/s`
   * seeddelta(block16): `PPL ≈ 1.0022`, prompt `≈ 51.8 tok/s`
-* Nota: en esta etapa el GGUF output aún incluye pesos densos + tensores SeedΔ (sirve para iterar/fallback). El ahorro de RAM real requiere la fase “strip/skip dense”.
+* Variante strip (sin pesos densos): `gemma4b_sd_mid_16-17_block16_k64_strip.gguf` — tamaño ~2.24 GiB (vs 2.31 GiB), PPL ≈ 1.0022, prompt eval ≈ 49.4 tok/s. Carga y ejecuta SeedΔ sin fallback denso.
