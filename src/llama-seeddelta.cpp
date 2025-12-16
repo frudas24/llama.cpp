@@ -218,10 +218,6 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
 
     const int64_t o0 = (n_out * ith) / nth;
     const int64_t o1 = (n_out * (ith + 1)) / nth;
-    const int64_t t0 = (n_tokens * ith) / nth;
-    const int64_t t1 = (n_tokens * (ith + 1)) / nth;
-    const int64_t t0 = (n_tokens * ith) / nth;
-    const int64_t t1 = (n_tokens * (ith + 1)) / nth;
 
     const bool fast_f32_contig =
             x->type == GGML_TYPE_F32 &&
@@ -712,6 +708,8 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
             }
         }
     } else {
+        const int64_t t0 = (n_tokens * ith) / nth;
+        const int64_t t1 = (n_tokens * (ith + 1)) / nth;
         for (int64_t t = t0; t < t1; ++t) {
             std::fill(y_hat.begin(), y_hat.end(), 0.0f);
 
@@ -880,6 +878,8 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
             }
         }
     } else {
+        const int64_t t0 = (n_tokens * ith) / nth;
+        const int64_t t1 = (n_tokens * (ith + 1)) / nth;
         for (int64_t t = t0; t < t1; ++t) {
             std::fill(y_hat.begin(), y_hat.end(), 0.0f);
 
