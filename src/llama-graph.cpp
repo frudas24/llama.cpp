@@ -643,6 +643,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                     res = llama_seeddelta_mul_mat(ctx0, cur, sdw->d_idx, sdw->d_val, sdw->row_scale);
                 }
             }
+            if (res && sched && backend_cpu) {
+                ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+            }
         }
     }
 
