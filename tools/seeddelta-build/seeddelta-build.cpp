@@ -1,6 +1,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "seeddelta_policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <numeric>
 #include <random>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -41,6 +43,10 @@ static void usage(const char * argv0) {
     printf("  --base-max-samples N max sampled outputs per block for base fit (default: 2048, 0=all)\n");
     printf("  --base-perm-trials N random P1 trials per base block (default: 1)\n");
     printf("  --strip-dense        drop original dense weights for layers processed (reduces GGUF size; disables dense fallback)\n");
+    printf("  --policy FILE        JSON policy for per-layer/tensor K/block/gating/autotune/strip overrides\n");
+    printf("  --policy-strict      reject unknown keys in policy.json (default: warn and ignore)\n");
+    printf("  --policy-dump-resolved print resolved config per tensor (debug)\n");
+    printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -1826,7 +1832,77 @@ struct report_entry {
     cost_estimate cost;
     bool has_w = false;
     bool has_x = false;
+    // Gating/decision metadata
+    bool gating_enabled = false;
+    bool gating_pass = true;
+    std::string gating_metric_used;
+    double gating_value = 0.0;
+    double gating_p05 = 0.0;
+    double gating_min_mean = 0.0;
+    double gating_min_p05 = 0.0;
+    bool emit = true;
+    bool strip_applied = false;
+    std::string decision_reason;
 };
+
+struct pending_tensor_set {
+    ggml_context * ctx = nullptr;
+    std::vector<ggml_tensor *> tensors;
+};
+
+static std::string metric_kind_to_string(sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return "cos_x_w";
+        case sd_metric_kind::cos_x:   return "cos_x";
+        case sd_metric_kind::cos_w:   return "cos_w";
+        case sd_metric_kind::cos:     return "cos";
+    }
+    return "cos";
+}
+
+static double pick_metric_value(const report_entry & re, sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return re.em_x_w.cos_mean;
+        case sd_metric_kind::cos_x:   return re.em_x.cos_mean;
+        case sd_metric_kind::cos_w:   return re.em_w.cos_mean;
+        case sd_metric_kind::cos:     return re.em.cos_mean;
+    }
+    return re.em.cos_mean;
+}
+
+static double pick_metric_p05(const report_entry & re, sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return re.em_x_w.cos_p05;
+        case sd_metric_kind::cos_x:   return re.em_x.cos_p05;
+        case sd_metric_kind::cos_w:   return re.em_w.cos_p05;
+        case sd_metric_kind::cos:     return re.em.cos_p05;
+    }
+    return re.em.cos_p05;
+}
+
+static std::string fnv1a_hex(const std::string & data) {
+    uint64_t hash = 1469598103934665603ULL; // FNV-1a 64-bit offset
+    for (unsigned char c : data) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream oss;
+    oss << std::hex;
+    oss.width(16);
+    oss.fill('0');
+    oss << hash;
+    return oss.str();
+}
+
+static std::string slurp_file(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    return oss.str();
+}
 
 int main(int argc, char ** argv) {
     std::string in_fname;
@@ -1835,6 +1911,7 @@ int main(int argc, char ** argv) {
     std::string layers_range;
     std::string imatrix_file;
     std::string report_json;
+    std::string policy_file;
 
     std::string scheme_str = "coo";
     int64_t block = 32;
@@ -1856,6 +1933,9 @@ int main(int argc, char ** argv) {
     float imatrix_eps = 1e-8f;
     float imatrix_power = 1.0f;
     int seed = 1234;
+    bool policy_strict = false;
+    bool policy_dump_resolved = false;
+    bool overwrite_existing = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1879,6 +1959,10 @@ int main(int argc, char ** argv) {
         if (arg == "--base-max-samples" && i + 1 < argc) { base_max_samples = std::stoll(argv[++i]); continue; }
         if (arg == "--base-perm-trials" && i + 1 < argc) { base_perm_trials = std::max(1, std::stoi(argv[++i])); continue; }
         if (arg == "--strip-dense") { strip_dense = true; continue; }
+        if (arg == "--policy" && i + 1 < argc) { policy_file = argv[++i]; continue; }
+        if (arg == "--policy-strict") { policy_strict = true; continue; }
+        if (arg == "--policy-dump-resolved") { policy_dump_resolved = true; continue; }
+        if (arg == "--overwrite-existing") { overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
         if (arg == "--eval-x" && i + 1 < argc) { eval_x = std::stoll(argv[++i]); continue; }
@@ -1945,6 +2029,25 @@ int main(int argc, char ** argv) {
 
     const int64_t n_tensors = gguf_get_n_tensors(src);
 
+    sd_policy policy;
+    sd_policy * policy_ptr = nullptr;
+    std::string policy_hash;
+    if (!policy_file.empty()) {
+        auto pres = sd_policy_load(policy_file, policy_strict, policy);
+        if (!pres.ok) {
+            fprintf(stderr, "seeddelta-build: %s\n", pres.error.c_str());
+            return 1;
+        }
+        for (const auto & w : pres.warnings) {
+            fprintf(stderr, "seeddelta-build: policy warning: %s\n", w.c_str());
+        }
+        policy_ptr = &policy;
+        const std::string policy_bytes = slurp_file(policy_file);
+        if (!policy_bytes.empty()) {
+            policy_hash = "fnv1a64:" + fnv1a_hex(policy_bytes);
+        }
+    }
+
     // Discover number of layers from tensor names.
     int64_t max_layer_id = -1;
     std::regex re_layer(R"(blk\.(\d+)\.)");
@@ -1959,31 +2062,6 @@ int main(int argc, char ** argv) {
     auto layers = parse_layer_range(layers_range, n_layer);
 
     const std::vector<std::string> kinds = { "ffn_gate", "ffn_up", "ffn_down" };
-    std::unordered_set<std::string> strip_weights;
-    if (strip_dense) {
-        for (const int64_t il : layers) {
-            for (const auto & kind : kinds) {
-                strip_weights.insert("blk." + std::to_string(il) + "." + kind + ".weight");
-            }
-        }
-    }
-
-    gguf_context * dst = gguf_init_empty();
-    gguf_set_kv(dst, src);
-
-    // Add original tensors.
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * name = gguf_get_tensor_name(src, ti);
-        if (strip_dense && strip_weights.count(name) > 0) {
-            continue;
-        }
-        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
-        if (!t) {
-            fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
-            continue;
-        }
-        gguf_add_tensor(dst, t);
-    }
 
     std::mt19937 rng(seed);
 
@@ -1992,12 +2070,41 @@ int main(int argc, char ** argv) {
 
     int64_t n_added = 0;
     std::vector<report_entry> report;
+    std::vector<pending_tensor_set> pending;
+    std::unordered_set<std::string> strip_weights;
+    bool any_strip = false;
+    bool warned_autotune = false;
 
     const int64_t K_default = std::max<int64_t>(1, K);
     const int64_t K_gate_eff = (K_gate > 0 ? K_gate : K_default);
     const int64_t K_up_eff   = (K_up   > 0 ? K_up   : K_default);
     const int64_t K_down_eff = (K_down > 0 ? K_down : K_default);
     const bool K_variable = (K_gate_eff != K_default) || (K_up_eff != K_default) || (K_down_eff != K_default);
+
+    sd_resolved_tensor baseline_cfg;
+    baseline_cfg.block = block;
+    baseline_cfg.K_gate = K_gate_eff;
+    baseline_cfg.K_up   = K_up_eff;
+    baseline_cfg.K_down = K_down_eff;
+    baseline_cfg.strip_dense = strip_dense;
+    baseline_cfg.enabled = true;
+    baseline_cfg.metric = sd_metric_kind::cos_x_w;
+    baseline_cfg.min_mean = 0.0f;
+    baseline_cfg.min_p05  = 0.0f;
+    baseline_cfg.gating_enabled = (policy_ptr != nullptr);
+    baseline_cfg.require_eval_x = baseline_cfg.gating_enabled &&
+            (baseline_cfg.metric == sd_metric_kind::cos_x || baseline_cfg.metric == sd_metric_kind::cos_x_w);
+    baseline_cfg.require_imatrix = baseline_cfg.gating_enabled &&
+            (baseline_cfg.metric == sd_metric_kind::cos_w || baseline_cfg.metric == sd_metric_kind::cos_x_w);
+
+    if (policy_ptr && baseline_cfg.require_eval_x && eval_x <= 0) {
+        fprintf(stderr, "seeddelta-build: policy gating requires --eval-x > 0\n");
+        return 1;
+    }
+    if (policy_ptr && baseline_cfg.require_imatrix && !have_imatrix) {
+        fprintf(stderr, "seeddelta-build: policy gating requires imatrix (metric uses *_w)\n");
+        return 1;
+    }
 
     for (const int64_t il : layers) {
         for (const auto & kind : kinds) {
@@ -2006,15 +2113,39 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            sd_resolved_tensor cfg = sd_policy_resolve(policy_ptr, il, kind, baseline_cfg);
+            if (!cfg.enabled) {
+                // still record later in report as disabled
+            }
+            if (cfg.autotune.enabled && !warned_autotune) {
+                fprintf(stderr, "seeddelta-build: autotune is enabled in policy but not implemented yet; using fixed K\n");
+                warned_autotune = true;
+            }
+            if (policy_dump_resolved) {
+                fprintf(stderr, "policy: blk.%" PRId64 ".%s enabled=%d strip=%d block=%" PRId64 " K(g/u/d)=%" PRId64 "/%" PRId64 "/%" PRId64 " metric=%s min_mean=%.3f min_p05=%.3f\n",
+                        il, kind.c_str(), cfg.enabled ? 1 : 0, cfg.strip_dense ? 1 : 0, cfg.block,
+                        cfg.K_gate, cfg.K_up, cfg.K_down,
+                        metric_kind_to_string(cfg.metric).c_str(), cfg.min_mean, cfg.min_p05);
+            }
+
+            if (cfg.require_eval_x && (eval_x <= 0 || eval_cols <= 0)) {
+                fprintf(stderr, "seeddelta-build: gating metric requires --eval-x and --eval-cols > 0 for %s\n", weight_name.c_str());
+                return 1;
+            }
+            if (cfg.require_imatrix && !have_imatrix) {
+                fprintf(stderr, "seeddelta-build: gating metric requires imatrix for %s\n", weight_name.c_str());
+                return 1;
+            }
+
             const std::string d_idx_name      = "blk." + std::to_string(il) + "." + kind + ".d_idx";
             const std::string d_val_name      = "blk." + std::to_string(il) + "." + kind + ".d_val";
             const std::string d_row_scale_name = "blk." + std::to_string(il) + "." + kind + ".d_row_scale";
             const std::string b_idx_name      = "blk." + std::to_string(il) + "." + kind + ".b_idx";
             const std::string b_val_name      = "blk." + std::to_string(il) + "." + kind + ".b_val";
 
-            if (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1 ||
+            if (!overwrite_existing && (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1 ||
                 gguf_find_tensor(src, b_idx_name.c_str()) != -1 || gguf_find_tensor(src, b_val_name.c_str()) != -1) {
-                fprintf(stderr, "seeddelta-build: %s already has delta tensors, skipping\n", weight_name.c_str());
+                fprintf(stderr, "seeddelta-build: %s already has delta tensors, skipping (use --overwrite-existing to rebuild)\n", weight_name.c_str());
                 continue;
             }
 
@@ -2023,29 +2154,65 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            if (!cfg.enabled) {
+                report_entry re;
+                re.layer = il;
+                re.kind = kind;
+                re.n_in = W->ne[0];
+                re.n_out = W->ne[1];
+                re.emit = false;
+                re.strip_applied = false;
+                re.gating_enabled = (policy_ptr != nullptr);
+                re.gating_pass = false;
+                re.decision_reason = "disabled";
+                re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.gating_min_mean = cfg.min_mean;
+                re.gating_min_p05 = cfg.min_p05;
+                report.push_back(std::move(re));
+                continue;
+            }
+
             const int64_t n_in  = W->ne[0];
             const int64_t n_out = W->ne[1];
             const int64_t K_kind =
-                    kind == "ffn_gate" ? K_gate_eff :
-                    kind == "ffn_up"   ? K_up_eff   :
-                                        K_down_eff;
+                    kind == "ffn_gate" ? cfg.K_gate :
+                    kind == "ffn_up"   ? cfg.K_up   :
+                                        cfg.K_down;
             const int64_t K_budget = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
             const bool is_tall = n_out >= n_in;
+            const int64_t block_here = (scheme == RESID_BLOCK) ? cfg.block : block;
+            const int64_t block = block_here; // shadow global block for per-tensor overrides
 
             std::vector<float> w_scale;
             const bool have_w = have_imatrix && make_imatrix_sqrt_scale(imatrix_data, weight_name, n_in, imatrix_eps, imatrix_power, w_scale);
+            if (cfg.require_imatrix && !have_w) {
+                report_entry re;
+                re.layer = il;
+                re.kind = kind;
+                re.n_in = n_in;
+                re.n_out = n_out;
+                re.emit = false;
+                re.gating_enabled = (policy_ptr != nullptr);
+                re.gating_pass = false;
+                re.decision_reason = "missing_imatrix";
+                re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.gating_min_mean = cfg.min_mean;
+                re.gating_min_p05 = cfg.min_p05;
+                report.push_back(std::move(re));
+                continue;
+            }
 
             int64_t n_blocks_keep = 0;
             int64_t K_eff = K_budget;
             if (scheme == RESID_BLOCK) {
-                const int64_t n_blocks_total = (n_in + block - 1) / block;
-                n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget + block - 1) / block, n_blocks_total));
-                K_eff = n_blocks_keep * block;
+                const int64_t n_blocks_total = (n_in + block_here - 1) / block_here;
+                n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget + block_here - 1) / block_here, n_blocks_total));
+                K_eff = n_blocks_keep * block_here;
             }
 
             if (scheme == RESID_BLOCK) {
                 printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=block block=%" PRId64 " nb=%" PRId64 " K=%" PRId64 " (budget=%" PRId64 ")%s\n",
-                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block, n_blocks_keep, K_eff, K_budget,
+                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block_here, n_blocks_keep, K_eff, K_budget,
                        have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
             } else {
                 printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=coo K=%" PRId64 "%s\n",
@@ -2364,9 +2531,51 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            if (!report_json.empty()) {
-                report.push_back(std::move(re));
+            re.gating_enabled = cfg.gating_enabled;
+            re.gating_metric_used = metric_kind_to_string(cfg.metric);
+            re.gating_min_mean = cfg.min_mean;
+            re.gating_min_p05  = cfg.min_p05;
+
+            const bool metric_needs_x = (cfg.metric == sd_metric_kind::cos_x || cfg.metric == sd_metric_kind::cos_x_w);
+            const bool metric_needs_w = (cfg.metric == sd_metric_kind::cos_w || cfg.metric == sd_metric_kind::cos_x_w);
+            bool metric_available = true;
+            if (metric_needs_x && !re.has_x) {
+                metric_available = false;
             }
+            if (metric_needs_w && !have_w) {
+                metric_available = false;
+            }
+
+            const double metric_val = pick_metric_value(re, cfg.metric);
+            const double metric_p05 = pick_metric_p05(re, cfg.metric);
+            bool gating_pass = !cfg.gating_enabled || (metric_available && metric_val >= cfg.min_mean && metric_p05 >= cfg.min_p05);
+            bool emit = cfg.enabled && gating_pass && metric_available;
+            bool strip_this = emit && cfg.strip_dense;
+
+            re.gating_pass = gating_pass && metric_available;
+            re.gating_value = metric_val;
+            re.gating_p05 = metric_p05;
+            re.emit = emit;
+            re.strip_applied = strip_this;
+            if (!metric_available) {
+                re.decision_reason = "metric_unavailable";
+            } else if (!gating_pass) {
+                re.decision_reason = "gating_fail";
+            } else {
+                re.decision_reason = "pass_gating";
+            }
+
+            if (!emit) {
+                report.push_back(std::move(re));
+                continue;
+            }
+
+            if (strip_this) {
+                strip_weights.insert(weight_name);
+                any_strip = true;
+            }
+
+            report.push_back(std::move(re));
 
             // Allocate a dedicated ggml context for new tensors to avoid a giant arena.
             const size_t size_idx = scheme == RESID_BLOCK
@@ -2446,8 +2655,10 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            gguf_add_tensor(dst, t_idx);
-            gguf_add_tensor(dst, t_val);
+            pending_tensor_set pts;
+            pts.ctx = ctx_sd;
+            pts.tensors.push_back(t_idx);
+            pts.tensors.push_back(t_val);
             n_added += 2;
 
             if (write_row_scale) {
@@ -2455,7 +2666,7 @@ int main(int argc, char ** argv) {
                 ggml_set_name(t_rs, d_row_scale_name.c_str());
                 auto * rs_f16 = (ggml_fp16_t *) t_rs->data;
                 ggml_fp32_to_fp16_row(d_row_scale.data(), rs_f16, n_out);
-                gguf_add_tensor(dst, t_rs);
+                pts.tensors.push_back(t_rs);
                 n_added += 1;
             }
 
@@ -2483,10 +2694,10 @@ int main(int argc, char ** argv) {
                     ggml_fp32_to_fp16_row(base.d3.data() + (size_t) b * (size_t) base.L, d3_f16 + (size_t) b * (size_t) base.L, base.L);
                 }
 
-                gguf_add_tensor(dst, t_d1);
-                gguf_add_tensor(dst, t_d2);
-                gguf_add_tensor(dst, t_d3);
-                gguf_add_tensor(dst, t_p1);
+                pts.tensors.push_back(t_d1);
+                pts.tensors.push_back(t_d2);
+                pts.tensors.push_back(t_d3);
+                pts.tensors.push_back(t_p1);
                 if (perm_type == GGML_TYPE_I16) {
                     auto * p1_i16 = (int16_t *) t_p1->data;
                     for (size_t i = 0; i < base.perm1.size(); ++i) {
@@ -2498,6 +2709,8 @@ int main(int argc, char ** argv) {
                 }
                 n_added += 4;
             }
+
+            pending.push_back(std::move(pts));
         }
     }
 
@@ -2505,12 +2718,35 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "no new SeedΔ tensors added\n");
     }
 
+    gguf_context * dst = gguf_init_empty();
+    gguf_set_kv(dst, src);
+
+    // Add original tensors, skipping those strippeados.
+    for (int64_t ti = 0; ti < n_tensors; ++ti) {
+        const char * name = gguf_get_tensor_name(src, ti);
+        if (any_strip && strip_weights.count(name) > 0) {
+            continue;
+        }
+        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
+        if (!t) {
+            fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
+            continue;
+        }
+        gguf_add_tensor(dst, t);
+    }
+
+    for (const auto & pts : pending) {
+        for (ggml_tensor * t : pts.tensors) {
+            gguf_add_tensor(dst, t);
+        }
+    }
+
     gguf_set_val_bool(dst, "seeddelta.enabled", n_added > 0);
     gguf_set_val_u32(dst, "seeddelta.version", 1);
     gguf_set_val_u32(dst, "seeddelta.scheme", (uint32_t) scheme);
     gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
     gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
-    gguf_set_val_bool(dst, "seeddelta.strip_dense", strip_dense);
+    gguf_set_val_bool(dst, "seeddelta.strip_dense", any_strip);
     if (scheme == RESID_BLOCK) {
         gguf_set_val_u32(dst, "seeddelta.resid.block", (uint32_t) block);
     }
@@ -2527,6 +2763,15 @@ int main(int argc, char ** argv) {
         gguf_set_val_u32(dst, "seeddelta.base.R", 1);
         gguf_set_val_u32(dst, "seeddelta.base.max_samples", (uint32_t) std::max<int64_t>(0, base_max_samples));
         gguf_set_val_u32(dst, "seeddelta.base.perm_trials", (uint32_t) std::max(1, base_perm_trials));
+    }
+
+    // Per-tensor audit metadata (minimal, per GGUF kv).
+    for (const auto & re : report) {
+        const std::string prefix = "seeddelta.blk." + std::to_string(re.layer) + "." + re.kind;
+        gguf_set_val_bool(dst, (prefix + ".enabled").c_str(), re.emit);
+        gguf_set_val_bool(dst, (prefix + ".gating_pass").c_str(), re.gating_pass);
+        gguf_set_val_bool(dst, (prefix + ".strip_dense").c_str(), re.strip_applied);
+        gguf_set_val_u32(dst, (prefix + ".K").c_str(), (uint32_t) std::max<int64_t>(0, re.K));
     }
 
     printf("writing %s with %" PRId64 " new tensors\n", out_fname.c_str(), n_added);
@@ -2563,6 +2808,8 @@ int main(int argc, char ** argv) {
         out << "  \"output\": \"" << json_escape(out_fname) << "\",\n";
         out << "  \"imatrix\": " << (have_imatrix ? "true" : "false") << ",\n";
         out << "  \"base\": " << (write_base ? "true" : "false") << ",\n";
+        out << "  \"policy_file\": \"" << (policy_file.empty() ? "" : json_escape(policy_file)) << "\",\n";
+        out << "  \"policy_hash\": \"" << json_escape(policy_hash) << "\",\n";
         if (write_base) {
             out << "  \"base_kind\": \"xor_circulant\",\n";
             out << "  \"base_max_samples\": " << base_max_samples << ",\n";
@@ -2635,7 +2882,17 @@ int main(int argc, char ** argv) {
             out << "      \"rel_l2_p95_x_w\": " << e.em_x_w.rel_l2_p95 << ",\n";
             out << "      \"cos_mean_x_w\": " << e.em_x_w.cos_mean << ",\n";
             out << "      \"cos_p05_x_w\": " << e.em_x_w.cos_p05 << ",\n";
-            out << "      \"norm_ratio_mean_x_w\": " << e.em_x_w.norm_ratio_mean << "\n";
+            out << "      \"norm_ratio_mean_x_w\": " << e.em_x_w.norm_ratio_mean << ",\n";
+            out << "      \"gating_enabled\": " << (e.gating_enabled ? "true" : "false") << ",\n";
+            out << "      \"gating_metric\": \"" << json_escape(e.gating_metric_used) << "\",\n";
+            out << "      \"gating_value\": " << e.gating_value << ",\n";
+            out << "      \"gating_p05\": " << e.gating_p05 << ",\n";
+            out << "      \"gating_min_mean\": " << e.gating_min_mean << ",\n";
+            out << "      \"gating_min_p05\": " << e.gating_min_p05 << ",\n";
+            out << "      \"gating_pass\": " << (e.gating_pass ? "true" : "false") << ",\n";
+            out << "      \"emit\": " << (e.emit ? "true" : "false") << ",\n";
+            out << "      \"strip_dense\": " << (e.strip_applied ? "true" : "false") << ",\n";
+            out << "      \"decision\": \"" << json_escape(e.decision_reason) << "\"\n";
 
             out << "    }" << (i + 1 < report.size() ? "," : "") << "\n";
         }
