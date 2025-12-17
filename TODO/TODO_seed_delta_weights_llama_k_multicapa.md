@@ -252,7 +252,7 @@ Campos recomendados (para forense y reproducibilidad):
 
 - `decision.metric_used` (p.ej. `cos_x_w` / `cos_x` / `cos_w`)
 - `decision.thresholds_used` (snapshot de thresholds tras merge)
-- `build.policy_hash` (sha256 del JSON) y (si se puede) `build.git_commit` / version string del builder
+- `build.policy_hash` (hash del JSON; actualmente `fnv1a64:<hex>`), y (si se puede) `build.git_commit` / version string del builder
 
 ---
 
@@ -269,25 +269,25 @@ Campos recomendados (para forense y reproducibilidad):
 
 ### Builder: policy/gating/autotune (Fase 4, prioridad alta)
 
-- [ ] Implementar `--policy` en `tools/seeddelta-build/seeddelta-build.cpp` (parse + merge + resolver).
-- [ ] Añadir `--policy-strict` (error en keys desconocidas) para evitar typos silenciosos.
-- [ ] (Opcional) `--policy-dump-resolved` para imprimir cfg efectivo por capa/tensor (debug rápido).
-- [ ] Definir contrato de métricas para gating/autotune:
+- [x] Implementar `--policy` en `tools/seeddelta-build/seeddelta-build.cpp` (parse + merge + resolver).
+- [x] Añadir `--policy-strict` (error en keys desconocidas) para evitar typos silenciosos.
+- [x] (Opcional) `--policy-dump-resolved` para imprimir cfg efectivo por capa/tensor (debug rápido).
+- [x] Definir contrato de métricas para gating/autotune:
   - si la policy usa `*_x*` exigir `--eval-x > 0` (y fallar claro si no)
   - si la policy usa `*_x_w` definir qué pasa sin `--imatrix` (error vs fallback + warning)
-- [ ] Implementar gating por tensor usando `cos_mean_x_w` + `cos_p05_x_w` (fallbacks si faltan).
-- [ ] Cambiar `--strip-dense` a comportamiento “por tensor”: solo strip si el tensor pasó gating y hay reemplazo.
-- [ ] Aclarar/implementar semántica de `seeddelta.strip_dense` con strip parcial:
+- [x] Implementar gating por tensor usando `cos_mean_x_w` + `cos_p05_x_w` (fallbacks si faltan).
+- [x] Cambiar `--strip-dense` a comportamiento “por tensor”: solo strip si el tensor pasó gating y hay reemplazo.
+- [x] Aclarar/implementar semántica de `seeddelta.strip_dense` con strip parcial:
   - setear el KV global si **cualquier** tensor fue strippeado (para permitir stubs)
   - opcional: metadata adicional para auditar qué tensores fueron strippeados vs mantenidos densos
-- [ ] Implementar autotune de K por tensor (schedule configurable).
-- [ ] Volcar resolved/gating/autotune/decision al `--report-json`.
-- [ ] Añadir `policy.example.qwen7b.json` y `policy.example.gemma.json` en `tools/seeddelta-build/policies/` (o `calibration/` si preferimos).
+- [x] Implementar autotune de K por tensor (schedule configurable).
+- [x] Volcar resolved/gating/autotune/decision al `--report-json`.
+- [x] Añadir `policy.example.qwen7b.json` y `policy.example.gemma.json` en `tools/seeddelta-build/policies/` (o `calibration/` si preferimos).
   - (Opcional) exponer gating/autotune “global” vía flags (`--autotune-k-*`, `--gating-*`) para arrancar sin policy y luego migrar.
 - [ ] Resolver robusto de tensor→kind (nombres reales por arquitectura):
   - mapear `blk.N.ffn_{gate,up,down}.weight` a `ffn_gate/up/down`
   - si un modelo no tiene ese tensor, skip + dejar rastro en report (no abortar silencioso)
-- [ ] Iteración segura sobre modelos ya SeedΔ:
+- [x] Iteración segura sobre modelos ya SeedΔ:
   - decidir comportamiento por defecto (skip vs overwrite) y exponer flags tipo `--skip-existing` / `--overwrite`
   - en modo policy, evitar “skipping” silencioso que invalida el resolved/gating/autotune
 - [ ] Harness reproducible para policy:

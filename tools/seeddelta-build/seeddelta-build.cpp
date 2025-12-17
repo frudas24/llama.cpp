@@ -1,6 +1,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "seeddelta_policy.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <numeric>
 #include <random>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -41,6 +43,10 @@ static void usage(const char * argv0) {
     printf("  --base-max-samples N max sampled outputs per block for base fit (default: 2048, 0=all)\n");
     printf("  --base-perm-trials N random P1 trials per base block (default: 1)\n");
     printf("  --strip-dense        drop original dense weights for layers processed (reduces GGUF size; disables dense fallback)\n");
+    printf("  --policy FILE        JSON policy for per-layer/tensor K/block/gating/autotune/strip overrides\n");
+    printf("  --policy-strict      reject unknown keys in policy.json (default: warn and ignore)\n");
+    printf("  --policy-dump-resolved print resolved config per tensor (debug)\n");
+    printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -1816,6 +1822,7 @@ struct report_entry {
     std::string kind;
     int64_t n_in = 0;
     int64_t n_out = 0;
+    int64_t K_budget = 0;
     int64_t K = 0;
     int64_t block = 0;
     int64_t n_blocks = 0;
@@ -1826,7 +1833,90 @@ struct report_entry {
     cost_estimate cost;
     bool has_w = false;
     bool has_x = false;
+    // Gating/decision metadata
+    bool gating_enabled = false;
+    bool gating_pass = true;
+    std::string gating_metric_used;
+    double gating_value = 0.0;
+    double gating_p05 = 0.0;
+    double gating_min_mean = 0.0;
+    double gating_min_p05 = 0.0;
+    bool emit = true;
+    bool strip_applied = false;
+    std::string decision_reason;
+
+    struct autotune_attempt {
+        int64_t K_budget = 0;
+        int64_t K_eff = 0;
+        int64_t n_blocks = 0;
+        double metric_value = 0.0;
+        double metric_p05 = 0.0;
+        bool pass = false;
+        double seconds = 0.0;
+    };
+    bool autotune_enabled = false;
+    int64_t autotune_selected_budget = 0;
+    std::vector<autotune_attempt> autotune_attempts;
 };
+
+struct pending_tensor_set {
+    ggml_context * ctx = nullptr;
+    std::vector<ggml_tensor *> tensors;
+};
+
+static std::string metric_kind_to_string(sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return "cos_x_w";
+        case sd_metric_kind::cos_x:   return "cos_x";
+        case sd_metric_kind::cos_w:   return "cos_w";
+        case sd_metric_kind::cos:     return "cos";
+    }
+    return "cos";
+}
+
+static double pick_metric_value(const report_entry & re, sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return re.em_x_w.cos_mean;
+        case sd_metric_kind::cos_x:   return re.em_x.cos_mean;
+        case sd_metric_kind::cos_w:   return re.em_w.cos_mean;
+        case sd_metric_kind::cos:     return re.em.cos_mean;
+    }
+    return re.em.cos_mean;
+}
+
+static double pick_metric_p05(const report_entry & re, sd_metric_kind m) {
+    switch (m) {
+        case sd_metric_kind::cos_x_w: return re.em_x_w.cos_p05;
+        case sd_metric_kind::cos_x:   return re.em_x.cos_p05;
+        case sd_metric_kind::cos_w:   return re.em_w.cos_p05;
+        case sd_metric_kind::cos:     return re.em.cos_p05;
+    }
+    return re.em.cos_p05;
+}
+
+static std::string fnv1a_hex(const std::string & data) {
+    uint64_t hash = 1469598103934665603ULL; // FNV-1a 64-bit offset
+    for (unsigned char c : data) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream oss;
+    oss << std::hex;
+    oss.width(16);
+    oss.fill('0');
+    oss << hash;
+    return oss.str();
+}
+
+static std::string slurp_file(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    return oss.str();
+}
 
 int main(int argc, char ** argv) {
     std::string in_fname;
@@ -1835,6 +1925,7 @@ int main(int argc, char ** argv) {
     std::string layers_range;
     std::string imatrix_file;
     std::string report_json;
+    std::string policy_file;
 
     std::string scheme_str = "coo";
     int64_t block = 32;
@@ -1856,6 +1947,9 @@ int main(int argc, char ** argv) {
     float imatrix_eps = 1e-8f;
     float imatrix_power = 1.0f;
     int seed = 1234;
+    bool policy_strict = false;
+    bool policy_dump_resolved = false;
+    bool overwrite_existing = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1879,6 +1973,10 @@ int main(int argc, char ** argv) {
         if (arg == "--base-max-samples" && i + 1 < argc) { base_max_samples = std::stoll(argv[++i]); continue; }
         if (arg == "--base-perm-trials" && i + 1 < argc) { base_perm_trials = std::max(1, std::stoi(argv[++i])); continue; }
         if (arg == "--strip-dense") { strip_dense = true; continue; }
+        if (arg == "--policy" && i + 1 < argc) { policy_file = argv[++i]; continue; }
+        if (arg == "--policy-strict") { policy_strict = true; continue; }
+        if (arg == "--policy-dump-resolved") { policy_dump_resolved = true; continue; }
+        if (arg == "--overwrite-existing") { overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
         if (arg == "--eval-x" && i + 1 < argc) { eval_x = std::stoll(argv[++i]); continue; }
@@ -1945,6 +2043,25 @@ int main(int argc, char ** argv) {
 
     const int64_t n_tensors = gguf_get_n_tensors(src);
 
+    sd_policy policy;
+    sd_policy * policy_ptr = nullptr;
+    std::string policy_hash;
+    if (!policy_file.empty()) {
+        auto pres = sd_policy_load(policy_file, policy_strict, policy);
+        if (!pres.ok) {
+            fprintf(stderr, "seeddelta-build: %s\n", pres.error.c_str());
+            return 1;
+        }
+        for (const auto & w : pres.warnings) {
+            fprintf(stderr, "seeddelta-build: policy warning: %s\n", w.c_str());
+        }
+        policy_ptr = &policy;
+        const std::string policy_bytes = slurp_file(policy_file);
+        if (!policy_bytes.empty()) {
+            policy_hash = "fnv1a64:" + fnv1a_hex(policy_bytes);
+        }
+    }
+
     // Discover number of layers from tensor names.
     int64_t max_layer_id = -1;
     std::regex re_layer(R"(blk\.(\d+)\.)");
@@ -1959,31 +2076,6 @@ int main(int argc, char ** argv) {
     auto layers = parse_layer_range(layers_range, n_layer);
 
     const std::vector<std::string> kinds = { "ffn_gate", "ffn_up", "ffn_down" };
-    std::unordered_set<std::string> strip_weights;
-    if (strip_dense) {
-        for (const int64_t il : layers) {
-            for (const auto & kind : kinds) {
-                strip_weights.insert("blk." + std::to_string(il) + "." + kind + ".weight");
-            }
-        }
-    }
-
-    gguf_context * dst = gguf_init_empty();
-    gguf_set_kv(dst, src);
-
-    // Add original tensors.
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * name = gguf_get_tensor_name(src, ti);
-        if (strip_dense && strip_weights.count(name) > 0) {
-            continue;
-        }
-        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
-        if (!t) {
-            fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
-            continue;
-        }
-        gguf_add_tensor(dst, t);
-    }
 
     std::mt19937 rng(seed);
 
@@ -1992,12 +2084,32 @@ int main(int argc, char ** argv) {
 
     int64_t n_added = 0;
     std::vector<report_entry> report;
+    std::vector<pending_tensor_set> pending;
+    std::unordered_set<std::string> strip_weights;
+    bool any_strip = false;
 
     const int64_t K_default = std::max<int64_t>(1, K);
     const int64_t K_gate_eff = (K_gate > 0 ? K_gate : K_default);
     const int64_t K_up_eff   = (K_up   > 0 ? K_up   : K_default);
     const int64_t K_down_eff = (K_down > 0 ? K_down : K_default);
     const bool K_variable = (K_gate_eff != K_default) || (K_up_eff != K_default) || (K_down_eff != K_default);
+
+    sd_resolved_tensor baseline_cfg;
+    baseline_cfg.block = block;
+    baseline_cfg.K_gate = K_gate_eff;
+    baseline_cfg.K_up   = K_up_eff;
+    baseline_cfg.K_down = K_down_eff;
+    baseline_cfg.strip_dense = strip_dense;
+    baseline_cfg.enabled = true;
+    baseline_cfg.metric = sd_metric_kind::cos_x_w;
+    baseline_cfg.min_mean = 0.0f;
+    baseline_cfg.min_p05  = 0.0f;
+    baseline_cfg.gating_enabled = (policy_ptr != nullptr);
+
+    if (policy_ptr && eval_cols <= 0) {
+        fprintf(stderr, "seeddelta-build: --policy requires --eval-cols > 0 for gating/autotune\n");
+        return 1;
+    }
 
     for (const int64_t il : layers) {
         for (const auto & kind : kinds) {
@@ -2006,15 +2118,44 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            sd_resolved_tensor baseline_kind = baseline_cfg;
+            if (kind == "ffn_down") {
+                baseline_kind.min_mean = 0.25f;
+                baseline_kind.min_p05  = 0.15f;
+            } else {
+                baseline_kind.min_mean = 0.45f;
+                baseline_kind.min_p05  = 0.30f;
+            }
+
+            sd_resolved_tensor cfg = sd_policy_resolve(policy_ptr, il, kind, baseline_kind);
+            if (!cfg.enabled) {
+                // still record later in report as disabled
+            }
+            if (policy_dump_resolved) {
+                fprintf(stderr, "policy: blk.%" PRId64 ".%s enabled=%d strip=%d block=%" PRId64 " K(g/u/d)=%" PRId64 "/%" PRId64 "/%" PRId64 " metric=%s min_mean=%.3f min_p05=%.3f\n",
+                        il, kind.c_str(), cfg.enabled ? 1 : 0, cfg.strip_dense ? 1 : 0, cfg.block,
+                        cfg.K_gate, cfg.K_up, cfg.K_down,
+                        metric_kind_to_string(cfg.metric).c_str(), cfg.min_mean, cfg.min_p05);
+            }
+
+            if (cfg.require_eval_x && (eval_x <= 0 || eval_cols <= 0)) {
+                fprintf(stderr, "seeddelta-build: gating metric requires --eval-x and --eval-cols > 0 for %s\n", weight_name.c_str());
+                return 1;
+            }
+            if (cfg.require_imatrix && !have_imatrix) {
+                fprintf(stderr, "seeddelta-build: gating metric requires imatrix for %s\n", weight_name.c_str());
+                return 1;
+            }
+
             const std::string d_idx_name      = "blk." + std::to_string(il) + "." + kind + ".d_idx";
             const std::string d_val_name      = "blk." + std::to_string(il) + "." + kind + ".d_val";
             const std::string d_row_scale_name = "blk." + std::to_string(il) + "." + kind + ".d_row_scale";
             const std::string b_idx_name      = "blk." + std::to_string(il) + "." + kind + ".b_idx";
             const std::string b_val_name      = "blk." + std::to_string(il) + "." + kind + ".b_val";
 
-            if (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1 ||
-                gguf_find_tensor(src, b_idx_name.c_str()) != -1 || gguf_find_tensor(src, b_val_name.c_str()) != -1) {
-                fprintf(stderr, "seeddelta-build: %s already has delta tensors, skipping\n", weight_name.c_str());
+            if (!overwrite_existing && (gguf_find_tensor(src, d_idx_name.c_str()) != -1 || gguf_find_tensor(src, d_val_name.c_str()) != -1 ||
+                gguf_find_tensor(src, b_idx_name.c_str()) != -1 || gguf_find_tensor(src, b_val_name.c_str()) != -1)) {
+                fprintf(stderr, "seeddelta-build: %s already has delta tensors, skipping (use --overwrite-existing to rebuild)\n", weight_name.c_str());
                 continue;
             }
 
@@ -2023,34 +2164,52 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            if (!cfg.enabled) {
+                report_entry re;
+                re.layer = il;
+                re.kind = kind;
+                re.n_in = W->ne[0];
+                re.n_out = W->ne[1];
+                re.emit = false;
+                re.strip_applied = false;
+                re.gating_enabled = (policy_ptr != nullptr);
+                re.gating_pass = false;
+                re.decision_reason = "disabled";
+                re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.gating_min_mean = cfg.min_mean;
+                re.gating_min_p05 = cfg.min_p05;
+                report.push_back(std::move(re));
+                continue;
+            }
+
             const int64_t n_in  = W->ne[0];
             const int64_t n_out = W->ne[1];
             const int64_t K_kind =
-                    kind == "ffn_gate" ? K_gate_eff :
-                    kind == "ffn_up"   ? K_up_eff   :
-                                        K_down_eff;
+                    kind == "ffn_gate" ? cfg.K_gate :
+                    kind == "ffn_up"   ? cfg.K_up   :
+                                        cfg.K_down;
             const int64_t K_budget = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
             const bool is_tall = n_out >= n_in;
+            const int64_t block_here = (scheme == RESID_BLOCK) ? cfg.block : block;
+            const int64_t block = block_here; // shadow global block for per-tensor overrides
 
             std::vector<float> w_scale;
             const bool have_w = have_imatrix && make_imatrix_sqrt_scale(imatrix_data, weight_name, n_in, imatrix_eps, imatrix_power, w_scale);
-
-            int64_t n_blocks_keep = 0;
-            int64_t K_eff = K_budget;
-            if (scheme == RESID_BLOCK) {
-                const int64_t n_blocks_total = (n_in + block - 1) / block;
-                n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget + block - 1) / block, n_blocks_total));
-                K_eff = n_blocks_keep * block;
-            }
-
-            if (scheme == RESID_BLOCK) {
-                printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=block block=%" PRId64 " nb=%" PRId64 " K=%" PRId64 " (budget=%" PRId64 ")%s\n",
-                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block, n_blocks_keep, K_eff, K_budget,
-                       have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
-            } else {
-                printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=coo K=%" PRId64 "%s\n",
-                       il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), K_eff,
-                       have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+            if (cfg.require_imatrix && !have_w) {
+                report_entry re;
+                re.layer = il;
+                re.kind = kind;
+                re.n_in = n_in;
+                re.n_out = n_out;
+                re.emit = false;
+                re.gating_enabled = (policy_ptr != nullptr);
+                re.gating_pass = false;
+                re.decision_reason = "missing_imatrix";
+                re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.gating_min_mean = cfg.min_mean;
+                re.gating_min_p05 = cfg.min_p05;
+                report.push_back(std::move(re));
+                continue;
             }
 
             base_fit base;
@@ -2062,85 +2221,104 @@ int main(int argc, char ** argv) {
                         il, kind.c_str(), base.L, base.B, base_max_samples, base_perm_trials, have_w ? " imatrix=on" : "", sec);
             }
 
-            std::vector<int32_t> d_idx;
-            std::vector<float>   d_val;
-            std::vector<int32_t> b_idx;
-            std::vector<float>   b_val;
-            std::vector<float>   d_row_scale;
-            if (scheme == RESID_BLOCK) {
-                GGML_ASSERT(n_blocks_keep > 0);
-                b_idx.assign((size_t) n_blocks_keep * (size_t) n_out, -1);
-                b_val.assign((size_t) block * (size_t) n_blocks_keep * (size_t) n_out, 0.0f);
-            } else {
-                d_idx.assign((size_t) K_eff * (size_t) n_out, -1);
-                d_val.assign((size_t) K_eff * (size_t) n_out, 0.0f);
-            }
-            if (write_row_scale) {
-                d_row_scale.resize((size_t) n_out, 1.0f);
-            }
+            struct trial_data {
+                report_entry re;
+                std::vector<int32_t> d_idx;
+                std::vector<float>   d_val;
+                std::vector<int32_t> b_idx;
+                std::vector<float>   b_val;
+                std::vector<float>   d_row_scale;
+                double seconds = 0.0;
+            };
 
-            std::atomic<int64_t> next_col{0};
-            std::vector<std::thread> workers;
-            workers.reserve((size_t) n_threads);
+            auto run_trial = [&](int64_t K_budget_trial) -> trial_data {
+                trial_data t;
 
-            const int64_t chunk = 16;
+                const int64_t t0_total = ggml_time_us();
+                const int64_t K_budget_clamped = std::max<int64_t>(1, std::min<int64_t>(K_budget_trial, n_in));
 
-            for (int ti = 0; ti < n_threads; ++ti) {
-                workers.emplace_back([&, ti]() {
-                    GGML_UNUSED(ti);
+                int64_t n_blocks_keep = 0;
+                int64_t K_eff = K_budget_clamped;
+                if (scheme == RESID_BLOCK) {
+                    const int64_t n_blocks_total = (n_in + block - 1) / block;
+                    n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget_clamped + block - 1) / block, n_blocks_total));
+                    K_eff = n_blocks_keep * block;
+                }
 
-                    std::vector<float> w;
-                    std::vector<float> r;
-                    std::vector<int32_t> topk;
-                    std::vector<int32_t> top_blocks;
-                    while (true) {
-                        const int64_t col0 = next_col.fetch_add(chunk);
-                        if (col0 >= n_out) {
-                            break;
-                        }
+                if (scheme == RESID_BLOCK) {
+                    printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=block block=%" PRId64 " nb=%" PRId64 " K=%" PRId64 " (budget=%" PRId64 ")%s\n",
+                           il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block, n_blocks_keep, K_eff, K_budget_clamped,
+                           have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+                } else {
+                    printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=coo K=%" PRId64 "%s\n",
+                           il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), K_eff,
+                           have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+                }
 
-                        const int64_t col1 = std::min<int64_t>(n_out, col0 + chunk);
-                        for (int64_t col = col0; col < col1; ++col) {
-                            read_column_f32(W, col, w);
+                t.re.layer = il;
+                t.re.kind = kind;
+                t.re.n_in = n_in;
+                t.re.n_out = n_out;
+                t.re.K_budget = K_budget_clamped;
+                t.re.K = K_eff;
+                t.re.block = (scheme == RESID_BLOCK) ? block : 0;
+                t.re.n_blocks = (scheme == RESID_BLOCK) ? n_blocks_keep : 0;
+                t.re.has_w = have_w;
+                t.re.cost = estimate_cost(write_base ? &base : nullptr, n_in, n_out, K_eff, write_row_scale);
 
-                            double dot = 0.0;
-                            double nn  = 0.0;
+                if (scheme == RESID_BLOCK) {
+                    GGML_ASSERT(n_blocks_keep > 0);
+                    t.b_idx.assign((size_t) n_blocks_keep * (size_t) n_out, -1);
+                    t.b_val.assign((size_t) block * (size_t) n_blocks_keep * (size_t) n_out, 0.0f);
+                } else {
+                    t.d_idx.assign((size_t) K_eff * (size_t) n_out, -1);
+                    t.d_val.assign((size_t) K_eff * (size_t) n_out, 0.0f);
+                }
+                if (write_row_scale) {
+                    t.d_row_scale.resize((size_t) n_out, 1.0f);
+                }
 
-                            if (write_base) {
-                                r.resize((size_t) n_in);
+                std::atomic<int64_t> next_col{0};
+                std::vector<std::thread> workers;
+                workers.reserve((size_t) n_threads);
 
-                                const int64_t L = base.L;
-                                GGML_ASSERT(L > 0);
+                const int64_t chunk = 16;
 
-                                if (is_tall) {
-                                    const int64_t b = col / L;
-                                    const int64_t p = col - b * L;
-                                    const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
-                                    const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                for (int ti = 0; ti < n_threads; ++ti) {
+                    workers.emplace_back([&, ti]() {
+                        GGML_UNUSED(ti);
 
-                                    for (int64_t i = 0; i < n_in; ++i) {
-                                        const int64_t j = inv ? (int64_t) inv[(size_t) i] : i;
-                                        const int64_t u = (p ^ j) & (L - 1);
-                                        const float base_w = h2[(size_t) u];
-                                        r[(size_t) i] = w[(size_t) i] - base_w;
+                        std::vector<float> w;
+                        std::vector<float> r;
+                        std::vector<int32_t> topk;
+                        std::vector<int32_t> top_blocks;
+                        while (true) {
+                            const int64_t col0 = next_col.fetch_add(chunk);
+                            if (col0 >= n_out) {
+                                break;
+                            }
 
-                                        if (write_row_scale) {
-                                            const double ws = have_w ? (double) w_scale[(size_t) i] : 1.0;
-                                            dot += (double) w[(size_t) i] * (double) base_w * ws * ws;
-                                            nn  += (double) base_w * (double) base_w * ws * ws;
-                                        }
-                                    }
-                                } else {
-                                    const int64_t p = col;
+                            const int64_t col1 = std::min<int64_t>(n_out, col0 + chunk);
+                            for (int64_t col = col0; col < col1; ++col) {
+                                read_column_f32(W, col, w);
 
-                                    for (int64_t b = 0; b < base.B; ++b) {
+                                double dot = 0.0;
+                                double nn  = 0.0;
+
+                                if (write_base) {
+                                    r.resize((size_t) n_in);
+
+                                    const int64_t L = base.L;
+                                    GGML_ASSERT(L > 0);
+
+                                    if (is_tall) {
+                                        const int64_t b = col / L;
+                                        const int64_t p = col - b * L;
                                         const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
                                         const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
-                                        const int64_t in0 = b * L;
-                                        const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
-                                        for (int64_t i = in0; i < in1; ++i) {
-                                            const int64_t q = i - in0;
-                                            const int64_t j = inv ? (int64_t) inv[(size_t) q] : q;
+
+                                        for (int64_t i = 0; i < n_in; ++i) {
+                                            const int64_t j = inv ? (int64_t) inv[(size_t) i] : i;
                                             const int64_t u = (p ^ j) & (L - 1);
                                             const float base_w = h2[(size_t) u];
                                             r[(size_t) i] = w[(size_t) i] - base_w;
@@ -2151,41 +2329,120 @@ int main(int argc, char ** argv) {
                                                 nn  += (double) base_w * (double) base_w * ws * ws;
                                             }
                                         }
+                                    } else {
+                                        const int64_t p = col;
+
+                                        for (int64_t b = 0; b < base.B; ++b) {
+                                            const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                                            const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                                            const int64_t in0 = b * L;
+                                            const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
+                                            for (int64_t i = in0; i < in1; ++i) {
+                                                const int64_t q = i - in0;
+                                                const int64_t j = inv ? (int64_t) inv[(size_t) q] : q;
+                                                const int64_t u = (p ^ j) & (L - 1);
+                                                const float base_w = h2[(size_t) u];
+                                                r[(size_t) i] = w[(size_t) i] - base_w;
+
+                                                if (write_row_scale) {
+                                                    const double ws = have_w ? (double) w_scale[(size_t) i] : 1.0;
+                                                    dot += (double) w[(size_t) i] * (double) base_w * ws * ws;
+                                                    nn  += (double) base_w * (double) base_w * ws * ws;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                            }
 
-                            if (scheme == RESID_BLOCK) {
-                                const std::vector<float> & src = write_base ? r : w;
-                                topk_blocks_energy_weighted(src, have_w ? &w_scale : nullptr, block, n_blocks_keep, top_blocks);
+                                if (scheme == RESID_BLOCK) {
+                                    const std::vector<float> & src = write_base ? r : w;
+                                    topk_blocks_energy_weighted(src, have_w ? &w_scale : nullptr, block, n_blocks_keep, top_blocks);
 
-                                float ss = 1.0f;
-                                if (write_row_scale) {
-                                    if (write_base) {
-                                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
-                                            const int32_t blk = top_blocks[(size_t) bi];
-                                            if (blk < 0) {
-                                                continue;
+                                    float ss = 1.0f;
+                                    if (write_row_scale) {
+                                        if (write_base) {
+                                            for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                                const int32_t blk = top_blocks[(size_t) bi];
+                                                if (blk < 0) {
+                                                    continue;
+                                                }
+                                                const int64_t in0 = (int64_t) blk * block;
+                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                                for (int64_t ii = in0; ii < in1; ++ii) {
+                                                    const double wi = (double) w[(size_t) ii];
+                                                    const double di = (double) r[(size_t) ii];
+                                                    const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+                                                    dot += wi * di * ws * ws;
+                                                    nn  += (2.0 * wi * di - di * di) * ws * ws;
+                                                }
                                             }
-                                            const int64_t in0 = (int64_t) blk * block;
-                                            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
-                                            for (int64_t ii = in0; ii < in1; ++ii) {
+                                        } else {
+                                            for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                                const int32_t blk = top_blocks[(size_t) bi];
+                                                if (blk < 0) {
+                                                    continue;
+                                                }
+                                                const int64_t in0 = (int64_t) blk * block;
+                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                                for (int64_t ii = in0; ii < in1; ++ii) {
+                                                    const double wi  = (double) w[(size_t) ii];
+                                                    const double whi = (double) w[(size_t) ii];
+                                                    const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+                                                    dot += wi * whi * ws * ws;
+                                                    nn  += whi * whi * ws * ws;
+                                                }
+                                            }
+                                        }
+
+                                        if (nn > 1e-30) {
+                                            ss = (float) (dot / nn);
+                                        }
+                                        t.d_row_scale[(size_t) col] = ss;
+                                    }
+
+                                    for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
+                                        const int32_t blk = bi < (int64_t) top_blocks.size() ? top_blocks[(size_t) bi] : -1;
+                                        t.b_idx[(size_t) col * (size_t) n_blocks_keep + (size_t) bi] = blk;
+
+                                        const int64_t in0 = (blk >= 0) ? (int64_t) blk * block : 0;
+                                        for (int64_t tt = 0; tt < block; ++tt) {
+                                            const int64_t ii = in0 + tt;
+                                            float vv = 0.0f;
+                                            if (blk >= 0 && ii >= 0 && ii < n_in) {
+                                                vv = write_base ? r[(size_t) ii] : w[(size_t) ii];
+                                            }
+                                            t.b_val[((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block + (size_t) tt] = vv;
+                                        }
+                                    }
+                                } else {
+                                    if (write_base) {
+                                        topk_abs_weighted(r, have_w ? &w_scale : nullptr, K_eff, topk);
+                                    } else {
+                                        topk_abs_weighted(w, have_w ? &w_scale : nullptr, K_eff, topk);
+                                    }
+
+                                    float ss = 1.0f;
+                                    if (write_row_scale) {
+                                        if (write_base) {
+                                            for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                                const int32_t ii = topk[(size_t) rr];
+                                                if (ii < 0 || ii >= (int32_t) n_in) {
+                                                    continue;
+                                                }
+
                                                 const double wi = (double) w[(size_t) ii];
                                                 const double di = (double) r[(size_t) ii];
                                                 const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
+
                                                 dot += wi * di * ws * ws;
                                                 nn  += (2.0 * wi * di - di * di) * ws * ws;
                                             }
-                                        }
-                                    } else {
-                                        for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
-                                            const int32_t blk = top_blocks[(size_t) bi];
-                                            if (blk < 0) {
-                                                continue;
-                                            }
-                                            const int64_t in0 = (int64_t) blk * block;
-                                            const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
-                                            for (int64_t ii = in0; ii < in1; ++ii) {
+                                        } else {
+                                            for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                                const int32_t ii = topk[(size_t) rr];
+                                                if (ii < 0 || ii >= (int32_t) n_in) {
+                                                    continue;
+                                                }
                                                 const double wi  = (double) w[(size_t) ii];
                                                 const double whi = (double) w[(size_t) ii];
                                                 const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
@@ -2193,180 +2450,268 @@ int main(int argc, char ** argv) {
                                                 nn  += whi * whi * ws * ws;
                                             }
                                         }
-                                    }
 
-                                    if (nn > 1e-30) {
-                                        ss = (float) (dot / nn);
-                                    }
-                                    d_row_scale[(size_t) col] = ss;
-                                }
-
-                                for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
-                                    const int32_t blk = bi < (int64_t) top_blocks.size() ? top_blocks[(size_t) bi] : -1;
-                                    b_idx[(size_t) col * (size_t) n_blocks_keep + (size_t) bi] = blk;
-
-                                    const int64_t in0 = (blk >= 0) ? (int64_t) blk * block : 0;
-                                    for (int64_t t = 0; t < block; ++t) {
-                                        const int64_t ii = in0 + t;
-                                        float vv = 0.0f;
-                                        if (blk >= 0 && ii >= 0 && ii < n_in) {
-                                            vv = write_base ? r[(size_t) ii] : w[(size_t) ii];
+                                        if (nn > 1e-30) {
+                                            ss = (float) (dot / nn);
                                         }
-                                        b_val[((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block + (size_t) t] = vv;
+                                        t.d_row_scale[(size_t) col] = ss;
                                     }
-                                }
-                            } else {
-                                if (write_base) {
-                                    topk_abs_weighted(r, have_w ? &w_scale : nullptr, K_eff, topk);
-                                } else {
-                                    topk_abs_weighted(w, have_w ? &w_scale : nullptr, K_eff, topk);
-                                }
 
-                                float ss = 1.0f;
-                                if (write_row_scale) {
-                                    if (write_base) {
-                                        for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                            const int32_t ii = topk[(size_t) rr];
-                                            if (ii < 0 || ii >= (int32_t) n_in) {
-                                                continue;
-                                            }
+                                    for (int64_t rr = 0; rr < K_eff; ++rr) {
+                                        const int32_t ii = topk[(size_t) rr];
+                                        t.d_idx[(size_t) col * (size_t) K_eff + (size_t) rr] = ii;
 
-                                            const double wi = (double) w[(size_t) ii];
-                                            const double di = (double) r[(size_t) ii];
-                                            const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
-
-                                            dot += wi * di * ws * ws;
-                                            nn  += (2.0 * wi * di - di * di) * ws * ws;
+                                        if (ii >= 0 && ii < (int32_t) n_in) {
+                                            t.d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = write_base ? r[(size_t) ii] : w[(size_t) ii];
+                                        } else {
+                                            t.d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = 0.0f;
                                         }
-                                    } else {
-                                        for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                            const int32_t ii = topk[(size_t) rr];
-                                            if (ii < 0 || ii >= (int32_t) n_in) {
-                                                continue;
-                                            }
-                                            const double wi  = (double) w[(size_t) ii];
-                                            const double whi = (double) w[(size_t) ii];
-                                            const double ws = have_w ? (double) w_scale[(size_t) ii] : 1.0;
-                                            dot += wi * whi * ws * ws;
-                                            nn  += whi * whi * ws * ws;
-                                        }
-                                    }
-
-                                    if (nn > 1e-30) {
-                                        ss = (float) (dot / nn);
-                                    }
-                                    d_row_scale[(size_t) col] = ss;
-                                }
-
-                                for (int64_t rr = 0; rr < K_eff; ++rr) {
-                                    const int32_t ii = topk[(size_t) rr];
-                                    d_idx[(size_t) col * (size_t) K_eff + (size_t) rr] = ii;
-
-                                    if (ii >= 0 && ii < (int32_t) n_in) {
-                                        d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = write_base ? r[(size_t) ii] : w[(size_t) ii];
-                                    } else {
-                                        d_val[(size_t) col * (size_t) K_eff + (size_t) rr] = 0.0f;
                                     }
                                 }
                             }
                         }
-                    }
-                });
-            }
-
-            for (auto & th : workers) {
-                th.join();
-            }
-
-            report_entry re;
-            re.layer = il;
-            re.kind = kind;
-            re.n_in = n_in;
-            re.n_out = n_out;
-            re.K = K_eff;
-            re.block = (scheme == RESID_BLOCK) ? block : 0;
-            re.n_blocks = (scheme == RESID_BLOCK) ? n_blocks_keep : 0;
-            re.has_w = have_w;
-            re.cost = estimate_cost(write_base ? &base : nullptr, n_in, n_out, K_eff, write_row_scale);
-
-            if (re.cost.ops_dense > 0.0) {
-                if (write_base) {
-                    fprintf(stderr, "  [blk.%" PRId64 ".%s] cost L=%" PRId64 " B=%" PRId64 " ops dense=%.3g base=%.3g delta=%.3g total=%.3g ratio=%.4f\n",
-                            il, kind.c_str(),
-                            re.cost.L, re.cost.B,
-                            re.cost.ops_dense, re.cost.ops_base, re.cost.ops_delta, re.cost.ops_total, re.cost.ops_ratio);
-                } else {
-                    fprintf(stderr, "  [blk.%" PRId64 ".%s] cost ops dense=%.3g delta=%.3g total=%.3g ratio=%.4f\n",
-                            il, kind.c_str(),
-                            re.cost.ops_dense, re.cost.ops_delta, re.cost.ops_total, re.cost.ops_ratio);
+                    });
                 }
-            }
 
-            if (eval_cols > 0) {
-                const int64_t t0 = ggml_time_us();
-                eval_metrics em;
-                if (scheme == RESID_BLOCK) {
-                    em = write_base
-                            ? eval_seeddelta_base_block_residual(W, base, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, rng)
-                            : eval_block_residual(W, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, rng);
-                } else {
-                    em = write_base
-                            ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng)
-                            : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng);
+                for (auto & th : workers) {
+                    th.join();
                 }
-                const double sec = double(ggml_time_us() - t0) / 1e6;
-                fprintf(stderr, "  [blk.%" PRId64 ".%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
-                        il, kind.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, em.norm_ratio_mean, sec);
 
-                re.em = em;
-
-                if (have_w) {
-                    eval_metrics em_w;
-                    if (scheme == RESID_BLOCK) {
-                        em_w = write_base
-                                ? eval_seeddelta_base_block_residual(W, base, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, rng)
-                                : eval_block_residual(W, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, rng);
+                if (t.re.cost.ops_dense > 0.0) {
+                    if (write_base) {
+                        fprintf(stderr, "  [blk.%" PRId64 ".%s] cost L=%" PRId64 " B=%" PRId64 " ops dense=%.3g base=%.3g delta=%.3g total=%.3g ratio=%.4f\n",
+                                il, kind.c_str(),
+                                t.re.cost.L, t.re.cost.B,
+                                t.re.cost.ops_dense, t.re.cost.ops_base, t.re.cost.ops_delta, t.re.cost.ops_total, t.re.cost.ops_ratio);
                     } else {
-                        em_w = write_base
-                                ? eval_seeddelta_base_residual(W, base, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng)
-                                : eval_sparse_residual(W, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng);
+                        fprintf(stderr, "  [blk.%" PRId64 ".%s] cost ops dense=%.3g delta=%.3g total=%.3g ratio=%.4f\n",
+                                il, kind.c_str(),
+                                t.re.cost.ops_dense, t.re.cost.ops_delta, t.re.cost.ops_total, t.re.cost.ops_ratio);
                     }
-                    re.em_w = em_w;
-                    fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_w cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
-                            il, kind.c_str(), eval_cols, em_w.rel_l2_mean, em_w.rel_l2_p95, em_w.cos_mean, em_w.cos_p05, em_w.norm_ratio_mean);
                 }
-            }
 
-            if (eval_cols > 0 && eval_x > 0) {
-                const int64_t t0 = ggml_time_us();
-                eval_metrics emx;
-                if (scheme == RESID_BLOCK) {
-                    emx = eval_seeddelta_x_block(W, write_base ? &base : nullptr, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, nullptr, eval_cols, eval_x, rng);
-                } else {
-                    emx = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, nullptr, K_eff, eval_cols, eval_x, rng);
-                }
-                const double sec = double(ggml_time_us() - t0) / 1e6;
-                fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
-                        il, kind.c_str(), eval_x, eval_cols, emx.rel_l2_mean, emx.rel_l2_p95, emx.cos_mean, emx.cos_p05, emx.norm_ratio_mean, sec);
-                re.em_x = emx;
-                re.has_x = true;
-
-                if (have_w) {
-                    eval_metrics emx_w;
+                if (eval_cols > 0) {
+                    const int64_t t0 = ggml_time_us();
+                    eval_metrics em;
                     if (scheme == RESID_BLOCK) {
-                        emx_w = eval_seeddelta_x_block(W, write_base ? &base : nullptr, b_idx, b_val, block, n_blocks_keep, write_row_scale ? &d_row_scale : nullptr, &w_scale, eval_cols, eval_x, rng);
+                        em = write_base
+                                ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng)
+                                : eval_block_residual(W, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng);
                     } else {
-                        emx_w = eval_seeddelta_x(W, write_base ? &base : nullptr, d_idx, d_val, write_row_scale ? &d_row_scale : nullptr, &w_scale, K_eff, eval_cols, eval_x, rng);
+                        em = write_base
+                                ? eval_seeddelta_base_residual(W, base, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng)
+                                : eval_sparse_residual(W, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng);
                     }
-                    re.em_x_w = emx_w;
-                    fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x_w x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
-                            il, kind.c_str(), eval_x, eval_cols, emx_w.rel_l2_mean, emx_w.rel_l2_p95, emx_w.cos_mean, emx_w.cos_p05, emx_w.norm_ratio_mean);
+                    const double sec = double(ggml_time_us() - t0) / 1e6;
+                    fprintf(stderr, "  [blk.%" PRId64 ".%s] eval cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
+                            il, kind.c_str(), eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, em.norm_ratio_mean, sec);
+
+                    t.re.em = em;
+
+                    if (have_w) {
+                        eval_metrics em_w;
+                        if (scheme == RESID_BLOCK) {
+                            em_w = write_base
+                                    ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng)
+                                    : eval_block_residual(W, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng);
+                        } else {
+                            em_w = write_base
+                                    ? eval_seeddelta_base_residual(W, base, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng)
+                                    : eval_sparse_residual(W, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng);
+                        }
+                        t.re.em_w = em_w;
+                        fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_w cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
+                                il, kind.c_str(), eval_cols, em_w.rel_l2_mean, em_w.rel_l2_p95, em_w.cos_mean, em_w.cos_p05, em_w.norm_ratio_mean);
+                    }
+                }
+
+                if (eval_cols > 0 && eval_x > 0) {
+                    const int64_t t0 = ggml_time_us();
+                    eval_metrics emx;
+                    if (scheme == RESID_BLOCK) {
+                        emx = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, eval_x, rng);
+                    } else {
+                        emx = eval_seeddelta_x(W, write_base ? &base : nullptr, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, nullptr, K_eff, eval_cols, eval_x, rng);
+                    }
+                    const double sec = double(ggml_time_us() - t0) / 1e6;
+                    fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f (%.1fs)\n",
+                            il, kind.c_str(), eval_x, eval_cols, emx.rel_l2_mean, emx.rel_l2_p95, emx.cos_mean, emx.cos_p05, emx.norm_ratio_mean, sec);
+                    t.re.em_x = emx;
+                    t.re.has_x = true;
+
+                    if (have_w) {
+                        eval_metrics emx_w;
+                        if (scheme == RESID_BLOCK) {
+                            emx_w = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, eval_x, rng);
+                        } else {
+                            emx_w = eval_seeddelta_x(W, write_base ? &base : nullptr, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, K_eff, eval_cols, eval_x, rng);
+                        }
+                        t.re.em_x_w = emx_w;
+                        fprintf(stderr, "  [blk.%" PRId64 ".%s] eval_x_w x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.4f p95=%.4f cos mean=%.4f p05=%.4f nr=%.4f\n",
+                                il, kind.c_str(), eval_x, eval_cols, emx_w.rel_l2_mean, emx_w.rel_l2_p95, emx_w.cos_mean, emx_w.cos_p05, emx_w.norm_ratio_mean);
+                    }
+                }
+
+                t.seconds = double(ggml_time_us() - t0_total) / 1e6;
+                return t;
+            };
+
+            std::vector<int64_t> schedule;
+            if (cfg.autotune.enabled) {
+                schedule = (kind == "ffn_down") ? cfg.autotune.schedule_down : cfg.autotune.schedule_gate_up;
+            }
+            if (schedule.empty()) {
+                schedule.push_back(K_budget);
+            }
+
+            // De-dup schedule while keeping order.
+            std::unordered_set<int64_t> seen;
+            std::vector<int64_t> sched_unique;
+            for (int64_t v : schedule) {
+                if (v <= 0) continue;
+                if (seen.insert(v).second) {
+                    sched_unique.push_back(v);
                 }
             }
 
-            if (!report_json.empty()) {
+            const int max_iters = cfg.autotune.enabled && cfg.autotune.max_iters > 0
+                    ? std::min<int>((int) cfg.autotune.max_iters, (int) sched_unique.size())
+                    : (int) sched_unique.size();
+
+            trial_data best_trial;
+            bool have_best = false;
+            double best_score = -1e30;
+
+            trial_data selected_trial;
+            bool have_selected = false;
+
+            std::vector<report_entry::autotune_attempt> attempts;
+            if (cfg.autotune.enabled) {
+                attempts.reserve((size_t) max_iters);
+            }
+
+            for (int it = 0; it < max_iters; ++it) {
+                const int64_t K_try = sched_unique[(size_t) it];
+                trial_data td = run_trial(K_try);
+
+                td.re.gating_enabled = cfg.gating_enabled;
+                td.re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                td.re.gating_min_mean = cfg.min_mean;
+                td.re.gating_min_p05  = cfg.min_p05;
+
+                const bool metric_needs_x = (cfg.metric == sd_metric_kind::cos_x || cfg.metric == sd_metric_kind::cos_x_w);
+                const bool metric_needs_w = (cfg.metric == sd_metric_kind::cos_w || cfg.metric == sd_metric_kind::cos_x_w);
+                bool metric_available = true;
+                if (cfg.gating_enabled) {
+                    if (metric_needs_x && !td.re.has_x) {
+                        metric_available = false;
+                    }
+                    if (metric_needs_w && !have_w) {
+                        metric_available = false;
+                    }
+                }
+
+                const double metric_val = pick_metric_value(td.re, cfg.metric);
+                const double metric_p05 = pick_metric_p05(td.re, cfg.metric);
+                bool gating_pass = true;
+                if (cfg.gating_enabled) {
+                    gating_pass = metric_available && metric_val >= cfg.min_mean && metric_p05 >= cfg.min_p05;
+                }
+                const bool emit = cfg.enabled && (!cfg.gating_enabled || gating_pass);
+
+                td.re.gating_pass = (!cfg.gating_enabled) ? true : (gating_pass && metric_available);
+                td.re.gating_value = metric_val;
+                td.re.gating_p05 = metric_p05;
+                td.re.emit = emit;
+                td.re.strip_applied = emit && cfg.strip_dense;
+                if (!cfg.gating_enabled) {
+                    td.re.decision_reason = "no_gating";
+                } else if (!metric_available) {
+                    td.re.decision_reason = "metric_unavailable";
+                } else if (!gating_pass) {
+                    td.re.decision_reason = "gating_fail";
+                } else {
+                    td.re.decision_reason = "pass_gating";
+                }
+
+                if (cfg.autotune.enabled) {
+                    report_entry::autotune_attempt at;
+                    at.K_budget = td.re.K_budget;
+                    at.K_eff = td.re.K;
+                    at.n_blocks = td.re.n_blocks;
+                    at.metric_value = metric_val;
+                    at.metric_p05 = metric_p05;
+                    at.pass = emit;
+                    at.seconds = td.seconds;
+                    attempts.push_back(at);
+                }
+
+                if (metric_available && metric_val > best_score) {
+                    best_score = metric_val;
+                    best_trial = td;
+                    have_best = true;
+                }
+
+                if (emit) {
+                    selected_trial = std::move(td);
+                    have_selected = true;
+                    break;
+                }
+            }
+
+            if (!have_best) {
+                best_trial.re.layer = il;
+                best_trial.re.kind = kind;
+                best_trial.re.n_in = n_in;
+                best_trial.re.n_out = n_out;
+                best_trial.re.emit = false;
+                best_trial.re.gating_enabled = cfg.gating_enabled;
+                best_trial.re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                best_trial.re.gating_min_mean = cfg.min_mean;
+                best_trial.re.gating_min_p05 = cfg.min_p05;
+                best_trial.re.decision_reason = "metric_unavailable";
+                have_best = true;
+            }
+
+            trial_data final_td;
+            if (have_selected) {
+                final_td = std::move(selected_trial);
+                final_td.re.autotune_enabled = cfg.autotune.enabled;
+                final_td.re.autotune_selected_budget = final_td.re.K_budget;
+                final_td.re.autotune_attempts = std::move(attempts);
+            } else {
+                final_td = std::move(best_trial);
+                final_td.re.emit = false;
+                final_td.re.strip_applied = false;
+                final_td.re.autotune_enabled = cfg.autotune.enabled;
+                final_td.re.autotune_selected_budget = 0;
+                final_td.re.autotune_attempts = std::move(attempts);
+                if (cfg.autotune.enabled) {
+                    final_td.re.decision_reason = "autotune_failed_keep_dense";
+                }
+            }
+
+            report_entry re = std::move(final_td.re);
+            std::vector<int32_t> d_idx = std::move(final_td.d_idx);
+            std::vector<float>   d_val = std::move(final_td.d_val);
+            std::vector<int32_t> b_idx = std::move(final_td.b_idx);
+            std::vector<float>   b_val = std::move(final_td.b_val);
+            std::vector<float>   d_row_scale = std::move(final_td.d_row_scale);
+
+            const int64_t n_blocks_keep = re.n_blocks;
+            const int64_t K_eff = re.K;
+
+            if (!re.emit) {
                 report.push_back(std::move(re));
+                continue;
             }
+
+            if (re.strip_applied) {
+                strip_weights.insert(weight_name);
+                any_strip = true;
+            }
+
+            report.push_back(std::move(re));
 
             // Allocate a dedicated ggml context for new tensors to avoid a giant arena.
             const size_t size_idx = scheme == RESID_BLOCK
@@ -2446,8 +2791,10 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            gguf_add_tensor(dst, t_idx);
-            gguf_add_tensor(dst, t_val);
+            pending_tensor_set pts;
+            pts.ctx = ctx_sd;
+            pts.tensors.push_back(t_idx);
+            pts.tensors.push_back(t_val);
             n_added += 2;
 
             if (write_row_scale) {
@@ -2455,7 +2802,7 @@ int main(int argc, char ** argv) {
                 ggml_set_name(t_rs, d_row_scale_name.c_str());
                 auto * rs_f16 = (ggml_fp16_t *) t_rs->data;
                 ggml_fp32_to_fp16_row(d_row_scale.data(), rs_f16, n_out);
-                gguf_add_tensor(dst, t_rs);
+                pts.tensors.push_back(t_rs);
                 n_added += 1;
             }
 
@@ -2483,10 +2830,10 @@ int main(int argc, char ** argv) {
                     ggml_fp32_to_fp16_row(base.d3.data() + (size_t) b * (size_t) base.L, d3_f16 + (size_t) b * (size_t) base.L, base.L);
                 }
 
-                gguf_add_tensor(dst, t_d1);
-                gguf_add_tensor(dst, t_d2);
-                gguf_add_tensor(dst, t_d3);
-                gguf_add_tensor(dst, t_p1);
+                pts.tensors.push_back(t_d1);
+                pts.tensors.push_back(t_d2);
+                pts.tensors.push_back(t_d3);
+                pts.tensors.push_back(t_p1);
                 if (perm_type == GGML_TYPE_I16) {
                     auto * p1_i16 = (int16_t *) t_p1->data;
                     for (size_t i = 0; i < base.perm1.size(); ++i) {
@@ -2498,6 +2845,8 @@ int main(int argc, char ** argv) {
                 }
                 n_added += 4;
             }
+
+            pending.push_back(std::move(pts));
         }
     }
 
@@ -2505,12 +2854,35 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "no new SeedΔ tensors added\n");
     }
 
+    gguf_context * dst = gguf_init_empty();
+    gguf_set_kv(dst, src);
+
+    // Add original tensors, skipping those strippeados.
+    for (int64_t ti = 0; ti < n_tensors; ++ti) {
+        const char * name = gguf_get_tensor_name(src, ti);
+        if (any_strip && strip_weights.count(name) > 0) {
+            continue;
+        }
+        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
+        if (!t) {
+            fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
+            continue;
+        }
+        gguf_add_tensor(dst, t);
+    }
+
+    for (const auto & pts : pending) {
+        for (ggml_tensor * t : pts.tensors) {
+            gguf_add_tensor(dst, t);
+        }
+    }
+
     gguf_set_val_bool(dst, "seeddelta.enabled", n_added > 0);
     gguf_set_val_u32(dst, "seeddelta.version", 1);
     gguf_set_val_u32(dst, "seeddelta.scheme", (uint32_t) scheme);
     gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
     gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
-    gguf_set_val_bool(dst, "seeddelta.strip_dense", strip_dense);
+    gguf_set_val_bool(dst, "seeddelta.strip_dense", any_strip);
     if (scheme == RESID_BLOCK) {
         gguf_set_val_u32(dst, "seeddelta.resid.block", (uint32_t) block);
     }
@@ -2527,6 +2899,15 @@ int main(int argc, char ** argv) {
         gguf_set_val_u32(dst, "seeddelta.base.R", 1);
         gguf_set_val_u32(dst, "seeddelta.base.max_samples", (uint32_t) std::max<int64_t>(0, base_max_samples));
         gguf_set_val_u32(dst, "seeddelta.base.perm_trials", (uint32_t) std::max(1, base_perm_trials));
+    }
+
+    // Per-tensor audit metadata (minimal, per GGUF kv).
+    for (const auto & re : report) {
+        const std::string prefix = "seeddelta.blk." + std::to_string(re.layer) + "." + re.kind;
+        gguf_set_val_bool(dst, (prefix + ".enabled").c_str(), re.emit);
+        gguf_set_val_bool(dst, (prefix + ".gating_pass").c_str(), re.gating_pass);
+        gguf_set_val_bool(dst, (prefix + ".strip_dense").c_str(), re.strip_applied);
+        gguf_set_val_u32(dst, (prefix + ".K").c_str(), (uint32_t) std::max<int64_t>(0, re.K));
     }
 
     printf("writing %s with %" PRId64 " new tensors\n", out_fname.c_str(), n_added);
@@ -2563,6 +2944,8 @@ int main(int argc, char ** argv) {
         out << "  \"output\": \"" << json_escape(out_fname) << "\",\n";
         out << "  \"imatrix\": " << (have_imatrix ? "true" : "false") << ",\n";
         out << "  \"base\": " << (write_base ? "true" : "false") << ",\n";
+        out << "  \"policy_file\": \"" << (policy_file.empty() ? "" : json_escape(policy_file)) << "\",\n";
+        out << "  \"policy_hash\": \"" << json_escape(policy_hash) << "\",\n";
         if (write_base) {
             out << "  \"base_kind\": \"xor_circulant\",\n";
             out << "  \"base_max_samples\": " << base_max_samples << ",\n";
@@ -2603,6 +2986,7 @@ int main(int argc, char ** argv) {
             out << "      \"kind\": \"" << json_escape(e.kind) << "\",\n";
             out << "      \"n_in\": " << e.n_in << ",\n";
             out << "      \"n_out\": " << e.n_out << ",\n";
+            out << "      \"K_budget\": " << e.K_budget << ",\n";
             out << "      \"K\": " << e.K << ",\n";
             out << "      \"block\": " << e.block << ",\n";
             out << "      \"n_blocks\": " << e.n_blocks << ",\n";
@@ -2635,7 +3019,37 @@ int main(int argc, char ** argv) {
             out << "      \"rel_l2_p95_x_w\": " << e.em_x_w.rel_l2_p95 << ",\n";
             out << "      \"cos_mean_x_w\": " << e.em_x_w.cos_mean << ",\n";
             out << "      \"cos_p05_x_w\": " << e.em_x_w.cos_p05 << ",\n";
-            out << "      \"norm_ratio_mean_x_w\": " << e.em_x_w.norm_ratio_mean << "\n";
+            out << "      \"norm_ratio_mean_x_w\": " << e.em_x_w.norm_ratio_mean << ",\n";
+            out << "      \"gating_enabled\": " << (e.gating_enabled ? "true" : "false") << ",\n";
+            out << "      \"gating_metric\": \"" << json_escape(e.gating_metric_used) << "\",\n";
+            out << "      \"gating_value\": " << e.gating_value << ",\n";
+            out << "      \"gating_p05\": " << e.gating_p05 << ",\n";
+            out << "      \"gating_min_mean\": " << e.gating_min_mean << ",\n";
+            out << "      \"gating_min_p05\": " << e.gating_min_p05 << ",\n";
+            out << "      \"gating_pass\": " << (e.gating_pass ? "true" : "false") << ",\n";
+            out << "      \"emit\": " << (e.emit ? "true" : "false") << ",\n";
+            out << "      \"strip_dense\": " << (e.strip_applied ? "true" : "false") << ",\n";
+            out << "      \"decision\": \"" << json_escape(e.decision_reason) << "\",\n";
+            out << "      \"autotune_enabled\": " << (e.autotune_enabled ? "true" : "false") << ",\n";
+            out << "      \"autotune_selected_budget\": " << e.autotune_selected_budget << ",\n";
+            out << "      \"autotune_attempts\": [";
+            for (size_t ai = 0; ai < e.autotune_attempts.size(); ++ai) {
+                const auto & a = e.autotune_attempts[ai];
+                out << (ai == 0 ? "\n" : ",\n");
+                out << "        {";
+                out << "\"K_budget\": " << a.K_budget << ", ";
+                out << "\"K_eff\": " << a.K_eff << ", ";
+                out << "\"n_blocks\": " << a.n_blocks << ", ";
+                out << "\"metric_value\": " << a.metric_value << ", ";
+                out << "\"metric_p05\": " << a.metric_p05 << ", ";
+                out << "\"pass\": " << (a.pass ? "true" : "false") << ", ";
+                out << "\"seconds\": " << a.seconds;
+                out << "}";
+            }
+            if (!e.autotune_attempts.empty()) {
+                out << "\n      ";
+            }
+            out << "]\n";
 
             out << "    }" << (i + 1 < report.size() ? "," : "") << "\n";
         }
