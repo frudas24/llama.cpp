@@ -2,6 +2,8 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "seeddelta_policy.h"
+#include "seeddelta_policy_export.h"
+#include "seeddelta_policy_selftest.h"
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +48,8 @@ static void usage(const char * argv0) {
     printf("  --policy FILE        JSON policy for per-layer/tensor K/block/gating/autotune/strip overrides\n");
     printf("  --policy-strict      reject unknown keys in policy.json (default: warn and ignore)\n");
     printf("  --policy-dump-resolved print resolved config per tensor (debug)\n");
+    printf("  --policy-export PATH write a canonical policy.json capturing final per-tensor decisions\n");
+    printf("  --policy-self-test   run internal policy merge tests and exit\n");
     printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
@@ -1926,6 +1930,7 @@ int main(int argc, char ** argv) {
     std::string imatrix_file;
     std::string report_json;
     std::string policy_file;
+    std::string policy_export_file;
 
     std::string scheme_str = "coo";
     int64_t block = 32;
@@ -1949,6 +1954,7 @@ int main(int argc, char ** argv) {
     int seed = 1234;
     bool policy_strict = false;
     bool policy_dump_resolved = false;
+    bool policy_self_test = false;
     bool overwrite_existing = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -1976,6 +1982,8 @@ int main(int argc, char ** argv) {
         if (arg == "--policy" && i + 1 < argc) { policy_file = argv[++i]; continue; }
         if (arg == "--policy-strict") { policy_strict = true; continue; }
         if (arg == "--policy-dump-resolved") { policy_dump_resolved = true; continue; }
+        if (arg == "--policy-export" && i + 1 < argc) { policy_export_file = argv[++i]; continue; }
+        if (arg == "--policy-self-test") { policy_self_test = true; continue; }
         if (arg == "--overwrite-existing") { overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
@@ -1987,6 +1995,10 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "unknown argument: %s\n", arg.c_str());
         usage(argv[0]);
+    }
+
+    if (policy_self_test) {
+        return sd_policy_self_test();
     }
 
     if (in_fname.empty() || out_fname.empty()) {
@@ -3075,6 +3087,28 @@ int main(int argc, char ** argv) {
         out << "}\n";
 
         fprintf(stderr, "seeddelta-build: wrote report %s\n", report_json.c_str());
+    }
+
+    if (!policy_export_file.empty()) {
+        std::vector<sd_tensor_decision> decisions;
+        decisions.reserve(report.size());
+        for (const auto & e : report) {
+            sd_tensor_decision d;
+            d.layer = e.layer;
+            d.kind = e.kind;
+            d.enabled = e.emit;
+            d.strip_dense = e.strip_applied;
+            d.block = e.block;
+            d.K_budget = e.K_budget;
+            decisions.push_back(std::move(d));
+        }
+
+        auto pres = sd_policy_export_write_canonical(policy_export_file, decisions);
+        if (!pres.ok) {
+            fprintf(stderr, "seeddelta-build: failed to export policy: %s\n", pres.error.c_str());
+            return 1;
+        }
+        fprintf(stderr, "seeddelta-build: wrote policy export %s\n", policy_export_file.c_str());
     }
 
     return 0;

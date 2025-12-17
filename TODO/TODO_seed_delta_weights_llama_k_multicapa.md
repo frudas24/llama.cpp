@@ -292,10 +292,11 @@ Campos recomendados (para forense y reproducibilidad):
   - en modo policy, evitar “skipping” silencioso que invalida el resolved/gating/autotune
 - [x] Harness reproducible para policy:
   - script nuevo `scripts/seeddelta-policy-eval.sh`: build con `--policy`, guardar report, correr smoke greedy (batería), PPL corto y logs opcionales de `/usr/bin/time -v`
-- [ ] Test mínimo del resolver/merge:
-  - al menos un “self-check” (p.ej. `--policy-dump-resolved` + golden esperado) para evitar regresiones en merge order/overrides
-  - incluir casos de strip seguro: `strip_dense=true` + gating fail ⇒ no strip
-  - incluir caso policy “disable all” ⇒ output == input (sin deltas, sin strip)
+- [x] Test mínimo del resolver/merge:
+  - `llama-seeddelta-build --policy-self-test` valida precedencia (CLI/defaults/ranges/layer/tensor) y strict/lenient
+- [x] Export de policy desde run/report:
+  - `llama-seeddelta-build --policy-export out.json` escribe policy canónica (strict-schema) desde decisiones finales
+  - `scripts/seeddelta-report-to-policy.py --report report.json --out policy.json` convierte report→policy offline (sin rebuild)
 
 ### Robustez runtime (pendiente real)
 
