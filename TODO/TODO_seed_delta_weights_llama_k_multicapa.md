@@ -41,6 +41,21 @@ Agregar a `llama-seeddelta-build`:
 
 **No-objetivo:** “arreglar” un tensor/capa intratable. Si no pasa gating, se queda denso; el win viene de cubrir el subconjunto que sí tolera aproximación.
 
+### 1.1) Modos de uso (sin duplicar código)
+
+- **Modo global (default):** se usa el CLI actual (p.ej. `--K-gate/--K-up/--K-down`, `--block`, `--strip-dense`, etc.) de forma uniforme. Debe seguir funcionando igual que hoy.
+- **Modo policy (opcional):** `--policy` define overrides por capa/tensor (y gating/autotune). Si un campo no está definido en policy, **hereda del modo global** (CLI).
+
+Objetivo: que `--policy` sea un “patch” sobre el builder actual, no un segundo sistema paralelo.
+
+### 1.2) Contrato de seguridad (strip-dense)
+
+Invariantes (corner-case crítico):
+
+- Si un tensor denso se elimina (*strip*), entonces **debe existir** SeedΔ para ese tensor y el runtime debe poder ejecutarla.
+- Si `strip_dense=true` pero el gating falla ⇒ **KEEP DENSE** siempre.
+- El builder **no debe producir** un GGUF donde falte el tensor denso *y* tampoco exista SeedΔ para ese tensor, salvo bajo un modo explícito “unsafe” (p.ej. `--force-strip-dense`) que debe quedar marcado en report/metadata como override.
+
 ---
 
 ## 2) Qué problema arregla (y qué no)
@@ -69,6 +84,13 @@ El gating debe priorizar **métricas funcionales** (con activaciones), porque es
 - Primario: `cos_mean_x_w` (y **cola**: `cos_p05_x_w` o `cos_p10_x_w` si existe).
 - Fallback si no hay `x_w`: `cos_mean_w` (menos confiable) o `cos_mean_x`.
 
+### 3.1) Prerrequisitos de métricas (para evitar resultados ambiguos)
+
+- Si el gating/autotune usa métricas `*_x*` ⇒ exigir `--eval-x > 0` (si no, error claro o fallback explícito).
+- Si el gating/autotune usa métricas `*_w` ⇒ definir qué pasa sin `--imatrix`:
+  - recomendado safety-first: error claro
+  - alternativa (si se permite): fallback a métrica no ponderada (`*_x` o `*_w`→`*_x`) con warning fuerte y `decision.metric_used` en el report
+
 ### Por qué NO gatear con `rel_l2` como hard rule
 
 En nuestros reportes hay tensores “malos” con `rel_l2_mean` cerca de 1 pero `cos` cerca de 0. En alta dimensión, **cos≈0** implica dirección casi aleatoria aunque la norma parezca “bien”.
@@ -94,18 +116,29 @@ Valores iniciales (ajustables por modelo):
 
 Diseño: **defaults** + **ranges** (en orden) + **layer exacto** + **tensor override**.
 
-### 4.1 Ejemplo mínimo (orientado a Qwen2.5 7B)
+> Nota: el bloque `defaults` en policy es opcional. En modo policy, el “baseline” es el CLI global; la policy solo sobreescribe lo que declare.
+
+### 4.1 Keys canónicas (schema v1) + unknown keys
+
+Para evitar typos y drift, el schema v1 debe declarar keys canónicas y comportamiento ante keys desconocidas:
+
+- Keys canónicas (v1): `enabled`, `strip_dense`, `block`, `K: {gate, up, down}`, `gating: {...}`, `autotune: {...}`.
+- Default recomendado:
+  - modo **lenient**: ignora keys desconocidas, emite warning y lo registra en el report.
+  - `--policy-strict`: keys desconocidas ⇒ error.
+
+### 4.2 Ejemplo mínimo (orientado a Qwen2.5 7B)
 
 ```json
 {
   "version": 1,
   "defaults": {
-    "enable": true,
+    "enabled": true,
     "block": 32,
     "K": { "gate": 256, "up": 256, "down": 512 },
-    "strip": true,
+    "strip_dense": true,
     "gating": {
-      "metric": "cos_xw",
+      "metric": "cos_x_w",
       "min_mean": { "gate": 0.45, "up": 0.45, "down": 0.25 },
       "min_p05":  { "gate": 0.30, "up": 0.30, "down": 0.15 }
     },
@@ -123,18 +156,30 @@ Diseño: **defaults** + **ranges** (en orden) + **layer exacto** + **tensor over
     }
   ],
   "layers": {
-    "8": { "enable": false },
-    "19": { "enable": true },
-    "20": { "enable": true }
+    "8": { "enabled": false },
+    "19": { "enabled": true },
+    "20": { "enabled": true }
   }
 }
 ```
 
-### 4.2 Semántica de merge (determinista)
+### 4.3 Semántica de merge (determinista)
 
-`defaults` → aplica cada `ranges[]` que contenga la capa (en orden) → aplica `layers[L]` → aplica `layers[L].tensors[T]`.
+1) Baseline = **CLI global** (flags actuales).  
+2) Si hay `--policy`: `defaults` → aplica cada `ranges[]` que contenga la capa (en orden) → aplica `layers[L]` → aplica `layers[L].tensors[T]`.
 
-### 4.3 IDs de tensor (v1)
+Regla de “último gana”: si varias reglas aplican y definen el mismo campo, la regla más específica (tensor > capa > rango > defaults) y/o la última en orden debe ganar (determinista).
+
+Prioridad formal (para evitar ambigüedad):
+
+1. CLI global
+2. policy.defaults
+3. policy.ranges (primero→último)
+4. policy.layers[L]
+5. policy.layers[L].tensors[T]
+6. Si dos reglas tienen misma especificidad, **la última en el JSON gana**.
+
+### 4.4 IDs de tensor (v1)
 
 - `ffn_gate`
 - `ffn_up`
@@ -180,6 +225,15 @@ Prioridad práctica (dado el comportamiento observado):
 - autotune primero en `ffn_gate`/`ffn_up` (son los más frágiles)
 - luego `ffn_down` (a veces tolera más, pero también puede requerir K alto)
 
+Nota de implementación (optimización): el fit de la base `W0` típicamente **no depende de K**, así que para autotune conviene computar/guardar la base una vez por tensor y re-emitir/re-evaluar el residual para distintos K (si el layout del builder lo permite).
+
+Contrato autotune (perf + corrección):
+
+- Autotune no debería refitear la base si no es necesario; debe re-encodear residual + re-evaluar.
+- Si ningún K pasa gating:
+  - se registran `attempts[]` completos (postmortem)
+  - pero el tensor queda denso (no SeedΔ, no strip), salvo modo explícito “unsafe”.
+
 ---
 
 ## 7) Report JSON (extensión compatible)
@@ -193,6 +247,12 @@ El `--report-json` actual ya contiene `weights[]` con métricas. Se propone aña
 - `layers[N].tensors[T].decision` (`emit_delta`, `strip_applied`, `reason`)
 
 Esto hace reproducibles los híbridos sin depender de logs.
+
+Campos recomendados (para forense y reproducibilidad):
+
+- `decision.metric_used` (p.ej. `cos_x_w` / `cos_x` / `cos_w`)
+- `decision.thresholds_used` (snapshot de thresholds tras merge)
+- `build.policy_hash` (sha256 del JSON) y (si se puede) `build.git_commit` / version string del builder
 
 ---
 
@@ -210,11 +270,32 @@ Esto hace reproducibles los híbridos sin depender de logs.
 ### Builder: policy/gating/autotune (Fase 4, prioridad alta)
 
 - [ ] Implementar `--policy` en `tools/seeddelta-build/seeddelta-build.cpp` (parse + merge + resolver).
+- [ ] Añadir `--policy-strict` (error en keys desconocidas) para evitar typos silenciosos.
+- [ ] (Opcional) `--policy-dump-resolved` para imprimir cfg efectivo por capa/tensor (debug rápido).
+- [ ] Definir contrato de métricas para gating/autotune:
+  - si la policy usa `*_x*` exigir `--eval-x > 0` (y fallar claro si no)
+  - si la policy usa `*_x_w` definir qué pasa sin `--imatrix` (error vs fallback + warning)
 - [ ] Implementar gating por tensor usando `cos_mean_x_w` + `cos_p05_x_w` (fallbacks si faltan).
 - [ ] Cambiar `--strip-dense` a comportamiento “por tensor”: solo strip si el tensor pasó gating y hay reemplazo.
+- [ ] Aclarar/implementar semántica de `seeddelta.strip_dense` con strip parcial:
+  - setear el KV global si **cualquier** tensor fue strippeado (para permitir stubs)
+  - opcional: metadata adicional para auditar qué tensores fueron strippeados vs mantenidos densos
 - [ ] Implementar autotune de K por tensor (schedule configurable).
 - [ ] Volcar resolved/gating/autotune/decision al `--report-json`.
 - [ ] Añadir `policy.example.qwen7b.json` y `policy.example.gemma.json` en `tools/seeddelta-build/policies/` (o `calibration/` si preferimos).
+  - (Opcional) exponer gating/autotune “global” vía flags (`--autotune-k-*`, `--gating-*`) para arrancar sin policy y luego migrar.
+- [ ] Resolver robusto de tensor→kind (nombres reales por arquitectura):
+  - mapear `blk.N.ffn_{gate,up,down}.weight` a `ffn_gate/up/down`
+  - si un modelo no tiene ese tensor, skip + dejar rastro en report (no abortar silencioso)
+- [ ] Iteración segura sobre modelos ya SeedΔ:
+  - decidir comportamiento por defecto (skip vs overwrite) y exponer flags tipo `--skip-existing` / `--overwrite`
+  - en modo policy, evitar “skipping” silencioso que invalida el resolved/gating/autotune
+- [ ] Harness reproducible para policy:
+  - extender `scripts/seeddelta-eval.sh` o añadir script nuevo para: build con `--policy`, guardar report, correr smoke greedy (batería) y (opcional) PPL corto
+- [ ] Test mínimo del resolver/merge:
+  - al menos un “self-check” (p.ej. `--policy-dump-resolved` + golden esperado) para evitar regresiones en merge order/overrides
+  - incluir casos de strip seguro: `strip_dense=true` + gating fail ⇒ no strip
+  - incluir caso policy “disable all” ⇒ output == input (sin deltas, sin strip)
 
 ### Robustez runtime (pendiente real)
 
@@ -246,3 +327,16 @@ Esto hace reproducibles los híbridos sin depender de logs.
 - Un policy/autotune **no es un lujo**: es la única forma de escalar de forma segura sin horas de prueba manual.
 - El resultado esperado inicialmente es híbrido: pocas capas/tensores pasan. Eso sigue siendo win si reduce RAM sin degradar.
 
+---
+
+## 11) Pruebas obligatorias (plan mínimo)
+
+- Policy/merge (unit-ish):
+  - precedencia exacta (CLI vs defaults vs ranges vs layer vs tensor)
+  - lenient vs strict (unknown keys)
+- Builder smoke:
+  - policy disable-all ⇒ no deltas, no strip
+  - policy “solo 19–20” ⇒ reproduce híbrido estable (greedy)
+  - strip solicitado pero gating fail ⇒ keep dense (verificar que el tensor denso existe)
+- Runtime smoke:
+  - cargar GGUF híbrido y correr greedy (`--seeddelta --no-repack --ignore-eos`) en 5 prompts (es/en/código corto)
