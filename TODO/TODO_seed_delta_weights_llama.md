@@ -369,7 +369,7 @@ Outputs:
 
 * [ ] Residual selection ponderada por imatrix (`*_w`)
 * [ ] Seed search (pocos trials) para minimizar error ponderado
-* [ ] Autotune por capa: decide `K/block` con budget global
+* [ ] Autotune/policy por capa+tensor: decide `K/block/strip` con gating seguro (ver `TODO/TODO_seed_delta_weights_llama_k_multicapa.md`)
 * [ ] Report consolidado: “MB saved vs ΔPPL”
 
 **Aceptación**
