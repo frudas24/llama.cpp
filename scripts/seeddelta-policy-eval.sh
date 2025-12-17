@@ -30,10 +30,14 @@ EVAL_COLS="64"
 EVAL_X="16"
 
 NO_REPACK="0"
+ROUNDTRIP="0"
 
 OUTDIR="calibration/seeddelta-policy-eval-$(date +%Y%m%d-%H%M%S)"
 SD_MODEL=""
 REPORT_JSON=""
+POLICY_EXPORT=""
+SD_MODEL_ROUNDTRIP=""
+REPORT_JSON_ROUNDTRIP=""
 
 usage() {
   cat <<'EOF'
@@ -59,6 +63,7 @@ options (common):
   --n-predict N           (default: 256)
   --chunks N              perplexity chunks (default: 16)
   --no-repack             pass --no-repack to runtime (debug)
+  --roundtrip             rebuild using --policy-export and verify decisions match
 
 options (builder):
   --scheme block|coo      (default: block)
@@ -102,6 +107,7 @@ while (( "$#" )); do
     --n-predict) N_PREDICT="${2:-}"; shift 2 ;;
     --chunks) PPL_CHUNKS="${2:-}"; shift 2 ;;
     --no-repack) NO_REPACK="1"; shift ;;
+    --roundtrip) ROUNDTRIP="1"; shift ;;
 
     --scheme) SCHEME="${2:-}"; shift 2 ;;
     --block) BLOCK="${2:-}"; shift 2 ;;
@@ -140,6 +146,9 @@ mkdir -p "${OUTDIR}"
 
 SD_MODEL="${SD_MODEL:-${OUTDIR}/model_sd.gguf}"
 REPORT_JSON="${REPORT_JSON:-${OUTDIR}/report.json}"
+POLICY_EXPORT="${POLICY_EXPORT:-${OUTDIR}/policy.exported.json}"
+SD_MODEL_ROUNDTRIP="${SD_MODEL_ROUNDTRIP:-${OUTDIR}/model_sd_roundtrip.gguf}"
+REPORT_JSON_ROUNDTRIP="${REPORT_JSON_ROUNDTRIP:-${OUTDIR}/report_roundtrip.json}"
 
 BUILD_LOG="${OUTDIR}/build.log"
 
@@ -177,11 +186,113 @@ fi
 if [[ -n "${IMATRIX_FILE}" ]]; then
   build_cmd+=( --imatrix "${IMATRIX_FILE}" )
 fi
+if [[ "${ROUNDTRIP}" == "1" ]]; then
+  build_cmd+=( --policy-export "${POLICY_EXPORT}" )
+fi
 
 echo "== build ==" | tee "${BUILD_LOG}"
 printf 'CMD: %q ' "${build_cmd[@]}" | tee -a "${BUILD_LOG}"
 echo | tee -a "${BUILD_LOG}"
 "${build_cmd[@]}" 2>&1 | tee -a "${BUILD_LOG}"
+
+if [[ "${ROUNDTRIP}" == "1" ]]; then
+  RT_LOG="${OUTDIR}/roundtrip.log"
+  echo "== roundtrip build ==" | tee "${RT_LOG}"
+  [[ -f "${POLICY_EXPORT}" ]] || die "missing policy export: ${POLICY_EXPORT}"
+
+  rt_cmd=(
+    "${BIN_DIR}/llama-seeddelta-build"
+    -i "${BASE_MODEL}"
+    -o "${SD_MODEL_ROUNDTRIP}"
+    --layers "${LAYERS}"
+    --scheme "${SCHEME}"
+    -t "${THREADS}"
+    --eval-cols "${EVAL_COLS}"
+    --eval-x 0
+    --report-json "${REPORT_JSON_ROUNDTRIP}"
+    --policy "${POLICY_EXPORT}"
+    --policy-strict
+  )
+  if [[ "${SCHEME}" == "block" ]]; then
+    rt_cmd+=( --block "${BLOCK}" )
+  fi
+  if [[ "${ROW_SCALE}" == "1" ]]; then
+    rt_cmd+=( --row-scale )
+  else
+    rt_cmd+=( --no-row-scale )
+  fi
+  if [[ "${USE_BASE}" == "1" ]]; then
+    rt_cmd+=( --base --base-max-samples "${BASE_MAX_SAMPLES}" --base-perm-trials "${BASE_PERM_TRIALS}" )
+  fi
+  if [[ "${STRIP_DENSE}" == "1" ]]; then
+    rt_cmd+=( --strip-dense )
+  fi
+  if [[ -n "${IMATRIX_FILE}" ]]; then
+    rt_cmd+=( --imatrix "${IMATRIX_FILE}" )
+  fi
+
+  printf 'CMD: %q ' "${rt_cmd[@]}" | tee -a "${RT_LOG}"
+  echo | tee -a "${RT_LOG}"
+  "${rt_cmd[@]}" 2>&1 | tee -a "${RT_LOG}"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    die "--roundtrip requires python3 to compare reports"
+  fi
+
+  REPORT_JSON="${REPORT_JSON}" REPORT_JSON_ROUNDTRIP="${REPORT_JSON_ROUNDTRIP}" python3 - <<'PY'
+import json
+import os
+import sys
+
+base = os.environ["REPORT_JSON"]
+rt = os.environ["REPORT_JSON_ROUNDTRIP"]
+
+def load_decisions(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        rep = json.load(f)
+    out = {}
+    for w in rep.get("weights", []):
+        if not isinstance(w, dict):
+            continue
+        layer = w.get("layer", None)
+        kind = w.get("kind", None)
+        if layer is None or kind is None:
+            continue
+        key = (int(layer), str(kind))
+        out[key] = (
+            bool(w.get("emit", False)),
+            bool(w.get("strip_dense", False)),
+            int(w.get("K_budget", 0) or 0),
+            int(w.get("block", 0) or 0),
+        )
+    return out
+
+a = load_decisions(base)
+b = load_decisions(rt)
+
+if a != b:
+    ak = set(a.keys())
+    bk = set(b.keys())
+    only_a = sorted(ak - bk)[:20]
+    only_b = sorted(bk - ak)[:20]
+    mism = []
+    for k in sorted(ak & bk):
+        if a[k] != b[k]:
+            mism.append((k, a[k], b[k]))
+            if len(mism) >= 20:
+                break
+    print("roundtrip decisions mismatch", file=sys.stderr)
+    if only_a:
+        print("only in base report:", only_a, file=sys.stderr)
+    if only_b:
+        print("only in roundtrip report:", only_b, file=sys.stderr)
+    for k, va, vb in mism:
+        print(f"diff {k}: base={va} roundtrip={vb}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"roundtrip decisions OK ({len(a)} tensors)")
+PY
+fi
 
 run_cli() {
   local label="$1"
