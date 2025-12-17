@@ -57,6 +57,12 @@
 /common/build-info.cpp
 /calibration/
 
+# Datasets (downloaded via scripts/get-wikitext-*.sh)
+/wikitext-2-raw-v1.zip
+/wikitext-2-raw/
+/wikitext-103-raw-v1.zip
+/wikitext-103-raw-v1/
+
 # Deprecated
 
 /main

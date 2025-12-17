@@ -4,8 +4,9 @@
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
-#include "vendor/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 using json = nlohmann::ordered_json;
 
@@ -94,8 +95,11 @@ static std::optional<sd_autotune_cfg> sd_parse_autotune(const json & j) {
 }
 
 static void sd_parse_rule_object(const json & j, sd_rule & rule, bool strict, std::vector<std::string> & warnings) {
-    auto warn_unknown = [&](const std::string & key) {
-        if (!strict) warnings.push_back("unknown key in policy: " + key);
+    auto unknown_key = [&](const std::string & key) {
+        if (strict) {
+            throw std::runtime_error("unknown key in policy: " + key);
+        }
+        warnings.push_back("unknown key in policy: " + key);
     };
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = it.key();
@@ -171,7 +175,7 @@ static void sd_parse_rule_object(const json & j, sd_rule & rule, bool strict, st
         } else if (key == "layers" || key == "version") {
             // handled elsewhere
         } else {
-            warn_unknown(key);
+            unknown_key(key);
         }
     }
 }
@@ -195,67 +199,59 @@ sd_policy_parse_result sd_policy_load(const std::string & path, bool strict, sd_
         return res;
     }
 
-    if (j.contains("version") && j["version"].is_number_integer()) {
-        out.version = j["version"].get<int>();
-    }
-
-    if (j.contains("defaults") && j["defaults"].is_object()) {
-        sd_parse_rule_object(j["defaults"], out.defaults, strict, out.warnings);
-    }
-
-    if (j.contains("ranges") && j["ranges"].is_array()) {
-        for (const auto & r : j["ranges"]) {
-            if (!r.is_object() || !r.contains("layers")) {
-                continue;
-            }
-            sd_policy::range_rule rr;
-            try {
-                rr.layers = sd_parse_layer_selector(r["layers"].get<std::string>());
-            } catch (const std::exception & e) {
-                out.warnings.push_back(std::string("invalid layers in range: ") + e.what());
-                continue;
-            }
-            sd_parse_rule_object(r, rr.rule, strict, out.warnings);
-            out.ranges.push_back(std::move(rr));
-        }
-    }
-
-    if (j.contains("layers") && j["layers"].is_object()) {
-        for (auto it = j["layers"].begin(); it != j["layers"].end(); ++it) {
+    try {
+        // Top-level unknown keys handling.
+        for (auto it = j.begin(); it != j.end(); ++it) {
             const std::string key = it.key();
-            int64_t lid = -1;
-            try {
-                lid = std::stoll(key);
-            } catch (...) {
-                out.warnings.push_back("invalid layer key: " + key);
+            if (key == "version" || key == "defaults" || key == "ranges" || key == "layers") {
                 continue;
             }
-            if (!it.value().is_object()) {
-                continue;
+            if (strict) {
+                throw std::runtime_error("unknown top-level key in policy: " + key);
             }
-            sd_rule r;
-            sd_parse_rule_object(it.value(), r, strict, out.warnings);
-            out.layers[lid] = std::move(r);
+            out.warnings.push_back("unknown top-level key in policy: " + key);
         }
+
+        if (j.contains("version") && j["version"].is_number_integer()) {
+            out.version = j["version"].get<int>();
+        }
+
+        if (j.contains("defaults") && j["defaults"].is_object()) {
+            sd_parse_rule_object(j["defaults"], out.defaults, strict, out.warnings);
+        }
+
+        if (j.contains("ranges") && j["ranges"].is_array()) {
+            for (const auto & r : j["ranges"]) {
+                if (!r.is_object() || !r.contains("layers")) {
+                    continue;
+                }
+                sd_policy::range_rule rr;
+                rr.layers = sd_parse_layer_selector(r["layers"].get<std::string>());
+                sd_parse_rule_object(r, rr.rule, strict, out.warnings);
+                out.ranges.push_back(std::move(rr));
+            }
+        }
+
+        if (j.contains("layers") && j["layers"].is_object()) {
+            for (auto it = j["layers"].begin(); it != j["layers"].end(); ++it) {
+                const std::string key = it.key();
+                int64_t lid = std::stoll(key);
+                if (!it.value().is_object()) {
+                    continue;
+                }
+                sd_rule r;
+                sd_parse_rule_object(it.value(), r, strict, out.warnings);
+                out.layers[lid] = std::move(r);
+            }
+        }
+    } catch (const std::exception & e) {
+        res.error = std::string("invalid policy: ") + e.what();
+        return res;
     }
 
     res.ok = true;
     res.warnings = out.warnings;
     return res;
-}
-
-static std::optional<float> pick_kind_opt(const sd_gating_thresholds & t, const std::string & kind) {
-    if (kind == "ffn_gate") return t.min_mean;
-    if (kind == "ffn_up")   return t.min_mean;
-    if (kind == "ffn_down") return t.min_mean;
-    return t.min_mean;
-}
-
-static std::optional<float> pick_kind_p05(const sd_gating_thresholds & t, const std::string & kind) {
-    if (kind == "ffn_gate") return t.min_p05;
-    if (kind == "ffn_up")   return t.min_p05;
-    if (kind == "ffn_down") return t.min_p05;
-    return t.min_p05;
 }
 
 sd_resolved_tensor sd_policy_resolve(
@@ -281,10 +277,12 @@ sd_resolved_tensor sd_policy_resolve(
     const auto it_layer = policy->layers.find(layer);
     if (it_layer != policy->layers.end()) {
         sd_merge_rule(acc, it_layer->second);
-        const auto it_tensor = it_layer->second.tensors.find(tensor_kind);
-        if (it_tensor != it_layer->second.tensors.end()) {
-            sd_merge_rule(acc, it_tensor->second);
-        }
+    }
+
+    // Apply per-tensor overrides accumulated from defaults/ranges/layer.
+    const auto it_tensor = acc.tensors.find(tensor_kind);
+    if (it_tensor != acc.tensors.end()) {
+        sd_merge_rule(acc, it_tensor->second);
     }
 
     if (acc.enabled.has_value()) out.enabled = *acc.enabled;
@@ -296,25 +294,14 @@ sd_resolved_tensor sd_policy_resolve(
     if (acc.metric.has_value()) out.metric = *acc.metric;
     if (acc.autotune.has_value()) out.autotune = *acc.autotune;
 
-    auto pick_thr = [&](const sd_gating_thresholds & thr, float fallback) -> float {
-        auto v = pick_kind_opt(thr, tensor_kind);
-        return v.has_value() ? *v : fallback;
-    };
-    auto pick_thr_p05 = [&](const sd_gating_thresholds & thr, float fallback) -> float {
-        auto v = pick_kind_p05(thr, tensor_kind);
-        return v.has_value() ? *v : fallback;
-    };
-
-    out.min_mean = pick_thr(acc.gate_thr, out.min_mean);
-    out.min_p05  = pick_thr_p05(acc.gate_thr, out.min_p05);
-    // If per-kind thresholds are set in up/down, they override.
+    const sd_gating_thresholds * thr = &acc.gate_thr;
     if (tensor_kind == "ffn_up") {
-        if (acc.up_thr.min_mean.has_value()) out.min_mean = *acc.up_thr.min_mean;
-        if (acc.up_thr.min_p05.has_value())  out.min_p05  = *acc.up_thr.min_p05;
+        thr = &acc.up_thr;
     } else if (tensor_kind == "ffn_down") {
-        if (acc.down_thr.min_mean.has_value()) out.min_mean = *acc.down_thr.min_mean;
-        if (acc.down_thr.min_p05.has_value())  out.min_p05  = *acc.down_thr.min_p05;
+        thr = &acc.down_thr;
     }
+    if (thr->min_mean.has_value()) out.min_mean = *thr->min_mean;
+    if (thr->min_p05.has_value())  out.min_p05  = *thr->min_p05;
 
     out.gating_enabled = true;
     out.require_eval_x = (out.metric == sd_metric_kind::cos_x || out.metric == sd_metric_kind::cos_x_w);
