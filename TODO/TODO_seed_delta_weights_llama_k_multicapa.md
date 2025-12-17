@@ -110,6 +110,19 @@ Valores iniciales (ajustables por modelo):
 
 > Nota: para apilar muchas capas, la cola (p05/p10) suele predecir mejor “no colapsar” que solo el mean.
 
+### 3.2) Stack-safety (capas/tensores acumulados)
+
+Los umbrales deben **endurecerse automáticamente** según la cantidad de tensores/capas aprobados para evitar error acumulado:
+
+- Definir una función `stack_budget = (#tensores aprobados)` y aplicar multiplicadores conservadores.
+- Ejemplo inicial:
+  - Si `stack_budget <= 2`: usar thresholds base (arriba).
+  - Si `3 <= stack_budget <= 8`: exigir `cos_mean_x_w` +0.05 y `cos_p05_x_w` +0.05 para gate/up.
+  - Si `stack_budget > 8`: exigir `cos_mean_x_w >= 0.60` y `cos_p05_x_w >= 0.45` para gate/up; `ffn_down` sube a `0.35/0.25` respectivamente.
+- Registrar los thresholds efectivos en el report (`decision.thresholds_used`) para auditar qué tan estricto fue el gating en cada caso.
+
+El objetivo es que una política pueda declarar “quiero tocar capas 8–26” y que el builder rechace automáticamente aquellas que no alcanzan el umbral endurecido para mantener greedy estable.
+
 ---
 
 ## 4) Policy JSON (schema propuesto)
@@ -312,17 +325,27 @@ Campos recomendados (para forense y reproducibilidad):
 - [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
 - [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
 - [ ] Clarificar repack vs RSS: tener medición consistente (time -v + logs) y explicar picos vs steady.
+- [ ] Instrumentar stack-safety: medir cuántos tensores pasan por policy vs cuántos terminan activos tras endurecer thresholds.
+  - Reportar en `build.stack_budget` para correlacionar con estabilidad.
 
 ### Calidad / data-aware “de verdad”
 
 - [ ] Mejorar dataset para imatrix por modelo (no depender de `gemma_calibration.txt` para todo).
 - [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar `||WX - ŴX||` más allá de imatrix diagonal.
 - [ ] Explorar construir SeedΔ desde F16/Q8 como fuente (evitar “loss-on-loss” de Q4).
+- [ ] Validar gating multi-precisión: repetir builder + policy en al menos tres precisiones (FP16, Q8, Q4) para el mismo modelo y documentar diferencias de cos/stack_budget.
+- [ ] Añadir `--source-precision` metadata al GGUF/export para rastrear con qué precisión se generó SeedΔ.
 
 ### Expandir targets (Fase 5)
 
 - [ ] Probar policy/gating en QKV/O con budgets conservadores (solo si gating indica que hay margen).
 - [ ] Embeddings/LM head solo con gating ultra estricto.
+
+### Modelos y pruebas cruzadas
+
+- [x] Inventario de modelos locales (`~/.cache/llama.cpp/*.gguf`) con tamaño, quant y tags SeedΔ (script helper `scripts/model-inventory.sh`).
+- [x] Bajar al menos un modelo “llama-like” en Q8/F16 (p.ej. Mistral 7B o Llama 3.1 8B) para validar que SeedΔ escala cuando el target es limpio. (Descargado `mistral-7b-instruct-v0.2.Q8_0.gguf` + `calibration/mistral7b.imatrix.gguf`; falta correr policy-eval.)
+- [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating para detectar regresiones temprano.
 
 ---
 
@@ -345,3 +368,22 @@ Campos recomendados (para forense y reproducibilidad):
   - strip solicitado pero gating fail ⇒ keep dense (verificar que el tensor denso existe)
 - Runtime smoke:
   - cargar GGUF híbrido y correr greedy (`--seeddelta --no-repack --ignore-eos`) en 5 prompts (es/en/código corto)
+
+---
+
+## 12) Plan de ataque inmediato
+
+1. **Stack-safe policy freeze**
+   - Exportar (`--policy-export`) las políticas que ya sabemos estables (Gemma 1B/4B, Qwen 19–20) y versionarlas.
+   - Añadir multiplicadores stack-safety en el builder y revalidar que Qwen siga estable (debe seguir aprobando solo 19–20, pero ahora con thresholds explícitos).
+2. **Cross-precision baseline**
+   - Descargar un modelo llama-like en Q8/F16 (ej. Mistral 7B) y correr `scripts/seeddelta-policy-eval.sh` con la misma policy para medir cuántas capas pasan.
+   - Documentar en `calibration/` (JSON + eval) la diferencia entre construir SeedΔ desde Q8/FP16 vs Q4 para un mismo rango.
+3. **Model inventory + small-model smoke**
+   - Escribir script `scripts/model-inventory.sh` que liste gguf disponibles con quant/size y tags SeedΔ.
+   - Ejecutar smoke en Gemma 1B/4B con las nuevas policies para asegurarnos de que el pipeline sigue estable cuando cambiamos thresholds.
+4. **Data-aware improvements**
+   - Generar nuevos imatrix específicos por modelo/dominio (no más `gemma_calibration` para Qwen).
+   - Investigar captura ligera de activaciones reales para reemplazar el proxy `eval_x`.
+
+Entrega esperada tras este plan: políticas congeladas + logs de Q8/F16 + inventario de modelos + documentación de stack_budget reales.
