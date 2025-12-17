@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": false
+  },
+  "ranges": [
+    {
+      "layers": "8-18",
+      "enabled": true,
+      "strip_dense": true,
+      "block": 32,
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "down": 0.45 },
+        "min_p05":  { "down": 0.30 }
+      },
+      "autotune": {
+        "enabled": true,
+        "schedule_down": [256, 512, 768, 1024, 1536, 2048],
+        "max_iters": 6
+      },
+      "tensors": {
+        "ffn_gate": { "enabled": false },
+        "ffn_up":   { "enabled": false },
+        "ffn_down": { "enabled": true }
+      }
+    },
+    {
+      "layers": "19-20",
+      "enabled": true,
+      "strip_dense": true,
+      "block": 32,
+      "K": { "gate": 256, "up": 256, "down": 512 },
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "gate": 0.45, "up": 0.45, "down": 0.35 },
+        "min_p05":  { "gate": 0.30, "up": 0.30, "down": 0.25 }
+      },
+      "autotune": {
+        "enabled": true,
+        "schedule_gate_up": [128, 256, 384, 512],
+        "schedule_down":    [256, 512, 768, 1024],
+        "max_iters": 4
+      }
+    }
+  ]
+}

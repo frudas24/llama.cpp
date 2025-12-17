@@ -284,14 +284,14 @@ Campos recomendados (para forense y reproducibilidad):
 - [x] Volcar resolved/gating/autotune/decision al `--report-json`.
 - [x] Añadir `policy.example.qwen7b.json` y `policy.example.gemma.json` en `tools/seeddelta-build/policies/` (o `calibration/` si preferimos).
   - (Opcional) exponer gating/autotune “global” vía flags (`--autotune-k-*`, `--gating-*`) para arrancar sin policy y luego migrar.
-- [ ] Resolver robusto de tensor→kind (nombres reales por arquitectura):
+- [x] Resolver robusto de tensor→kind (nombres reales por arquitectura):
   - mapear `blk.N.ffn_{gate,up,down}.weight` a `ffn_gate/up/down`
   - si un modelo no tiene ese tensor, skip + dejar rastro en report (no abortar silencioso)
 - [x] Iteración segura sobre modelos ya SeedΔ:
   - decidir comportamiento por defecto (skip vs overwrite) y exponer flags tipo `--skip-existing` / `--overwrite`
   - en modo policy, evitar “skipping” silencioso que invalida el resolved/gating/autotune
-- [ ] Harness reproducible para policy:
-  - extender `scripts/seeddelta-eval.sh` o añadir script nuevo para: build con `--policy`, guardar report, correr smoke greedy (batería) y (opcional) PPL corto
+- [x] Harness reproducible para policy:
+  - script nuevo `scripts/seeddelta-policy-eval.sh`: build con `--policy`, guardar report, correr smoke greedy (batería), PPL corto y logs opcionales de `/usr/bin/time -v`
 - [ ] Test mínimo del resolver/merge:
   - al menos un “self-check” (p.ej. `--policy-dump-resolved` + golden esperado) para evitar regresiones en merge order/overrides
   - incluir casos de strip seguro: `strip_dense=true` + gating fail ⇒ no strip
@@ -300,7 +300,8 @@ Campos recomendados (para forense y reproducibilidad):
 ### Robustez runtime (pendiente real)
 
 - [ ] Nan-Guardian/fallback: si el op produce NaN/Inf o si el tensor está marcado “unsafe”, fallback claro.
-- [ ] “Unsafe tensor” metadata: si builder falla gating, marcar explícitamente (para auditar sin abrir JSON).
+- [x] “Unsafe tensor” metadata: si builder falla gating, marcar explícitamente (para auditar sin abrir JSON).
+  - se escribe por tensor en KV (v1): `seeddelta.blk.N.<kind>.gating_pass`, `...enabled`, `...strip_dense`, `...K`.
 
 ### Perf / RAM (sigue siendo el cuello)
 

@@ -2114,9 +2114,7 @@ int main(int argc, char ** argv) {
     for (const int64_t il : layers) {
         for (const auto & kind : kinds) {
             const std::string weight_name = "blk." + std::to_string(il) + "." + kind + ".weight";
-            if (gguf_find_tensor(src, weight_name.c_str()) == -1) {
-                continue;
-            }
+            const bool have_weight = gguf_find_tensor(src, weight_name.c_str()) != -1;
 
             sd_resolved_tensor baseline_kind = baseline_cfg;
             if (kind == "ffn_down") {
@@ -2145,6 +2143,26 @@ int main(int argc, char ** argv) {
             if (cfg.require_imatrix && !have_imatrix) {
                 fprintf(stderr, "seeddelta-build: gating metric requires imatrix for %s\n", weight_name.c_str());
                 return 1;
+            }
+
+            if (!have_weight) {
+                if (policy_ptr || !report_json.empty()) {
+                    report_entry re;
+                    re.layer = il;
+                    re.kind = kind;
+                    re.n_in = 0;
+                    re.n_out = 0;
+                    re.emit = false;
+                    re.strip_applied = false;
+                    re.gating_enabled = (policy_ptr != nullptr);
+                    re.gating_pass = false;
+                    re.decision_reason = "missing_tensor";
+                    re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                    re.gating_min_mean = cfg.min_mean;
+                    re.gating_min_p05 = cfg.min_p05;
+                    report.push_back(std::move(re));
+                }
+                continue;
             }
 
             const std::string d_idx_name      = "blk." + std::to_string(il) + "." + kind + ".d_idx";
