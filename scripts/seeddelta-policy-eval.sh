@@ -259,12 +259,20 @@ def load_decisions(path: str):
         if layer is None or kind is None:
             continue
         key = (int(layer), str(kind))
-        out[key] = (
-            bool(w.get("emit", False)),
-            bool(w.get("strip_dense", False)),
-            int(w.get("K_budget", 0) or 0),
-            int(w.get("block", 0) or 0),
-        )
+        emit = bool(w.get("emit", False))
+        strip = bool(w.get("strip_dense", False))
+        K_budget = int(w.get("K_budget", 0) or 0)
+        block = int(w.get("block", 0) or 0)
+
+        # When a tensor is not emitted, K/block are bookkeeping and can differ
+        # depending on whether the builder actually tried to fit (gating fail)
+        # vs policy-disabled (no attempt). For roundtrip, require strict match
+        # only on emitted tensors.
+        if not emit:
+            K_budget = 0
+            block = 0
+
+        out[key] = (emit, strip, K_budget, block)
     return out
 
 a = load_decisions(base)
