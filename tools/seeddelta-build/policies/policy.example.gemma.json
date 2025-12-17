@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": false
+  },
+  "ranges": [
+    {
+      "layers": "10-11",
+      "enabled": true,
+      "strip_dense": true,
+      "block": 16,
+      "K": { "gate": 64, "up": 64, "down": 128 },
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "gate": 0.45, "up": 0.45, "down": 0.25 },
+        "min_p05":  { "gate": 0.30, "up": 0.30, "down": 0.15 }
+      },
+      "autotune": {
+        "enabled": false
+      }
+    }
+  ]
+}
