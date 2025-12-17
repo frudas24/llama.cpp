@@ -300,7 +300,10 @@ Campos recomendados (para forense y reproducibilidad):
 
 ### Robustez runtime (pendiente real)
 
-- [ ] Nan-Guardian/fallback: si el op produce NaN/Inf o si el tensor está marcado “unsafe”, fallback claro.
+- [x] Nan-Guardian/fallback: si el op produce NaN/Inf, reemplazar por un valor seguro:
+  - best-effort fallback denso si `w_ref` es accesible en host
+  - si no hay fallback denso disponible (p.ej. offload), clamp a `0.0f`
+  - log a `stderr` solo una vez (evita spam)
 - [x] “Unsafe tensor” metadata: si builder falla gating, marcar explícitamente (para auditar sin abrir JSON).
   - se escribe por tensor en KV (v1): `seeddelta.blk.N.<kind>.gating_pass`, `...enabled`, `...strip_dense`, `...K`.
 

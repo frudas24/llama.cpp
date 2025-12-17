@@ -1,9 +1,12 @@
 #include "llama-seeddelta.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -64,6 +67,145 @@ static inline int32_t read_base_i16_i32(const ggml_tensor * t, const uint8_t * b
         return (int32_t) *(const int16_t *)(base + off);
     }
     return *(const int32_t *)(base + off);
+}
+
+static std::atomic_flag llama_seeddelta_nan_warned = ATOMIC_FLAG_INIT;
+static std::atomic<int64_t> llama_seeddelta_nan_count{0};
+static thread_local std::vector<float> llama_seeddelta_wcol_tls;
+
+static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t col, std::vector<float> & out) {
+    if (!w || ggml_n_dims(w) != 2) {
+        return false;
+    }
+    if (!w->data) {
+        return false;
+    }
+    if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
+        return false;
+    }
+
+    const int64_t n_in  = w->ne[0];
+    const int64_t n_out = w->ne[1];
+    if (n_in <= 0 || col < 0 || col >= n_out) {
+        return false;
+    }
+
+    out.resize((size_t) n_in);
+
+    const uint8_t * base = (const uint8_t *) w->data + col * w->nb[1];
+    const auto * traits = ggml_get_type_traits(w->type);
+    if (!traits) {
+        return false;
+    }
+
+    if (!traits->is_quantized) {
+        if (w->type == GGML_TYPE_F32) {
+            if ((size_t) w->nb[0] == sizeof(float)) {
+                std::memcpy(out.data(), base, (size_t) n_in * sizeof(float));
+            } else {
+                for (int64_t i = 0; i < n_in; ++i) {
+                    out[(size_t) i] = *(const float *)(base + i * w->nb[0]);
+                }
+            }
+            return true;
+        }
+        if (w->type == GGML_TYPE_F16) {
+            for (int64_t i = 0; i < n_in; ++i) {
+                out[(size_t) i] = ggml_fp16_to_fp32(*(const ggml_fp16_t *)(base + i * w->nb[0]));
+            }
+            return true;
+        }
+        if (traits->to_float) {
+            traits->to_float(base, out.data(), n_in);
+            return true;
+        }
+        return false;
+    }
+
+    if (!traits->to_float) {
+        return false;
+    }
+    traits->to_float(base, out.data(), n_in);
+    return true;
+}
+
+static bool llama_seeddelta_dense_fallback(
+        const ggml_tensor * w_ref,
+        const ggml_tensor * x,
+        int64_t o,
+        int64_t t,
+        float & y_out) {
+    if (!w_ref || !x) {
+        return false;
+    }
+    if (!x->data) {
+        return false;
+    }
+    if (x->buffer && !ggml_backend_buffer_is_host(x->buffer)) {
+        return false;
+    }
+    if (ggml_n_dims(x) < 2) {
+        return false;
+    }
+    if (ggml_n_dims(w_ref) != 2) {
+        return false;
+    }
+
+    const int64_t n_in = x->ne[0];
+    if (w_ref->ne[0] != n_in) {
+        return false;
+    }
+    if (o < 0 || o >= w_ref->ne[1]) {
+        return false;
+    }
+    if (t < 0 || t >= x->ne[1]) {
+        return false;
+    }
+
+    if (!llama_seeddelta_read_weight_col_f32(w_ref, o, llama_seeddelta_wcol_tls)) {
+        return false;
+    }
+
+    const uint8_t * x_data = (const uint8_t *) x->data;
+    double acc = 0.0;
+    for (int64_t i = 0; i < n_in; ++i) {
+        const float xv = read_x_f16_or_f32(x, x_data, i, t);
+        acc += (double) llama_seeddelta_wcol_tls[(size_t) i] * (double) xv;
+    }
+
+    y_out = (float) acc;
+    return std::isfinite(y_out);
+}
+
+static inline float llama_seeddelta_nan_guard(
+        const ggml_tensor * w_ref,
+        const ggml_tensor * x,
+        int64_t o,
+        int64_t t,
+        float y) {
+    if (std::isfinite(y)) {
+        return y;
+    }
+
+    bool fallback_ok = false;
+    float y_fb = 0.0f;
+    if (llama_seeddelta_dense_fallback(w_ref, x, o, t, y_fb)) {
+        y = y_fb;
+        fallback_ok = true;
+    } else {
+        y = 0.0f;
+    }
+
+    llama_seeddelta_nan_count.fetch_add(1, std::memory_order_relaxed);
+    if (!llama_seeddelta_nan_warned.test_and_set(std::memory_order_relaxed)) {
+        const char * name = w_ref ? ggml_get_name(w_ref) : "<null>";
+        std::fprintf(stderr,
+                "llama-seeddelta: NaN/Inf detected in custom op output; %s for tensor '%s'\n",
+                fallback_ok ? "falling back to dense" : "replacing with 0.0 (dense fallback unavailable)",
+                name ? name : "<unnamed>");
+    }
+
+    return y;
 }
 
 static inline void hadamard_transform(float * data, int64_t n) {
@@ -189,7 +331,7 @@ static void apply_base_block(
 //   row_scale : [n_out]      optional scale per output row
 //   y     : [n_out, n_tokens]
 static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(userdata);
+    const ggml_tensor * w_ref = (const ggml_tensor *) userdata;
 
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * d_idx    = dst->src[1];
@@ -251,7 +393,9 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
                         }
                         y += val_col[r] * x_data[ii + t * n_in];
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         } else {
@@ -271,7 +415,9 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
                         }
                         y += val_col[r] * x_data[ii + t * n_in];
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         }
@@ -300,7 +446,9 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
                 const float xv = read_x_f16_or_f32(x, x_data, ii, t);
                 y += vv * xv;
             }
-            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+            float out = (scale != 1.0f) ? (y * scale) : y;
+            out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
         }
     }
 }
@@ -312,7 +460,7 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
 //   row_scale : [n_out]              optional scale per output row
 //   y     : [n_out, n_tokens]
 static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(userdata);
+    const ggml_tensor * w_ref = (const ggml_tensor *) userdata;
 
     const ggml_tensor * x         = dst->src[0];
     const ggml_tensor * b_idx     = dst->src[1];
@@ -388,7 +536,9 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                             y += vv[j] * xv[j];
                         }
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         } else {
@@ -417,7 +567,9 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                             y += vv[j] * xv[j];
                         }
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         }
@@ -466,7 +618,9 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                             y += ggml_fp16_to_fp32(vv[j]) * ggml_fp16_to_fp32(xv[j]);
                         }
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         } else {
@@ -494,7 +648,9 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                             y += ggml_fp16_to_fp32(vv[j]) * ggml_fp16_to_fp32(xv[j]);
                         }
                     }
-                    dst_data[o + t * n_out] = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    dst_data[o + t * n_out] = out;
                 }
             }
         }
@@ -532,7 +688,9 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                     y += vv * xv;
                 }
             }
-            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+            float out = (scale != 1.0f) ? (y * scale) : y;
+            out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+            *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
         }
     }
 }
@@ -540,6 +698,7 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
 ggml_tensor * llama_seeddelta_mul_mat(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * d_idx,
         ggml_tensor  * d_val,
         ggml_tensor  * row_scale) {
@@ -556,7 +715,7 @@ ggml_tensor * llama_seeddelta_mul_mat(
             args, 4,
             llama_seeddelta_coo_op,
             GGML_N_TASKS_MAX,
-            nullptr);
+            w_ref);
 
     return res;
 }
@@ -564,6 +723,7 @@ ggml_tensor * llama_seeddelta_mul_mat(
 ggml_tensor * llama_seeddelta_mul_mat_block(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * b_idx,
         ggml_tensor  * b_val,
         ggml_tensor  * row_scale) {
@@ -580,7 +740,7 @@ ggml_tensor * llama_seeddelta_mul_mat_block(
             args, 4,
             llama_seeddelta_block_op,
             GGML_N_TASKS_MAX,
-            nullptr);
+            w_ref);
 
     return res;
 }
@@ -597,7 +757,7 @@ struct llama_seeddelta_scratch {
 static thread_local llama_seeddelta_scratch llama_seeddelta_scratch_tls;
 
 static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(userdata);
+    const ggml_tensor * w_ref = (const ggml_tensor *) userdata;
 
     const ggml_tensor * x          = dst->src[0];
     const ggml_tensor * base_d1    = dst->src[1];
@@ -703,7 +863,9 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                     }
 
                     const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
-                    *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
                 }
             }
         }
@@ -748,14 +910,16 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                 }
 
                 const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
-                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+                float out = (scale != 1.0f) ? (y * scale) : y;
+                out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
             }
         }
     }
 }
 
 static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(userdata);
+    const ggml_tensor * w_ref = (const ggml_tensor *) userdata;
 
     const ggml_tensor * x          = dst->src[0];
     const ggml_tensor * base_d1    = dst->src[1];
@@ -873,7 +1037,9 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                     }
 
                     const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
-                    *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+                    float out = (scale != 1.0f) ? (y * scale) : y;
+                    out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
                 }
             }
         }
@@ -926,7 +1092,9 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                 }
 
                 const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
-                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = (scale != 1.0f) ? (y * scale) : y;
+                float out = (scale != 1.0f) ? (y * scale) : y;
+                out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
             }
         }
     }
@@ -935,6 +1103,7 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
 ggml_tensor * llama_seeddelta_mul_mat_base(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * base_d1,
         ggml_tensor  * base_d2,
         ggml_tensor  * base_d3,
@@ -959,7 +1128,7 @@ ggml_tensor * llama_seeddelta_mul_mat_base(
             args, 9,
             llama_seeddelta_base_op,
             GGML_N_TASKS_MAX,
-            nullptr);
+            w_ref);
 
     return res;
 }
@@ -967,6 +1136,7 @@ ggml_tensor * llama_seeddelta_mul_mat_base(
 ggml_tensor * llama_seeddelta_mul_mat_base_block(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * base_d1,
         ggml_tensor  * base_d2,
         ggml_tensor  * base_d3,
@@ -991,7 +1161,7 @@ ggml_tensor * llama_seeddelta_mul_mat_base_block(
             args, 9,
             llama_seeddelta_base_block_op,
             GGML_N_TASKS_MAX,
-            nullptr);
+            w_ref);
 
     return res;
 }

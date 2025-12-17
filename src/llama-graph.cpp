@@ -623,24 +623,24 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             if (sdw->b_idx && sdw->b_val) {
                 if (sdw->base_d1) {
                     res = llama_seeddelta_mul_mat_base_block(
-                            ctx0, cur,
+                            ctx0, cur, w,
                             sdw->base_d1, sdw->base_d2, sdw->base_d3,
                             sdw->base_perm1, sdw->base_perm2,
                             sdw->b_idx, sdw->b_val,
                             sdw->row_scale);
                 } else {
-                    res = llama_seeddelta_mul_mat_block(ctx0, cur, sdw->b_idx, sdw->b_val, sdw->row_scale);
+                    res = llama_seeddelta_mul_mat_block(ctx0, cur, w, sdw->b_idx, sdw->b_val, sdw->row_scale);
                 }
             } else if (sdw->d_idx && sdw->d_val) {
                 if (sdw->base_d1) {
                     res = llama_seeddelta_mul_mat_base(
-                            ctx0, cur,
+                            ctx0, cur, w,
                             sdw->base_d1, sdw->base_d2, sdw->base_d3,
                             sdw->base_perm1, sdw->base_perm2,
                             sdw->d_idx, sdw->d_val,
                             sdw->row_scale);
                 } else {
-                    res = llama_seeddelta_mul_mat(ctx0, cur, sdw->d_idx, sdw->d_val, sdw->row_scale);
+                    res = llama_seeddelta_mul_mat(ctx0, cur, w, sdw->d_idx, sdw->d_val, sdw->row_scale);
                 }
             }
             if (res && sched && backend_cpu) {

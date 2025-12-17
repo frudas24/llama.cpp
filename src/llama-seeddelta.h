@@ -41,6 +41,7 @@ struct llama_seeddelta_context {
 ggml_tensor * llama_seeddelta_mul_mat(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * d_idx,
         ggml_tensor  * d_val,
         ggml_tensor  * row_scale);
@@ -49,6 +50,7 @@ ggml_tensor * llama_seeddelta_mul_mat(
 ggml_tensor * llama_seeddelta_mul_mat_block(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * b_idx,
         ggml_tensor  * b_val,
         ggml_tensor  * row_scale);
@@ -57,6 +59,7 @@ ggml_tensor * llama_seeddelta_mul_mat_block(
 ggml_tensor * llama_seeddelta_mul_mat_base(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * base_d1,
         ggml_tensor  * base_d2,
         ggml_tensor  * base_d3,
@@ -70,6 +73,7 @@ ggml_tensor * llama_seeddelta_mul_mat_base(
 ggml_tensor * llama_seeddelta_mul_mat_base_block(
         ggml_context * ctx,
         ggml_tensor  * x,
+        ggml_tensor  * w_ref,
         ggml_tensor  * base_d1,
         ggml_tensor  * base_d2,
         ggml_tensor  * base_d3,
