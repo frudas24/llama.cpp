@@ -144,3 +144,5 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+.codex/

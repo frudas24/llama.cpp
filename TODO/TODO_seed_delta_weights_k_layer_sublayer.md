@@ -14,13 +14,76 @@ para el diseño del builder/policy/gating/autotune y resultados actuales.
 
 ---
 
+## 0) Definiciones (para evitar ambigüedad)
+
+Estas definiciones son **v1 (MVP)** para que “K por subcapa/tile” y “Δ por etapas” signifiquen lo mismo
+cuando se implementen.
+
+- **Tensor objetivo**: en v1, matrices FFN `ffn_gate`, `ffn_up`, `ffn_down` por capa `blk.N`.
+- **Subcapa/tile**:
+  - v1: *tiles por filas* (rangos contiguos de filas de `W`, alineados a `block` y/o a `n_out`).
+  - Ejemplo: `ffn_down` con `n_out=4096`, tiles: `[0..1023]`, `[1024..2047]`, `[2048..3071]`, `[3072..4095]`.
+- **K por tile**:
+  - K aplica al **residual Δ** dentro de ese tile (no al tensor completo).
+  - K se interpreta como “presupuesto de bloques/entradas” del esquema residual (block/COO) para ese tile.
+- **Stage (multi-stage Δ)**:
+  - `\hat W = W_0 + Δ_1 + Δ_2 + ... + Δ_m` con `m` pequeño.
+  - Cada `Δ_s` aproxima el residual restante tras aplicar las etapas anteriores.
+  - Restricción: `Σ_s K_s ≤ K_total` (y/o budget de ops/mem).
+
+---
+
+## 0.1) Criterios de aceptación (KPIs) y comparabilidad
+
+Sin KPIs por run, el backlog se convierte en wishlist. Para cada experimento/preset, reportar:
+
+- **Calidad numérica (termómetro):**
+  - PPL en Wikitext‑2 (`wikitext-2-raw/wiki.test.raw`) con `ctx`/`chunks` fijos.
+  - Reportar `ΔPPL` vs base y `PPL±std` si aplica.
+- **Estabilidad funcional (gate final):**
+  - Greedy pack con prompts duros: `calibration/greedy_zombie_pack.txt`.
+  - Runner: `scripts/seeddelta-greedy-pack.sh` o `scripts/seeddelta-policy-eval.sh --greedy-pack ...`.
+  - Criterio v1: `RESULT: PASS` (0 prompts flagged).
+- **Perf (prompt y gen):**
+  - `tok/s` en prompt eval y gen batch=1 (p.ej. `llama-cli -n 256`), y/o `llama-perplexity` prompt time.
+  - Reportar `Δtok/s` vs base y “overhead por tensor activo” si se puede aislar.
+- **Memoria (steady y pico):**
+  - `Maximum resident set size` (`/usr/bin/time -v`) + `llama_memory_breakdown_print` (Host/CPU_REPACK/ctx/compute).
+  - Distinguir pico (repack) vs steady (host model) explícitamente.
+- **Stack-safety:**
+  - `stack_budget`: cuántos tensores SeedΔ activos por tipo (gate/up/down) y total.
+  - `stack_cost`: coste ponderado (ver sección 7), y su correlación con greedy/PPL.
+
+Metodología multi-precisión (para conclusiones limpias):
+
+- Para aislar “source_precision”, comparar **el mismo modelo** generado desde la misma base:
+  - HF base → GGUF F16 → cuantizar a Q8/Q4 desde ese mismo F16 → construir SeedΔ en cada uno.
+  - Evitar inferencias fuertes comparando fine-tunes distintos (p.ej. Kimiko FP16 vs Mistral instruct Q8).
+
+---
+
+## 0.2) Orden sugerido (MVP) para no dispersarse
+
+Prioridad por ROI y por reducción de ambigüedad:
+
+1) **Gating FFN compuesto + stack_budget/stack_cost** (secciones 5 y 7): evitar zombies antes de tocar más capas.
+2) **Comparabilidad multi-precisión** (sección 2): misma base F16 → Q8/Q4, y medir headroom real.
+3) **Δ por etapas** (6.1) y **K por tile** (6.2): aumentar capacidad sin subir K global a lo bruto.
+4) Optimización pesada de kernels (`W0x`) solo cuando sepamos qué presets valen la pena acelerar.
+
+---
+
 ## 1) Perf / RAM (sigue siendo el cuello)
 
-- [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
-- [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
+Orden recomendado (antes de micro-optimizar):
+
 - [ ] Clarificar repack vs RSS: tener medición consistente (time -v + logs) y explicar picos vs steady.
+- [ ] Medir “costo por tensor activo” en runtime:
+      - cuánto sube prompt/gen tok/s y cuánto sube RSS/CPU_REPACK por cada tensor SeedΔ activado.
 - [ ] Instrumentar stack-safety: medir cuántos tensores pasan por policy vs cuántos terminan activos tras endurecer thresholds.
-  - Reportar en `build.stack_budget` para correlacionar con estabilidad (greedy/PPL) en los reports.
+      - Reportar `build.stack_budget` y `build.stack_cost`.
+- [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
+- [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
 
 ## 2) Calidad / data-aware “de verdad”
 
@@ -43,3 +106,89 @@ para el diseño del builder/policy/gating/autotune y resultados actuales.
 - [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating
       para detectar regresiones temprano (PPL+greedy pack).
 
+---
+
+## 5) Gating y error a nivel bloque FFN (no solo tensor)
+
+Motivación empírica (Qwen 7B Q4, Mistral 7B Q8, Gemma 4B Q4):
+
+- Tensores individuales pueden “pasar” gating (`cos_x_w` decente) pero el bloque completo FFN (`gate+up+down`)
+  rompe comportamiento greedy al apilar varias capas (loops, drift de idioma, fallos en instrucciones duras).
+- En SwiGLU/SILU el error en `gate`/`up` es multiplicativo: cambia patrón de activación antes de la no-linealidad
+  y luego se amplifica al multiplicar por `up` y proyectar con `down`.
+
+Acciones:
+
+- [ ] Definir un score de calidad **a nivel FFN compuesto**:
+      - score primario: `cos_mean` + `cos_p05` de la salida del bloque:
+        - `FFN(x)=W_down(silu(W_gate x) ⊙ (W_up x))`
+        - `\hat{FFN}(x)=\hat W_down(silu(\hat W_gate x) ⊙ (\hat W_up x))`
+      - score secundario (drift): `mean/var` y colas (p05/p95) de `h` y de la salida del bloque.
+      - dataset/activaciones: usar activaciones reales `x` (mismo texto/calib usado para imatrix o un pack representativo).
+      - decisión v1:
+        - `gate/up` solo si el **FFN-score** pasa (no basta con `cos_x_w` por tensor).
+        - `down` puede seguir con gating por tensor mientras FFN-score no esté disponible.
+- [ ] Explorar políticas “down-only por defecto”:
+      - habilitar SeedΔ en `ffn_down` más agresivamente,
+      - requerir thresholds más altos o score FFN compuesto para permitir SeedΔ en `gate/up`.
+
+---
+
+## 6) Δ por etapas y K por subcapa/bloque
+
+### 6.1) Δ por etapas (multi-stage)
+
+Idea: aproximar el residual en varias etapas pequeñas:
+
+- `\hat W = W_0 + Δ_1 + Δ_2 + ... + Δ_m`, donde cada `Δ_s` tiene presupuesto K pequeño y corrige el residual del residual.
+- Análogo a matching pursuit/OMP: el primer top-K es miope; stages sucesivos pueden capturar estructura que el primer corte no vio.
+
+Acciones:
+
+- [ ] Diseñar un esquema de builder “multi-stage”:
+      - número de stages `m` pequeño (p.ej. 2–3), con K decreciente o constante.
+      - gating y report JSON por stage (para ver ganancia marginal de cada `Δ_s`).
+- [ ] Definir condición de stop (no “stages infinitos”):
+      - permitir `stage+1` solo si mejora el score funcional > X% o reduce error > Y por costo adicional.
+      - si no hay ganancia marginal clara, no agregar stages (evita matar perf/complexidad).
+- [ ] Definir un presupuesto total de compute/memoria por tensor:
+      - limitar `Σ_s K_s` y el número de stages en función de la ganancia observada en métricas funcionales.
+
+### 6.2) K por subcapa/bloque (tiles)
+
+Idea: dividir la matriz en tiles y asignar K distinto según “importancia/dificultad”:
+
+- tiles alineados con el `block` (32/64) y con el layout de cache.
+- pocos niveles de K (p.ej. {256, 512, 1024, 1536}) para evitar explosión de combinatoria.
+
+Acciones:
+
+- [ ] Definir una factorización por tiles (filas/columnas o bloques 2D) y medir curva “error vs K” por tile.
+- [ ] Formular un “knapsack suave” implementable (greedy allocate):
+      - medir “beneficio por +ΔK” en un subconjunto de tiles (top‑N por importancia imatrix),
+      - asignar K por niveles hasta consumir presupuesto total (sin solver exacto).
+- [ ] Exponer en policy una forma simple de esto:
+      - p.ej. `K_levels` globales + reglas por rango de filas/cols/subcapa (stack inferior, media, superior).
+
+---
+
+## 7) Control global de stack-safety (presupuesto de error acumulado)
+
+Razonamiento:
+
+- El error no se suma linealmente, se **encadena** a través de capas y no-linealidades.
+- Un gating por tensor puede aceptar muchos deltas “borderline” que, al apilarse, degradan PPL y greedy.
+
+Acciones:
+
+- [ ] Definir un “presupuesto de stack” global por modelo/config:
+      - máximo número de tensores SeedΔ activos por tipo (`gate/up/down`) y por bloque (FFN/attn).
+      - reglas más estrictas (umbrales más altos) cuando el stack_budget potencial crece.
+- [ ] Hacer el budget más inteligente con un “coste ponderado” (no solo conteo):
+      - intuición: tensores borderline (cola p05 baja) consumen más presupuesto que tensores muy buenos.
+      - ejemplo conceptual:
+        - `cost = α·(1 - cos_mean) + β·(1 - cos_p05)` (por tensor, usando métrica funcional si existe).
+        - permitir más tensores si son “muy buenos” y cortar rápido si son borderline.
+- [ ] Integrar stack-safety en policy:
+      - campos tipo `stack_budget.max_tensors`, `stack_budget.max_gate_up`, etc.
+      - decisiones claras en report JSON cuando un tensor no se activa por exceder presupuesto global.
