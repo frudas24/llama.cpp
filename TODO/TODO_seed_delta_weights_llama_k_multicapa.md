@@ -1,5 +1,12 @@
 # TODO — SeedΔ: mecanismo K multicapa (`--policy`) + gating + autotune (builder)
 
+> Nota de pivote (2025-12-18): todo el backlog de optimización fina
+> (perf `W0x`, multi-precisión, activaciones reales, targets extra como QKV/O
+> y embeddings) se sigue rastreando ahora en
+> `TODO_seed_delta_weights_k_layer_sublayer.md`. Este documento queda
+> centrado en el builder/policy/gating/autotune y en los resultados de
+> experiments multicapa.
+
 Este documento define un mecanismo **data-aware y seguro** para escalar SeedΔ a *muchas capas* sin colapsar calidad (loops tipo “now…”) usando:
 
 - **Policy JSON** para defaults + overrides por capa + overrides por tensor (`ffn_gate`, `ffn_up`, `ffn_down`).
@@ -320,32 +327,21 @@ Campos recomendados (para forense y reproducibilidad):
 - [x] “Unsafe tensor” metadata: si builder falla gating, marcar explícitamente (para auditar sin abrir JSON).
   - se escribe por tensor en KV (v1): `seeddelta.blk.N.<kind>.gating_pass`, `...enabled`, `...strip_dense`, `...K`.
 
-### Perf / RAM (sigue siendo el cuello)
+### Perf / RAM, data-aware y targets extra
 
-- [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
-- [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
-- [ ] Clarificar repack vs RSS: tener medición consistente (time -v + logs) y explicar picos vs steady.
-- [ ] Instrumentar stack-safety: medir cuántos tensores pasan por policy vs cuántos terminan activos tras endurecer thresholds.
-  - Reportar en `build.stack_budget` para correlacionar con estabilidad.
+El backlog detallado de optimización de `W0x` / layout, mejoras data-aware (activaciones reales,
+multi-precisión como fuente) y expansión a QKV/O, embeddings y LM head se mantiene ahora en:
 
-### Calidad / data-aware “de verdad”
+- `TODO_seed_delta_weights_k_layer_sublayer.md`
 
-- [ ] Mejorar dataset para imatrix por modelo (no depender de `gemma_calibration.txt` para todo).
-- [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar `||WX - ŴX||` más allá de imatrix diagonal.
-- [ ] Explorar construir SeedΔ desde F16/Q8 como fuente (evitar “loss-on-loss” de Q4).
-- [ ] Validar gating multi-precisión: repetir builder + policy en al menos tres precisiones (FP16, Q8, Q4) para el mismo modelo y documentar diferencias de cos/stack_budget.
-- [ ] Añadir `--source-precision` metadata al GGUF/export para rastrear con qué precisión se generó SeedΔ.
-
-### Expandir targets (Fase 5)
-
-- [ ] Probar policy/gating en QKV/O con budgets conservadores (solo si gating indica que hay margen).
-- [ ] Embeddings/LM head solo con gating ultra estricto.
+Dentro de este documento mantenemos solo el estado del builder/policy/gating/autotune y los
+resultados de los experimentos actuales; el diseño fino de K por capa/subcapa y las optimizaciones
+de rendimiento/quality cross-model viven en el nuevo TODO.
 
 ### Modelos y pruebas cruzadas
 
 - [x] Inventario de modelos locales (`~/.cache/llama.cpp/*.gguf`) con tamaño, quant y tags SeedΔ (script helper `scripts/model-inventory.sh`).
 - [x] Bajar al menos un modelo “llama-like” en Q8/F16 (p.ej. Mistral 7B o Llama 3.1 8B) para validar que SeedΔ escala cuando el target es limpio. (Descargado `mistral-7b-instruct-v0.2.Q8_0.gguf` + `calibration/mistral7b.imatrix.gguf`; corrido policy-eval con varias policies y exportada una policy estable down-only 14–23).
-- [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating para detectar regresiones temprano.
 
 ---
 
@@ -478,3 +474,150 @@ Próximos pasos derivados:
   - añadir caps explícitos (máximo N tensores emitidos por tipo y M totales) además de thresholds por tensor,
   - exponer estos caps en la policy (`stack_budget`) y reflejarlos en el report.
 - Replicar el patrón “pocos tensores de alta calidad” en otros modelos (Gemma 3 4B, Devstral 24B) antes de perseguir compresión agresiva.
+
+---
+
+## 14) Notas de investigación 2025-12-18 (Kimiko Mistral 7B FP16 vs Q8 y harness PPL+greedy)
+
+### 14.1) Conversión Kimiko FP16 → GGUF y baseline
+
+- Modelo HF: `TheBloke/Kimiko-Mistral-7B-fp16` (base Mistral 7B, FP16).
+- Conversión a GGUF F16:
+  - Script: `convert_hf_to_gguf.py` con venv local (`.venv`), `torch`, `transformers`, `sentencepiece`.
+  - Directorio snapshot HF: `/home/devgpt/.cache/huggingface/hub/models--TheBloke--Kimiko-Mistral-7B-fp16/snapshots/<commit>`, con `config.json`, `tokenizer.json`, `pytorch_model-0000{1,2}-of-00002.bin`, `pytorch_model.bin.index.json`.
+  - Comando efectivo:
+    - `python convert_hf_to_gguf.py --outfile /home/devgpt/models/Kimiko-Mistral-7B-fp16.gguf --outtype f16 <snapshot_dir>`
+  - Resultado:
+    - GGUF FP16: `/home/devgpt/models/Kimiko-Mistral-7B-fp16.gguf` (~13.5 GiB, `file_type = F16`, 7.24B params).
+- Baseline PPL (wikitext-2, ctx=512, chunks=4, t=8):
+  - `llama-perplexity -m Kimiko-Mistral-7B-fp16.gguf -f wiki.test.raw --chunks 4 -t 8 -c 512 --no-warmup`
+  - PPL ≈ **6.09 ± 0.45**.
+  - Host RAM ≈ 13.8 GiB modelo + 256 MiB KV + 109 MiB compute ≈ 14.2 GiB.
+- Comparación con Mistral Q8 instruct:
+  - Q8 baseline (Mistral instruct) PPL ≈ **7.30 ± 0.63** en la misma configuración.
+  - FP16 (Kimiko) es claramente mejor en PPL (como cabe esperar de una FP16 fine-tuned).
+
+### 14.2) Imatrix FP16 y policy down-only 14–23
+
+- Imatrix FP16:
+  - `llama-imatrix -m Kimiko-Mistral-7B-fp16.gguf -f wiki.test.raw -o calibration/kimiko_mistral7b_fp16.imatrix.gguf -t 8 -c 512 --no-ppl --chunks 8`
+  - Ruta: `calibration/kimiko_mistral7b_fp16.imatrix.gguf` (~4.8 MiB).
+- Policy aplicada (misma que en Q8):
+  - `tools/seeddelta-build/policies/policy.mistral7b.abl.layers14-23.down-only.json`
+    - Solo `ffn_down` en capas 14–23.
+    - Thresholds fuertes: `cos_x_w_mean ≥ 0.60`, `cos_x_w_p05 ≥ 0.45` para down.
+- Build FP16:
+  - `scripts/seeddelta-policy-eval.sh --base Kimiko-Mistral-7B-fp16.gguf --policy policy.mistral7b.abl.layers14-23.down-only.json --layers 14-23 --imatrix calibration/kimiko_mistral7b_fp16.imatrix.gguf --text wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --outdir calibration/seeddelta-policy-eval-kimiko-fp16-down-14-23`
+  - Output model: `calibration/seeddelta-policy-eval-kimiko-fp16-down-14-23/model_sd.gguf` (~14.5 GiB).
+  - `report.json` muestra, igual que en Q8:
+    - `stack_pass_gate_up = 0`, `stack_pass_down = 1`.
+    - Solo `blk.23.ffn_down` con `emit = true`, `strip_dense = false`, `block=32`, `K=1536`, `gating_pass = true`.
+- PPL FP16 con SeedΔ down-only 14–23:
+  - `llama-perplexity -m model_sd.gguf -f wiki.test.raw --chunks 4 -t 8 -c 512 --no-warmup --seeddelta`
+  - PPL ≈ **6.37 ± 0.48** (vs 6.09 base FP16).
+  - Degradación muy similar a la observada en Q8 (`7.30 → ~7.58`).
+  - Host RAM prácticamente igual a base (~14.2 GiB); down-only en una capa no reduce mucho footprint FP16.
+
+### 14.3) Policy stack-strict 19–23 en FP16 (vs Q8)
+
+- Policy usada: `tools/seeddelta-build/policies/policy.mistral7b.stack-strict.19-23.json` (la misma que en Mistral Q8).
+  - Umbrales fuertes:
+    - `cos_x_w_mean ≥ 0.60`, `cos_x_w_p05 ≥ 0.45` para gate/up.
+    - `cos_x_w_mean ≥ 0.50`, `cos_x_w_p05 ≥ 0.35` para down.
+  - Autotune habilitado en gate/up/down, `K` creciente por schedule.
+- Build FP16:
+  - `scripts/seeddelta-policy-eval.sh --base Kimiko-Mistral-7B-fp16.gguf --policy policy.mistral7b.stack-strict.19-23.json --layers 19-23 --imatrix calibration/kimiko_mistral7b_fp16.imatrix.gguf --text wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --outdir calibration/seeddelta-policy-eval-kimiko-fp16-strict-19-23`
+  - Output: `calibration/seeddelta-policy-eval-kimiko-fp16-strict-19-23/model_sd.gguf`.
+  - `report.json`:
+    - `stack_pass_gate_up = 3`, `stack_pass_down = 2` (5 tensores emitidos en 19–23).
+    - Similar al caso Q8 (Q8 tenía `stack_pass_gate_up = 2`, `stack_pass_down = 3`).
+- PPL FP16 con stack-strict 19–23:
+  - `llama-perplexity -m model_sd.gguf -f wiki.test.raw --chunks 4 -t 8 -c 512 --no-warmup --seeddelta`
+  - PPL ≈ **8.44 ± 0.66**.
+  - Comparación:
+    - FP16 base: 6.09 → strict 19–23: 8.44 (Δ ≈ +2.35).
+    - Q8 base (Mistral instruct): 7.30 → strict 19–23: ~10.7 (Δ ≈ +3.4).
+  - Conclusión:
+    - FP16 tolera algo mejor el stack de 5 tensores (sube menos la PPL que Q8), pero sigue siendo una degradación significativa.
+    - El patrón “1–3 tensores ok, 5+ tensores ya duelen” se mantiene tanto en Q8 como en FP16.
+
+### 14.4) Harness PPL + greedy (por qué Wikitext no basta)
+
+- Wikitext(-2) es útil pero no suficiente:
+  - **Sí sirve para**:
+    - regresiones rápidas y comparables entre builds (score numérico estable),
+    - detectar acumulación grave de error cuando apilar deltas hace explotar la PPL,
+    - A/B consistente manteniendo `ctx`, `chunks`, `seed`, etc.
+  - **No basta para** el objetivo de “no romper instruct/chat”:
+    - modelos instruct (Qwen, Mistral/Kimiko) están ajustados a chat/instrucciones; puedes tener PPL aceptable pero respuestas zombis (loops, cambio de idioma, violación de instrucciones).
+    - el síntoma real es funcional (greedy `temp=0, top-k=1`), no solo de PPL.
+- Regla práctica:
+  - Si un build sube PPL poco pero degrada greedy → **greedy manda** (máximo cuidado).
+  - Si greedy parece bien pero PPL explota → alerta de degradación latente (aparecerá en prompts/dominios distintos).
+
+### 14.5) Prompt pack minimalista para detección de “zombies”
+
+Harness recomendado (además de Wikitext) para estabilidad instruct/chat en greedy:
+
+- Settings:
+  - `--temp 0 --top-k 1 --seed 1 --single-turn -n 128`
+  - No usar `--ignore-eos` aquí (facilita loops); solo si queremos forzar.
+- Prompt pack sugerido (20 prompts, mezcla es/en/código/instrucciones):
+  - P01_greeting_es: saludo + pregunta en español, 1 frase cada uno.
+  - P02_concise_bullets: overfitting en 3 viñetas, ≤12 palabras por viñeta.
+  - P03_follow_instruction_single_word: responder solo “listo”.
+  - P04_anti_loop_constraint: exactamente 2 oraciones, sin repetir ninguna palabra, tema “persistencia de caché”.
+  - P05_translation_control: traducción al inglés de una frase en español.
+  - P06_math_exact: 17*23, solo número.
+  - P07_short_reasoning: 2 razones sobre repetición vs mezcla de idiomas.
+  - P08_json_strict: JSON válido con `{"task":"", "lang":"es", "steps":[...]}`.
+  - P09_code_go_snippet: snippet Go corto con backoff exponencial (≤25 líneas).
+  - P10_code_explain: explicación de un comando `time -v ./llama-cli ...`.
+  - P11_regex: regex para 3 repeticiones consecutivas de misma palabra (case-insensitive).
+  - P12_sql: query Postgres para top-10 usuarios por eventos en 24h.
+  - P13_yaml: YAML con threads/ctx/temp/top_k/seed.
+  - P14_micro_summary: 1 oración sobre “policies evitan zombies, apilar rompe PPL”.
+  - P15_spanish_only_guard: explicar “latencia” en 2 oraciones, solo español.
+  - P16_programming_short: línea sobre diferencia stack vs heap (en español).
+  - P17_error_style: mensaje de error corto para “policy JSON inválida: key desconocida”.
+  - P18_list_no_repeat: 8 palabras distintas relacionadas con compresión.
+  - P19_instruction_priority: “qué detecta antes zombie, PPL o greedy?” (≤20 palabras, español).
+  - P20_exit: responder solo `/exit`.
+
+Uso recomendado:
+
+- Correr el pack en greedy para base y modelo SeedΔ y verificar:
+  - ausencia de loops claros (“now now now…”, repeticiones largas),
+  - respeto de idioma (prompts en español no se deriven a inglés sin razón),
+  - obediencia de instrucciones duras (P03, P08, P20).
+- Combinar este gate con PPL en Wikitext:
+  - FP16 + down-only 23: PPL sube poco y greedy se mantiene sano → aceptable como preset estable.
+  - FP16 + strict 19–23: PPL ~8.44 (sube mucho) → aunque greedy no colapse, es candidato a “preset agresivo solo para experimentos”.
+
+Implementación práctica:
+
+- [x] Archivo de prompts: `calibration/greedy_zombie_pack.txt` (20 prompts P01–P20_sentinel, texto igual al de esta sección).
+- [x] Runner dedicado: `scripts/seeddelta-greedy-pack.sh`:
+  - args: `--base BASE.gguf --sd SD.gguf [--pack FILE] [--outdir DIR]`.
+  - fija `--temp 0 --top-k 1 --seed 1 --single-turn -n 128`.
+  - genera outputs en `OUTDIR/{base,sd,diff}` y un resumen con:
+    - `rep` (repetición máxima de palabra),
+    - `drift` (proxy de ratio de ASCII en prompts que deberían ser solo español),
+    - `STRICT_FAIL` para P03/P20 si no se respeta exactamente “listo” / “fin”.
+  - imprime `RESULT: PASS` si `Prompts flagged = 0`, si no `RESULT: FAIL`.
+- [x] Integración en `scripts/seeddelta-policy-eval.sh`:
+  - flag: `--greedy-pack FILE`.
+  - si se pasa, al final ejecuta `scripts/seeddelta-greedy-pack.sh` con el modelo base y el SeedΔ recién construido, dejando logs en:
+    - `OUTDIR/greedy_pack/` y `OUTDIR/greedy_pack.log`.
+
+Ejemplo de uso (remoto Mistral 7B Q8):
+
+- Comando:
+  - `./scripts/seeddelta-policy-eval.sh --base ../models/mistral-7b-instruct-v0.2.Q8_0.gguf --policy tools/seeddelta-build/policies/policy.mistral7b.abl.layers14-23.down-only.json --layers 14-23 --imatrix calibration/mistral7b.imatrix.gguf --text wikitext-2-raw/wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --greedy-pack calibration/greedy_zombie_pack.txt --outdir calibration/seeddelta-policy-eval-mistral-q8-down-14-23-greedy`
+- Resultado greedy (SeedΔ) para “down-only 14–23, Q8”:
+  - Muchos prompts con `drift ~0.98–1.00` en casos que deberían ser solo español.
+  - P03 (`listo`) y P20 (`fin`) marcados como `STRICT_FAIL`.
+  - Resumen: `Prompts flagged: 11/20`, `RESULT: FAIL`.
+- Interpretación:
+  - Aunque la PPL en Wikitext solo sube moderadamente (~7.30 → ~7.58), el comportamiento instruct/chat cambia de forma fuerte (drift a inglés + fallos de instrucciones duras).
+  - El harness greedy confirma que este preset “down-only 14–23” en Mistral Q8 no es aceptable como policy estable; se mantiene como preset experimental.
