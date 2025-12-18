@@ -25,8 +25,12 @@ cuando se implementen.
 
   * *Tiles por filas*: rangos contiguos de filas de la matriz ($W \in \mathbb{R}^{n_{out}\times n_{in}}$).
   * Cada tile $t$ define una submatriz ($W_t = W[r_t:r_{t+1}, :]$).
-  * Restricción v1: los límites $r_t$ están alineados a `block_rows` (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
-    * Nota: `block_rows` aquí es la granularidad de filas del tile; no confundir con `--block` del scheme residual.
+  * Parámetros v1:
+    * `tile_rows`: filas por tile (altura del tile). Debe mantenerse fijo por run (comparabilidad).
+      * Recomendación v1: `tile_rows = 1024` (o `tile_rows = n_out/4` cuando aplique) y el último tile puede ser más pequeño.
+    * `tile_rows_align`: alineación de `tile_rows` y límites $r_t$ (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
+      * Nota: `tile_rows_align` es solo granularidad del tile; no confundir con `--block` del scheme residual.
+  * Restricción v1: los límites $r_t$ están alineados a `tile_rows_align`.
   * Ejemplo: `ffn_down` con `n_out=4096`, tiles por filas: `[0..1023]`, `[1024..2047]`, `[2048..3071]`, `[3072..4095]`.
 
 * **K por tile (v1)**:
@@ -35,10 +39,12 @@ cuando se implementen.
   * K se interpreta como **presupuesto de sparsidad del residual** *en ese tile*.
   * Definición v1 (para evitar dobles interpretaciones):
 
-    * **Si el residual es block-sparse**: $K_t$ = máximo número de **bloques** activos por fila dentro del tile.
+    * **Si el residual es block-sparse 2D (scheme `block`)**:
+      * Un **bloque** es una submatriz 2D de tamaño $B\times B$, donde $B$ viene del parámetro `--block` del scheme residual (v1: bloques cuadrados).
+      * $K_t$ = máximo número de bloques 2D activos por **row-block** (grupo de $B$ filas) dentro del tile.
     * **Si el residual es COO-like por filas**: $K_t$ = máximo número de **entradas** activas por fila dentro del tile.
   * (Nota) No mezclar definiciones: el builder debe declarar explícitamente cuál aplica según `--scheme`.
-  * (Nota) Si internamente se agrupan filas en `block_rows`, debe ser una optimización; no cambia la semántica de $K_t$.
+  * (Nota) Si internamente se agrupan filas en `tile_rows_align`, debe ser una optimización; no cambia la semántica de $K_t$.
 
 * **Stage (multi-stage Δ)**:
 
@@ -222,7 +228,13 @@ Acciones:
     r_i=\frac{\|\hat y_i\|_2}{\|y_i\|_2+\epsilon}
     $$
     Reportar: `ffn_norm_ratio_mean` + `p05/p95`.
-  * Dataset/activaciones: usar activaciones reales (x_i) (mismo texto/calib usado para imatrix o un pack representativo).
+    Además, para budgets acumulativos, reportar log-ratio:
+    $$
+    \ell_i=\log(r_i)
+    $$
+    Reportar: `ffn_log_norm_ratio_mean = mean_i(\ell_i)` + `p05/p95`.
+  * Dataset/activaciones: usar activaciones reales $x_i$ **a la entrada del FFN** (post-norm del bloque, pre matmul `gate/up`)
+    (mismo texto/calib usado para imatrix o un pack representativo).
   * Decisión v1:
 
     * permitir tocar `gate/up` **solo si** el **FFN-score** pasa (no basta con `cos_x_w` por tensor).
@@ -273,7 +285,7 @@ Acciones:
 
 Idea: dividir la matriz en tiles y asignar K distinto según “importancia/dificultad”:
 
-* tiles alineados con `block_rows` (32/64) y con el layout de cache.
+* tiles alineados con `tile_rows_align` (32/64) y con el layout de cache.
 * pocos niveles de K (p.ej. {256, 512, 1024, 1536}) para evitar explosión de combinatoria.
 
 Acciones:
@@ -316,16 +328,19 @@ Acciones:
 
     * clamp: `cos := clamp(cos, -1, 1)`
     * $$
-      cost = \alpha(1-\bar c) + \beta(1-c_{p05})
+      cost = \max\big(0,\ \alpha(\tau_{mean}-\bar c) + \beta(\tau_{p05}-c_{p05})\big)
       $$
     * Definición de métricas para `\bar c` y `c_{p05}`:
       * mientras no exista FFN-score: usar `cos_mean_x_w` y `cos_p05_x_w` del tensor.
       * cuando exista FFN-score: para `gate/up` usar `ffn_cos_mean` y `ffn_cos_p05` (sección 5).
-    * (opcional v2) penalizar drift de escala si está disponible:
+    * Definición de targets `\tau_*` (para que tensores “muy buenos” no paguen coste):
+      * v1 (configurable, por tipo): targets más altos para `gate/up` que para `down`.
+      * Ejemplo inicial: `gate/up`: `\tau_{mean}=0.70`, `\tau_{p05}=0.55`; `down`: `\tau_{mean}=0.60`, `\tau_{p05}=0.45`.
+    * (opcional v2) penalizar drift de escala si está disponible (preferir log-ratio):
       $$
-      cost = cost + \gamma\,|\log(\bar r)|
+      cost = cost + \gamma\,|\bar \ell|
       $$
-      donde $\bar r$ es `norm_ratio_mean` (o `ffn_norm_ratio_mean` si existe).
+      donde $\bar \ell$ es `ffn_log_norm_ratio_mean` (y si no existe, aproximar con `log(norm_ratio_mean)`).
   * permitir más tensores si son “muy buenos” y cortar rápido si son borderline.
 
 * [ ] Integrar stack-safety en policy:
