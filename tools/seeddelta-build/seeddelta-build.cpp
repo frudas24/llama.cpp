@@ -1381,6 +1381,8 @@ static bool eval_ffn_proxy_coo_replace_one(
         const ggml_tensor * W_down,
         const std::vector<int32_t> & d_idx,
         const std::vector<float> & d_val,
+        const base_fit * base,
+        bool write_base,
         int64_t K,
         int64_t eval_x,
         int64_t eval_cols,
@@ -1393,6 +1395,11 @@ static bool eval_ffn_proxy_coo_replace_one(
         return false;
     }
 
+    if (kind == "ffn_down") {
+        // v0 proxy: not supported for down (would require approximating W_down weights tile-wise).
+        return false;
+    }
+
     const int64_t n_in = W_gate->ne[0];
     const int64_t n_hidden = W_gate->ne[1];
     const int64_t n_out = W_down->ne[1];
@@ -1400,6 +1407,11 @@ static bool eval_ffn_proxy_coo_replace_one(
     const int64_t n_x = std::min<int64_t>(eval_x, 128);
     const int64_t n_hidden_samp = std::min<int64_t>(n_hidden, eval_cols > 0 ? eval_cols : 128);
     const int64_t n_out_samp = std::min<int64_t>(n_out, eval_cols > 0 ? eval_cols : 128);
+
+    const bool have_base = write_base && base && base->L > 0 && base->B > 0;
+    const bool is_tall = n_out >= n_in;
+    const int64_t L = have_base ? base->L : 0;
+    const int64_t B = have_base ? base->B : 0;
 
     std::mt19937 rng(seed);
     std::vector<int64_t> hid_idx(n_hidden);
@@ -1458,6 +1470,59 @@ static bool eval_ffn_proxy_coo_replace_one(
         return acc;
     };
 
+    // Base helpers for gate/up (same input dim as n_in).
+    std::vector<std::vector<int64_t>> cols_in_block;
+    std::vector<int64_t> pos_in_block;
+    std::vector<float> x_hat;
+    std::vector<float> x_chunk;
+    std::vector<float> v;
+    std::vector<float> tmp;
+    std::vector<float> y_base;
+    if (have_base) {
+        tmp.resize((size_t) L);
+        v.resize((size_t) L);
+        y_base.resize((size_t) L);
+        if (is_tall) {
+            x_hat.resize((size_t) L);
+            cols_in_block.resize((size_t) B);
+            pos_in_block.resize((size_t) n_hidden_samp);
+            for (int64_t hi = 0; hi < n_hidden_samp; ++hi) {
+                const int64_t col_idx = hid_idx[(size_t) hi];
+                const int64_t b = col_idx / L;
+                if (b >= 0 && b < B) {
+                    cols_in_block[(size_t) b].push_back(hi);
+                    pos_in_block[(size_t) hi] = col_idx - b * L;
+                }
+            }
+        } else {
+            x_chunk.resize((size_t) L);
+        }
+    }
+
+    auto base_col_dot = [&](int64_t col_idx, const std::vector<float> & xv) -> double {
+        if (!have_base) return 0.0;
+        if (is_tall) {
+            for (int64_t i = 0; i < n_in; ++i) x_hat[(size_t) i] = xv[(size_t) i];
+            for (int64_t i = n_in; i < L; ++i) x_hat[(size_t) i] = 0.0f;
+            const int64_t b = col_idx / L;
+            const int64_t p = col_idx - b * L;
+            if (b < 0 || b >= B) return 0.0;
+            apply_base_block_f32(x_hat.data(), v.data(), tmp.data(), *base, b);
+            return (p >= 0 && p < L) ? (double) v[(size_t) p] : 0.0;
+        } else {
+            std::fill(y_base.begin(), y_base.end(), 0.0f);
+            for (int64_t b = 0; b < B; ++b) {
+                const int64_t in0 = b * L;
+                const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
+                for (int64_t i = 0; i < in1 - in0; ++i) x_chunk[(size_t) i] = xv[(size_t) (in0 + i)];
+                for (int64_t i = in1 - in0; i < L; ++i) x_chunk[(size_t) i] = 0.0f;
+                apply_base_block_f32(x_chunk.data(), v.data(), tmp.data(), *base, b);
+                for (int64_t i = 0; i < L; ++i) y_base[(size_t) i] += v[(size_t) i];
+            }
+            return (col_idx >= 0 && col_idx < L) ? (double) y_base[(size_t) col_idx] : 0.0;
+        }
+    };
+
     for (int64_t xi = 0; xi < n_x; ++xi) {
         for (int64_t i = 0; i < n_in; ++i) {
             x[(size_t) i] = nd(rng);
@@ -1472,10 +1537,10 @@ static bool eval_ffn_proxy_coo_replace_one(
 
             double g_hat = g_true;
             double u_hat = u_true;
-            if (kind == \"ffn_gate\") {
-                g_hat = dot_delta_col(h, x);
-            } else if (kind == \"ffn_up\") {
-                u_hat = dot_delta_col(h, x);
+            if (kind == "ffn_gate") {
+                g_hat = (have_base ? base_col_dot(h, x) : 0.0) + dot_delta_col(h, x);
+            } else if (kind == "ffn_up") {
+                u_hat = (have_base ? base_col_dot(h, x) : 0.0) + dot_delta_col(h, x);
             }
             gate_hat[(size_t) hi] = g_hat;
             up_hat[(size_t) hi]   = u_hat;
@@ -3040,10 +3105,11 @@ int main(int argc, char ** argv) {
 
                 ffn_proxy_metrics fpm;
                 const int proxy_seed = seed + (int) il * 101 + (int) (kind == "ffn_gate" ? 1 : (kind == "ffn_up" ? 2 : 3));
-                if (eval_ffn_proxy_coo_replace_one(kind, W_gate, W_up, W_down, d_idx, d_val, K_eff, eval_x, eval_cols, proxy_seed, fpm)) {
+                bool proxy_ok = eval_ffn_proxy_coo_replace_one(kind, W_gate, W_up, W_down, d_idx, d_val, write_base ? &base : nullptr, write_base, K_eff, eval_x, eval_cols, proxy_seed, fpm);
+                if (proxy_ok) {
                     re.ffn_proxy_available = true;
                     re.ffn_proxy_scope = "replace_only_current_tensor";
-                    re.ffn_proxy_base_used = false;
+                    re.ffn_proxy_base_used = write_base;
                     re.ffn_proxy_eval_x = fpm.eval_x;
                     re.ffn_proxy_eval_out = fpm.eval_out;
                     re.ffn_proxy_seed = proxy_seed;
@@ -3055,11 +3121,11 @@ int main(int argc, char ** argv) {
                     re.ffn_proxy_log_norm_ratio_p95 = fpm.log_norm_ratio_p95;
                 } else {
                     re.ffn_proxy_available = false;
-                    re.ffn_proxy_reason = "proxy_unavailable";
+                    re.ffn_proxy_reason = (kind == "ffn_down") ? "proxy_kind_not_supported" : "proxy_unavailable";
                 }
             } else {
                 re.ffn_proxy_available = false;
-                re.ffn_proxy_reason = write_base ? "proxy_requires_no_base" : "proxy_requires_coo_evalx";
+                re.ffn_proxy_reason = (eval_x <= 0) ? "proxy_requires_eval_x" : "proxy_requires_coo";
             }
 
             // Stack-cost (v1): simple affine penalty vs targets; zero if not emitted or metric missing.
