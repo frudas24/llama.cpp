@@ -54,21 +54,6 @@ struct stack_safety_tracker {
     }
 };
 
-static void finalize_report_entry(report_entry & e) {
-    if (e.metric_used.empty()) {
-        e.metric_used = e.gating_metric_used;
-    }
-    if (e.target_tau_mean == 0.0) {
-        e.target_tau_mean = e.gating_min_mean;
-    }
-    if (e.target_tau_p05 == 0.0) {
-        e.target_tau_p05 = e.gating_min_p05;
-    }
-    if (e.reject_reason.empty()) {
-        e.reject_reason = e.decision_reason;
-    }
-}
-
 static void usage(const char * argv0) {
     printf("usage: %s -i in.gguf -o out.gguf [options]\n\n", argv0);
     printf("options:\n");
@@ -1934,6 +1919,21 @@ struct report_entry {
     int64_t autotune_selected_budget = 0;
     std::vector<autotune_attempt> autotune_attempts;
 };
+
+static void finalize_report_entry(report_entry & e) {
+    if (e.metric_used.empty()) {
+        e.metric_used = e.gating_metric_used;
+    }
+    if (e.target_tau_mean == 0.0) {
+        e.target_tau_mean = e.gating_min_mean;
+    }
+    if (e.target_tau_p05 == 0.0) {
+        e.target_tau_p05 = e.gating_min_p05;
+    }
+    if (e.reject_reason.empty()) {
+        e.reject_reason = e.decision_reason;
+    }
+}
 
 struct pending_tensor_set {
     ggml_context * ctx = nullptr;
