@@ -2171,6 +2171,7 @@ int main(int argc, char ** argv) {
     std::vector<pending_tensor_set> pending;
     std::unordered_set<std::string> strip_weights;
     bool any_strip = false;
+    double stack_cost_running = 0.0;
 
     const int64_t K_default = std::max<int64_t>(1, K);
     const int64_t K_gate_eff = (K_gate > 0 ? K_gate : K_default);
@@ -2822,6 +2823,25 @@ int main(int argc, char ** argv) {
 
             const int64_t n_blocks_keep = re.n_blocks;
             const int64_t K_eff = re.K;
+
+            // Stack-cost (v1): simple affine penalty vs targets; zero if not emitted or metric missing.
+            {
+                const double metric_mean = re.gating_value;
+                const double metric_p05  = re.gating_p05;
+                const double tau_mean    = re.target_tau_mean;
+                const double tau_p05     = re.target_tau_p05;
+                double cost_delta = 0.0;
+                if (re.emit && std::isfinite(metric_mean) && std::isfinite(metric_p05)) {
+                    const double d_mean = std::max(0.0, tau_mean - metric_mean);
+                    const double d_p05  = std::max(0.0, tau_p05  - metric_p05);
+                    cost_delta = d_mean + d_p05; // weights (alpha=beta=1) v1
+                }
+                re.stack_cost_delta = cost_delta;
+                re.stack_cost_total = stack_cost_running + (re.emit ? cost_delta : 0.0);
+                if (re.emit) {
+                    stack_cost_running = re.stack_cost_total;
+                }
+            }
 
             if (!re.emit) {
                 finalize_report_entry(re);

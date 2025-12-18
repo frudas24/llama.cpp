@@ -15,7 +15,7 @@ para el diseño del builder/policy/gating/autotune y resultados actuales.
 Estado rápido (marcar avances):
 
 - [x] Schema de `report.json` extendido (metric_used/targets_used, reject_reason, tiles/K_custom, stack_cost_* placeholders).
-- [ ] Calcular y volcar `stack_cost_*` real (usando tau_* por métrica).
+- [x] Calcular y volcar `stack_cost_*` v1 (tau_* desde gating, coste = max(0, d_mean+d_p05), alpha=beta=1).
 - [ ] Poblar k_per_tile/unique_k_count/tiles_* cuando haya tiles/K_custom; hoy quedan vacíos.
 - [ ] FFN-score compuesto implementado y usado en report/gating.
 
