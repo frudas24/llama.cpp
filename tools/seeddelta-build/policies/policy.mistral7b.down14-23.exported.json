@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": false,
+    "strip_dense": false,
+    "gating": {
+      "metric": "cos",
+      "min_mean": -1.0,
+      "min_p05": -1.0
+    },
+    "autotune": {
+      "enabled": false
+    }
+  },
+  "layers": {
+    "14": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "15": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "16": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "17": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "18": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "19": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "20": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "21": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "22": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": false,
+          "strip_dense": false,
+          "block": 32
+        }
+      }
+    },
+    "23": {
+      "tensors": {
+        "ffn_gate": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_up": {
+          "enabled": false,
+          "strip_dense": false
+        },
+        "ffn_down": {
+          "enabled": true,
+          "strip_dense": false,
+          "block": 32,
+          "K": 1536
+        }
+      }
+    }
+  }
+}

@@ -303,9 +303,10 @@ sd_resolved_tensor sd_policy_resolve(
     if (thr->min_mean.has_value()) out.min_mean = *thr->min_mean;
     if (thr->min_p05.has_value())  out.min_p05  = *thr->min_p05;
 
-    out.gating_enabled = true;
-    out.require_eval_x = (out.metric == sd_metric_kind::cos_x || out.metric == sd_metric_kind::cos_x_w);
-    out.require_imatrix = (out.metric == sd_metric_kind::cos_w || out.metric == sd_metric_kind::cos_x_w);
+    const bool gating_requested = !(out.min_mean < 0.0f || out.min_p05 < 0.0f);
+    out.gating_enabled = gating_requested;
+    out.require_eval_x = gating_requested && (out.metric == sd_metric_kind::cos_x || out.metric == sd_metric_kind::cos_x_w);
+    out.require_imatrix = gating_requested && (out.metric == sd_metric_kind::cos_w || out.metric == sd_metric_kind::cos_x_w);
 
     return out;
 }

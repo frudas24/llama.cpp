@@ -344,7 +344,7 @@ Campos recomendados (para forense y reproducibilidad):
 ### Modelos y pruebas cruzadas
 
 - [x] Inventario de modelos locales (`~/.cache/llama.cpp/*.gguf`) con tamaño, quant y tags SeedΔ (script helper `scripts/model-inventory.sh`).
-- [x] Bajar al menos un modelo “llama-like” en Q8/F16 (p.ej. Mistral 7B o Llama 3.1 8B) para validar que SeedΔ escala cuando el target es limpio. (Descargado `mistral-7b-instruct-v0.2.Q8_0.gguf` + `calibration/mistral7b.imatrix.gguf`; falta correr policy-eval.)
+- [x] Bajar al menos un modelo “llama-like” en Q8/F16 (p.ej. Mistral 7B o Llama 3.1 8B) para validar que SeedΔ escala cuando el target es limpio. (Descargado `mistral-7b-instruct-v0.2.Q8_0.gguf` + `calibration/mistral7b.imatrix.gguf`; corrido policy-eval con varias policies y exportada una policy estable down-only 14–23).
 - [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating para detectar regresiones temprano.
 
 ---
@@ -374,10 +374,10 @@ Campos recomendados (para forense y reproducibilidad):
 ## 12) Plan de ataque inmediato
 
 1. **Stack-safe policy freeze**
-   - Exportar (`--policy-export`) las políticas que ya sabemos estables (Gemma 1B/4B, Qwen 19–20) y versionarlas.
-   - Añadir multiplicadores stack-safety en el builder y revalidar que Qwen siga estable (debe seguir aprobando solo 19–20, pero ahora con thresholds explícitos).
+   - Exportar (`--policy-export`) las políticas que ya sabemos estables (Gemma 1B/4B, Qwen 19–20, Mistral 7B down-only 14–23) y versionarlas.
+   - Añadir multiplicadores stack-safety en el builder y revalidar que Qwen siga estable (debe seguir aprobando solo 19–20, pero ahora con thresholds explícitos) y que Mistral conserve el comportamiento de la policy exportada `tools/seeddelta-build/policies/policy.mistral7b.down14-23.exported.json`.
 2. **Cross-precision baseline**
-   - Descargar un modelo llama-like en Q8/F16 (ej. Mistral 7B) y correr `scripts/seeddelta-policy-eval.sh` con la misma policy para medir cuántas capas pasan.
+   - Para al menos un modelo llama-like (ej. Mistral 7B) comparar Q8 vs FP16: correr `scripts/seeddelta-policy-eval.sh` con la misma policy sobre ambas precisiones y medir cuántas capas/tensores pasan y cómo escala PPL.
    - Documentar en `calibration/` (JSON + eval) la diferencia entre construir SeedΔ desde Q8/FP16 vs Q4 para un mismo rango.
 3. **Model inventory + small-model smoke**
    - Escribir script `scripts/model-inventory.sh` que liste gguf disponibles con quant/size y tags SeedΔ.
@@ -387,3 +387,94 @@ Campos recomendados (para forense y reproducibilidad):
    - Investigar captura ligera de activaciones reales para reemplazar el proxy `eval_x`.
 
 Entrega esperada tras este plan: políticas congeladas + logs de Q8/F16 + inventario de modelos + documentación de stack_budget reales.
+
+---
+
+## 13) Notas de investigación 2025-12-18 (Mistral 7B Q8 y stack-safety)
+
+### 13.1) Setup
+
+- Modelo: `mistral-7b-instruct-v0.2.Q8_0.gguf` (`general.name = mistralai_mistral-7b-instruct-v0.2`, file_type=Q8_0, ~7.17 GiB).
+- Texto de evaluación: `wikitext-2-raw/wiki.test.raw` (`scripts/get-wikitext-2.sh`).
+- Imatrix: `calibration/mistral7b.imatrix.gguf` (8 chunks, ctx=512, t=8, `--no-ppl`).
+- Builder: esquema block32, base xor_circulant (L=4096, B=4, depth=2, samples=2048, perm_trials=4), `--imatrix` on, `--eval-cols 64`, `--eval-x 16`.
+- Runtime: CPU-only (REPACK on, Flash Attention auto), `t=8`, `ctx=512`, `chunks=4`.
+
+Baseline PPL (sin SeedΔ):
+
+- `llama-perplexity -m mistral-7b-instruct-v0.2.Q8_0.gguf -f wiki.test.raw --chunks 4 -t 8 -c 512 --no-warmup`
+- Resultado: `PPL ≈ 7.3049 ± 0.63`.
+
+### 13.2) Policy “base” 14–23 (gate+up+down, agresiva)
+
+- Policy: `tools/seeddelta-build/policies/policy.mistral7b.base.json`.
+- Rango: capas 14–23, block32, K_gate/up=256–640, K_down=512–1536, `cos_x_w` con thresholds medios.
+- Run: `scripts/seeddelta-policy-eval.sh --base mistral.Q8 --policy policy.mistral7b.base.json --layers 14-23 --imatrix mistral7b.imatrix.gguf --text wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --outdir calibration/seeddelta-policy-eval-mistral-base-14-23`.
+- Report:
+  - `stack_pass_gate_up = 3`, `stack_pass_down = 10`.
+  - `emit = true` en 13 tensores (combinación de gate/up/down en 14–23).
+- PPL:
+  - PPL SeedΔ: `≈ 40.94` (vs 7.30 base).
+  - Greedy: texto incoherente, repetitivo y “raro” (fuerte distorsión semántica).
+- Conclusión:
+  - Aunque cada tensor pasa umbrales de cos_x_w “razonables” de forma aislada, apilar ~13 tensores en 10 capas **rompe el modelo**.
+  - Necesario introducir límites de stack-safety (umbral por tensor + límite de cantidad).
+
+### 13.3) Policy down-only 14–23 (conservadora)
+
+- Policy: `tools/seeddelta-build/policies/policy.mistral7b.abl.layers14-23.down-only.json` (solo `ffn_down` enabled, thresholds duros: `cos_x_w_mean >= 0.60`, `cos_x_w_p05 >= 0.45` para down).
+- Rango: 14–23, base+residual como arriba, sin strip-dense.
+- Run: `scripts/seeddelta-policy-eval.sh --base mistral.Q8 --policy policy.mistral7b.abl.layers14-23.down-only.json --layers 14-23 --imatrix mistral7b.imatrix.gguf --text wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --outdir calibration/seeddelta-policy-eval-mistral-down-14-23`.
+- Report:
+  - `stack_pass_gate_up = 0`, `stack_pass_down = 1`.
+  - Solo `blk.23.ffn_down` pasa gating con `cos_mean_x_w ≈ 0.64`, `cos_p05_x_w ≈ 0.43`, `ops_ratio ≈ 0.11`.
+  - `emit = true` únicamente para `layer=23, kind=ffn_down` con `block=32`, `K=1536`.
+- PPL:
+  - PPL SeedΔ: `≈ 7.58` (vs 7.30 base; degradación pequeña).
+  - Greedy: respuestas coherentes (“Hola! I'm here to help…”, sin loops ni collapse), tok/s ≈ 4 en gen.
+- Policy export + roundtrip:
+  - Export: `--policy-export calibration/seeddelta-policy-eval-mistral-down-14-23-roundtrip/policy.exported.json`.
+  - Roundtrip: rebuild con `--policy calibration/.../policy.exported.json --policy-strict`, `--eval-x 0`.
+  - Resultado: `roundtrip decisions OK (30 tensors)`.
+  - Policy canonicalizada: `tools/seeddelta-build/policies/policy.mistral7b.down14-23.exported.json` (defaults disabled; solo `layer 23 ffn_down` enabled con `block=32`, `K=1536`).
+- Conclusión:
+  - Para Mistral 7B Q8, una única capa/tensor (23 down) con cos_x_w alto produce un modelo estable con PPL aceptable.
+  - La policy exportada representa una configuración “lo más agresiva posible sin romper” dentro de este rango bajo thresholds actuales.
+
+### 13.4) Policies 19–23 y 19–20 (apilando pocos tensores)
+
+- Policy stack-strict 19–23:
+  - `tools/seeddelta-build/policies/policy.mistral7b.stack-strict.19-23.json`.
+  - Más agresiva en 19–23 (gate/up+down) con thresholds duros (`cos_x_w_mean ≥ 0.60` gate/up, `≥ 0.50` down).
+  - Run: `scripts/seeddelta-policy-eval.sh ... --policy policy.mistral7b.stack-strict.19-23.json --layers 19-23 --outdir calibration/seeddelta-policy-eval-mistral-strict-19-23`.
+  - Report: `stack_pass_gate_up = 2`, `stack_pass_down = 3`, `emit = true` en 5 tensores totales.
+  - PPL SeedΔ: `≈ 10.74` (degradación notable vs 7.30, pero sin colapso total); greedy coherente.
+- Policy ablation 19–20:
+  - `tools/seeddelta-build/policies/policy.mistral7b.abl.layers19-20.only.json`.
+  - Solo capas 19–20, mismos thresholds fuertes.
+  - Run: `scripts/seeddelta-policy-eval.sh ... --policy policy.mistral7b.abl.layers19-20.only.json --layers 19-20 --outdir calibration/seeddelta-policy-eval-mistral-abl-19-20`.
+  - Report: `stack_pass_gate_up = 1`, `stack_pass_down = 2`, `emit = true` en 3 tensores.
+  - PPL SeedΔ: `≈ 8.70`; greedy coherente.
+- Conclusión:
+  - Incluso con cos_x_w altos, apilar 5 tensores (19–23) ya sube PPL a ~10.7.
+  - Apilar 3 tensores (19–20) degrada menos (PPL ~8.7).
+  - Apilar 1 tensor (solo 23 down) es el punto actual de “mejor trade-off” (PPL ~7.6).
+
+### 13.5) Lecciones para stack-safety y generalización
+
+- Gating por tensor con `cos_x_w` y cola (p05) funciona como filtro de *estabilidad mínima*, pero:
+  - no basta para garantizar PPL baja si permitimos apilar muchos tensores,
+  - el “stack budget” (número de tensores emitidos) debe entrar explícitamente en la política (cap por tipo y cap global).
+- Q4 vs Q8:
+  - Qwen 2.5 7B Q4: casi ninguna capa media es stack-safe; solo 19–20 se dejan tocar, y con pocos tensores.
+  - Mistral 7B Q8: hay más tensores “candidatos”, pero el budget de apilamiento sigue siendo pequeño (1–3 tensores conservadores).
+- Política estable exportada:
+  - `tools/seeddelta-build/policies/policy.mistral7b.down14-23.exported.json` captura una configuración “safety-first” comprobada en Mistral 7B Q8.
+  - Sirve como plantilla de cómo debería verse un preset “universal estable” para modelos cuantizados: pocos tensores, thresholds altos, sin strip-dense y con roundtrip verificado.
+
+Próximos pasos derivados:
+
+- Endurecer stack-safety en el builder:
+  - añadir caps explícitos (máximo N tensores emitidos por tipo y M totales) además de thresholds por tensor,
+  - exponer estos caps en la policy (`stack_budget`) y reflejarlos en el report.
+- Replicar el patrón “pocos tensores de alta calidad” en otros modelos (Gemma 3 4B, Devstral 24B) antes de perseguir compresión agresiva.

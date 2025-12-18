@@ -24,6 +24,36 @@
 #include <unordered_set>
 #include <vector>
 
+struct stack_safety_tracker {
+    int gate_up_pass = 0;
+    int down_pass = 0;
+
+    void adjust(const std::string & kind, float & min_mean, float & min_p05) const {
+        const bool is_down = (kind == "ffn_down");
+        const int passed = is_down ? down_pass : gate_up_pass;
+        if (passed >= 8) {
+            if (is_down) {
+                min_mean = std::max(min_mean, 0.35f);
+                min_p05  = std::max(min_p05, 0.25f);
+            } else {
+                min_mean = std::max(min_mean, 0.60f);
+                min_p05  = std::max(min_p05, 0.45f);
+            }
+        } else if (passed >= 3) {
+            min_mean += 0.05f;
+            min_p05  += 0.05f;
+        }
+    }
+
+    void record_pass(const std::string & kind) {
+        if (kind == "ffn_down") {
+            ++down_pass;
+        } else {
+            ++gate_up_pass;
+        }
+    }
+};
+
 static void usage(const char * argv0) {
     printf("usage: %s -i in.gguf -o out.gguf [options]\n\n", argv0);
     printf("options:\n");
@@ -2123,6 +2153,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    stack_safety_tracker stack_guard;
+
     for (const int64_t il : layers) {
         for (const auto & kind : kinds) {
             const std::string weight_name = "blk." + std::to_string(il) + "." + kind + ".weight";
@@ -2148,6 +2180,12 @@ int main(int argc, char ** argv) {
                         metric_kind_to_string(cfg.metric).c_str(), cfg.min_mean, cfg.min_p05);
             }
 
+            float gating_min_mean = cfg.min_mean;
+            float gating_min_p05  = cfg.min_p05;
+            if (cfg.gating_enabled) {
+                stack_guard.adjust(kind, gating_min_mean, gating_min_p05);
+            }
+
             if (cfg.require_eval_x && (eval_x <= 0 || eval_cols <= 0)) {
                 fprintf(stderr, "seeddelta-build: gating metric requires --eval-x and --eval-cols > 0 for %s\n", weight_name.c_str());
                 return 1;
@@ -2170,8 +2208,8 @@ int main(int argc, char ** argv) {
                     re.gating_pass = false;
                     re.decision_reason = "missing_tensor";
                     re.gating_metric_used = metric_kind_to_string(cfg.metric);
-                    re.gating_min_mean = cfg.min_mean;
-                    re.gating_min_p05 = cfg.min_p05;
+                    re.gating_min_mean = gating_min_mean;
+                    re.gating_min_p05 = gating_min_p05;
                     report.push_back(std::move(re));
                 }
                 continue;
@@ -2206,8 +2244,8 @@ int main(int argc, char ** argv) {
                 re.gating_pass = false;
                 re.decision_reason = "disabled";
                 re.gating_metric_used = metric_kind_to_string(cfg.metric);
-                re.gating_min_mean = cfg.min_mean;
-                re.gating_min_p05 = cfg.min_p05;
+                re.gating_min_mean = gating_min_mean;
+                re.gating_min_p05 = gating_min_p05;
                 report.push_back(std::move(re));
                 continue;
             }
@@ -2236,8 +2274,8 @@ int main(int argc, char ** argv) {
                 re.gating_pass = false;
                 re.decision_reason = "missing_imatrix";
                 re.gating_metric_used = metric_kind_to_string(cfg.metric);
-                re.gating_min_mean = cfg.min_mean;
-                re.gating_min_p05 = cfg.min_p05;
+                re.gating_min_mean = gating_min_mean;
+                re.gating_min_p05 = gating_min_p05;
                 report.push_back(std::move(re));
                 continue;
             }
@@ -2626,8 +2664,8 @@ int main(int argc, char ** argv) {
 
                 td.re.gating_enabled = cfg.gating_enabled;
                 td.re.gating_metric_used = metric_kind_to_string(cfg.metric);
-                td.re.gating_min_mean = cfg.min_mean;
-                td.re.gating_min_p05  = cfg.min_p05;
+                td.re.gating_min_mean = gating_min_mean;
+                td.re.gating_min_p05  = gating_min_p05;
 
                 const bool metric_needs_x = (cfg.metric == sd_metric_kind::cos_x || cfg.metric == sd_metric_kind::cos_x_w);
                 const bool metric_needs_w = (cfg.metric == sd_metric_kind::cos_w || cfg.metric == sd_metric_kind::cos_x_w);
@@ -2645,7 +2683,7 @@ int main(int argc, char ** argv) {
                 const double metric_p05 = pick_metric_p05(td.re, cfg.metric);
                 bool gating_pass = true;
                 if (cfg.gating_enabled) {
-                    gating_pass = metric_available && metric_val >= cfg.min_mean && metric_p05 >= cfg.min_p05;
+                    gating_pass = metric_available && metric_val >= gating_min_mean && metric_p05 >= gating_min_p05;
                 }
                 const bool emit = cfg.enabled && (!cfg.gating_enabled || gating_pass);
 
@@ -2697,8 +2735,8 @@ int main(int argc, char ** argv) {
                 best_trial.re.emit = false;
                 best_trial.re.gating_enabled = cfg.gating_enabled;
                 best_trial.re.gating_metric_used = metric_kind_to_string(cfg.metric);
-                best_trial.re.gating_min_mean = cfg.min_mean;
-                best_trial.re.gating_min_p05 = cfg.min_p05;
+                best_trial.re.gating_min_mean = gating_min_mean;
+                best_trial.re.gating_min_p05 = gating_min_p05;
                 best_trial.re.decision_reason = "metric_unavailable";
                 have_best = true;
             }
@@ -2735,6 +2773,8 @@ int main(int argc, char ** argv) {
                 report.push_back(std::move(re));
                 continue;
             }
+
+            stack_guard.record_pass(kind);
 
             if (re.strip_applied) {
                 strip_weights.insert(weight_name);
@@ -3007,6 +3047,8 @@ int main(int argc, char ** argv) {
         out << "  },\n";
         out << "  \"eval_cols\": " << eval_cols << ",\n";
         out << "  \"eval_x\": " << eval_x << ",\n";
+        out << "  \"stack_pass_gate_up\": " << stack_guard.gate_up_pass << ",\n";
+        out << "  \"stack_pass_down\": " << stack_guard.down_pass << ",\n";
         out << "  \"weights\": [\n";
 
         for (size_t i = 0; i < report.size(); ++i) {

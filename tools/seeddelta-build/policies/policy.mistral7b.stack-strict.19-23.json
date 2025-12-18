@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "defaults": { "enabled": false },
+  "ranges": [
+    {
+      "layers": "19-23",
+      "enabled": true,
+      "strip_dense": false,
+      "block": 32,
+      "K": { "gate": 256, "up": 256, "down": 512 },
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "gate": 0.60, "up": 0.60, "down": 0.50 },
+        "min_p05":  { "gate": 0.45, "up": 0.45, "down": 0.35 }
+      },
+      "autotune": {
+        "enabled": true,
+        "schedule_gate_up": [256, 384, 512, 640, 768],
+        "schedule_down":    [512, 768, 1024, 1536],
+        "max_iters": 5
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": true,
+    "strip_dense": true,
+    "block": 32,
+    "K": { "gate": 256, "up": 256, "down": 512 },
+    "gating": {
+      "metric": "cos_x_w",
+      "min_mean": { "gate": 0.50, "up": 0.50, "down": 0.30 },
+      "min_p05":  { "gate": 0.35, "up": 0.35, "down": 0.20 }
+    },
+    "autotune": {
+      "enabled": true,
+      "schedule_gate_up": [128, 256, 384, 512, 640],
+      "schedule_down":    [256, 512, 768, 1024],
+      "max_iters": 5
+    }
+  },
+  "ranges": [
+    { "layers": "0-5",  "enabled": false },
+    {
+      "layers": "6-23",
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "gate": 0.55, "up": 0.55, "down": 0.35 },
+        "min_p05":  { "gate": 0.40, "up": 0.40, "down": 0.22 }
+      },
+      "autotune": {
+        "enabled": true,
+        "schedule_gate_up": [256, 384, 512, 640],
+        "schedule_down":    [512, 768, 1024, 1280],
+        "max_iters": 4
+      }
+    },
+    {
+      "layers": "24-31",
+      "K": { "gate": 384, "up": 384, "down": 640 },
+      "gating": {
+        "metric": "cos_x_w",
+        "min_mean": { "gate": 0.60, "up": 0.60, "down": 0.40 },
+        "min_p05":  { "gate": 0.45, "up": 0.45, "down": 0.25 }
+      },
+      "autotune": {
+        "enabled": true,
+        "schedule_gate_up": [256, 384, 512, 768],
+        "schedule_down":    [512, 768, 1024, 1536],
+        "max_iters": 5
+      }
+    }
+  ]
+}
