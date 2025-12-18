@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -81,6 +82,7 @@ static void usage(const char * argv0) {
     printf("  --policy-export PATH write a canonical policy.json capturing final per-tensor decisions\n");
     printf("  --policy-self-test   run internal policy merge tests and exit\n");
     printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
+    printf("  --stack-cost-cap F   hard cap for accumulated stack_cost (default: +inf => no cap)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -2028,6 +2030,7 @@ int main(int argc, char ** argv) {
     bool policy_dump_resolved = false;
     bool policy_self_test = false;
     bool overwrite_existing = false;
+    double stack_cost_cap = std::numeric_limits<double>::infinity();
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -2056,6 +2059,7 @@ int main(int argc, char ** argv) {
         if (arg == "--policy-dump-resolved") { policy_dump_resolved = true; continue; }
         if (arg == "--policy-export" && i + 1 < argc) { policy_export_file = argv[++i]; continue; }
         if (arg == "--policy-self-test") { policy_self_test = true; continue; }
+        if (arg == "--stack-cost-cap" && i + 1 < argc) { stack_cost_cap = std::stod(argv[++i]); continue; }
         if (arg == "--overwrite-existing") { overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { eval_cols = std::stoll(argv[++i]); continue; }
@@ -2844,6 +2848,17 @@ int main(int argc, char ** argv) {
             }
 
             if (!re.emit) {
+                finalize_report_entry(re);
+                report.push_back(std::move(re));
+                continue;
+            }
+
+            // Enforce global stack_cost cap if provided.
+            if (stack_cost_running > stack_cost_cap) {
+                re.emit = false;
+                re.strip_applied = false;
+                re.decision_reason = "stack_cost_cap";
+                re.reject_reason = re.decision_reason;
                 finalize_report_entry(re);
                 report.push_back(std::move(re));
                 continue;
