@@ -54,6 +54,21 @@ struct stack_safety_tracker {
     }
 };
 
+static void finalize_report_entry(report_entry & e) {
+    if (e.metric_used.empty()) {
+        e.metric_used = e.gating_metric_used;
+    }
+    if (e.target_tau_mean == 0.0) {
+        e.target_tau_mean = e.gating_min_mean;
+    }
+    if (e.target_tau_p05 == 0.0) {
+        e.target_tau_p05 = e.gating_min_p05;
+    }
+    if (e.reject_reason.empty()) {
+        e.reject_reason = e.decision_reason;
+    }
+}
+
 static void usage(const char * argv0) {
     printf("usage: %s -i in.gguf -o out.gguf [options]\n\n", argv0);
     printf("options:\n");
@@ -1871,13 +1886,40 @@ struct report_entry {
     bool gating_enabled = false;
     bool gating_pass = true;
     std::string gating_metric_used;
+    std::string metric_used;
     double gating_value = 0.0;
     double gating_p05 = 0.0;
     double gating_min_mean = 0.0;
     double gating_min_p05 = 0.0;
+    double target_tau_mean = 0.0;
+    double target_tau_p05 = 0.0;
     bool emit = true;
     bool strip_applied = false;
     std::string decision_reason;
+    std::string reject_reason;
+    double stack_cost_delta = 0.0;
+    double stack_cost_total = 0.0;
+
+    // Tiled-K metadata (v1: may be empty if no tiles)
+    int64_t tile_rows = 0;
+    int64_t tile_rows_align = 0;
+    int64_t k_total_per_tensor = 0;
+    std::vector<int64_t> k_levels;
+    std::vector<int64_t> k_per_tile; // post-round, dense per tile (row order)
+    int64_t unique_k_count = 0;
+    int64_t tiles_rounded_count = 0;
+    double tiles_rounded_pct = 0.0;
+    int64_t tiles_dropped_count = 0;
+    double tiles_dropped_pct = 0.0;
+    bool k_custom_used = false;
+    struct k_stats {
+        double min = 0.0;
+        double max = 0.0;
+        double mean = 0.0;
+        bool has = false;
+    };
+    k_stats k_requested_stats;
+    k_stats k_selected_stats;
 
     struct autotune_attempt {
         int64_t K_budget = 0;
@@ -2208,8 +2250,12 @@ int main(int argc, char ** argv) {
                     re.gating_pass = false;
                     re.decision_reason = "missing_tensor";
                     re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                    re.metric_used = re.gating_metric_used;
                     re.gating_min_mean = gating_min_mean;
                     re.gating_min_p05 = gating_min_p05;
+                    re.target_tau_mean = gating_min_mean;
+                    re.target_tau_p05 = gating_min_p05;
+                    re.reject_reason = re.decision_reason;
                     report.push_back(std::move(re));
                 }
                 continue;
@@ -2244,8 +2290,12 @@ int main(int argc, char ** argv) {
                 re.gating_pass = false;
                 re.decision_reason = "disabled";
                 re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.metric_used = re.gating_metric_used;
                 re.gating_min_mean = gating_min_mean;
                 re.gating_min_p05 = gating_min_p05;
+                re.target_tau_mean = gating_min_mean;
+                re.target_tau_p05 = gating_min_p05;
+                re.reject_reason = re.decision_reason;
                 report.push_back(std::move(re));
                 continue;
             }
@@ -2274,8 +2324,12 @@ int main(int argc, char ** argv) {
                 re.gating_pass = false;
                 re.decision_reason = "missing_imatrix";
                 re.gating_metric_used = metric_kind_to_string(cfg.metric);
+                re.metric_used = re.gating_metric_used;
                 re.gating_min_mean = gating_min_mean;
                 re.gating_min_p05 = gating_min_p05;
+                re.target_tau_mean = gating_min_mean;
+                re.target_tau_p05 = gating_min_p05;
+                re.reject_reason = re.decision_reason;
                 report.push_back(std::move(re));
                 continue;
             }
@@ -2770,6 +2824,7 @@ int main(int argc, char ** argv) {
             const int64_t K_eff = re.K;
 
             if (!re.emit) {
+                finalize_report_entry(re);
                 report.push_back(std::move(re));
                 continue;
             }
@@ -2781,6 +2836,7 @@ int main(int argc, char ** argv) {
                 any_strip = true;
             }
 
+            finalize_report_entry(re);
             report.push_back(std::move(re));
 
             // Allocate a dedicated ggml context for new tensors to avoid a giant arena.
@@ -3099,9 +3155,37 @@ int main(int argc, char ** argv) {
             out << "      \"gating_min_mean\": " << e.gating_min_mean << ",\n";
             out << "      \"gating_min_p05\": " << e.gating_min_p05 << ",\n";
             out << "      \"gating_pass\": " << (e.gating_pass ? "true" : "false") << ",\n";
+            out << "      \"metric_used\": \"" << json_escape(e.metric_used) << "\",\n";
+            out << "      \"targets_used\": {\"tau_mean\": " << e.target_tau_mean << ", \"tau_p05\": " << e.target_tau_p05 << "},\n";
+            out << "      \"stack_cost_delta\": " << e.stack_cost_delta << ",\n";
+            out << "      \"stack_cost_total\": " << e.stack_cost_total << ",\n";
             out << "      \"emit\": " << (e.emit ? "true" : "false") << ",\n";
             out << "      \"strip_dense\": " << (e.strip_applied ? "true" : "false") << ",\n";
             out << "      \"decision\": \"" << json_escape(e.decision_reason) << "\",\n";
+            out << "      \"reject_reason\": \"" << json_escape(e.reject_reason) << "\",\n";
+            out << "      \"tile_rows\": " << e.tile_rows << ",\n";
+            out << "      \"tile_rows_align\": " << e.tile_rows_align << ",\n";
+            out << "      \"k_total_per_tensor\": " << e.k_total_per_tensor << ",\n";
+            out << "      \"k_levels\": [";
+            for (size_t ki = 0; ki < e.k_levels.size(); ++ki) {
+                if (ki) out << ", ";
+                out << e.k_levels[ki];
+            }
+            out << "],\n";
+            out << "      \"unique_k_count\": " << e.unique_k_count << ",\n";
+            out << "      \"tiles_rounded_count\": " << e.tiles_rounded_count << ",\n";
+            out << "      \"tiles_rounded_pct\": " << e.tiles_rounded_pct << ",\n";
+            out << "      \"tiles_dropped_count\": " << e.tiles_dropped_count << ",\n";
+            out << "      \"tiles_dropped_pct\": " << e.tiles_dropped_pct << ",\n";
+            out << "      \"k_per_tile\": [";
+            for (size_t ti = 0; ti < e.k_per_tile.size(); ++ti) {
+                if (ti) out << ", ";
+                out << e.k_per_tile[ti];
+            }
+            out << "],\n";
+            out << "      \"k_custom_used\": " << (e.k_custom_used ? "true" : "false") << ",\n";
+            out << "      \"k_requested_stats\": {\"has\": " << (e.k_requested_stats.has ? "true" : "false") << ", \"min\": " << e.k_requested_stats.min << ", \"max\": " << e.k_requested_stats.max << ", \"mean\": " << e.k_requested_stats.mean << "},\n";
+            out << "      \"k_selected_stats\": {\"has\": " << (e.k_selected_stats.has ? "true" : "false") << ", \"min\": " << e.k_selected_stats.min << ", \"max\": " << e.k_selected_stats.max << ", \"mean\": " << e.k_selected_stats.mean << "},\n";
             out << "      \"autotune_enabled\": " << (e.autotune_enabled ? "true" : "false") << ",\n";
             out << "      \"autotune_selected_budget\": " << e.autotune_selected_budget << ",\n";
             out << "      \"autotune_attempts\": [";
