@@ -23,9 +23,10 @@ cuando se implementen.
 
 * **Subcapa/tile (v1)**:
 
-  * *Tiles por filas*: rangos contiguos de filas de la matriz (W \in \mathbb{R}^{n_{out}\times n_{in}}).
-  * Cada tile (t) define una submatriz (W_t = W[r_t:r_{t+1}, :]).
-  * Restricción v1: los límites ((r_t)) están alineados a `block_rows` (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
+  * *Tiles por filas*: rangos contiguos de filas de la matriz ($W \in \mathbb{R}^{n_{out}\times n_{in}}$).
+  * Cada tile $t$ define una submatriz ($W_t = W[r_t:r_{t+1}, :]$).
+  * Restricción v1: los límites $r_t$ están alineados a `block_rows` (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
+    * Nota: `block_rows` aquí es la granularidad de filas del tile; no confundir con `--block` del scheme residual.
   * Ejemplo: `ffn_down` con `n_out=4096`, tiles por filas: `[0..1023]`, `[1024..2047]`, `[2048..3071]`, `[3072..4095]`.
 
 * **K por tile (v1)**:
@@ -34,20 +35,22 @@ cuando se implementen.
   * K se interpreta como **presupuesto de sparsidad del residual** *en ese tile*.
   * Definición v1 (para evitar dobles interpretaciones):
 
-    * **Si el residual es block-sparse**: (K_t) = número de **bloques** activos dentro del tile.
-    * **Si el residual es COO-like por filas**: (K_t) = número de **entradas activas por fila** (o por bloque de filas) dentro del tile.
+    * **Si el residual es block-sparse**: $K_t$ = máximo número de **bloques** activos por fila dentro del tile.
+    * **Si el residual es COO-like por filas**: $K_t$ = máximo número de **entradas** activas por fila dentro del tile.
   * (Nota) No mezclar definiciones: el builder debe declarar explícitamente cuál aplica según `--scheme`.
+  * (Nota) Si internamente se agrupan filas en `block_rows`, debe ser una optimización; no cambia la semántica de $K_t$.
 
 * **Stage (multi-stage Δ)**:
 
-  * [
+  * Definición:
+    $$
     \hat W = W_0 + \Delta_1 + \Delta_2 + \cdots + \Delta_m,\quad m\ \text{pequeño}
-    ]
+    $$
   * Formalmente:
-    [
+    $$
     R_0 = W - W_0,\quad \Delta_s \approx R_{s-1},\quad R_s = R_{s-1} - \Delta_s
-    ]
-  * Restricción: (\sum_s K_s \le K_{total}) (y/o budget de ops/mem).
+    $$
+  * Restricción: $\sum_s K_s \le K_{total}$ (y/o budget de ops/mem).
 
 ---
 
@@ -70,6 +73,7 @@ Sin KPIs por run, el backlog se convierte en wishlist. Para cada experimento/pre
     * `flag.loop` (repetición/atasco),
     * `flag.lang_drift` (cambio de idioma),
     * `flag.instruction_break` (rompe restricciones duras).
+    * Nota: `flag.lang_drift` es telemetría (v2); no debe ser gate duro mientras el detector sea heurístico.
 
 * **Perf (prompt y gen):**
 
@@ -106,6 +110,28 @@ Prioridad por ROI y por reducción de ambigüedad:
 
 ---
 
+## 0.3) Gates de avance (para no optimizar a ciegas)
+
+Estos gates convierten el TODO en ingeniería “shippeable”. Si un gate falla, **no** avanzar a la siguiente etapa;
+primero corregir métricas/criterios.
+
+* **Gate A — Score funcional confiable:**
+  * El “FFN-score compuesto” (sección 5) debe correlacionar con `ΔPPL` (Wikitext) y con fallos del greedy pack.
+  * Si no correlaciona, no vale la pena optimizar tiles, stages ni kernels (estaríamos optimizando un proxy roto).
+
+* **Gate B — Stack-safety reduce cliffs:**
+  * Al comprimir “más” (más tensores/capas), `stack_budget/stack_cost` debe reducir varianza de calidad y evitar
+    cliff (modelos zombis) en greedy pack.
+  * Si se siguen viendo cliffs con el mismo `stack_cost`, ajustar thresholds/cost (sección 7) o revisar si el score usado
+    no está midiendo la composición (p.ej. debe ser FFN-score, no tensor-score).
+
+* **Gate C — Tiled K mejora PPL/MB sin romper throughput:**
+  * “K por tile con niveles discretos” (sección 6.2) debe mejorar `PPL/MB` (o bajar `ΔPPL` a igual memoria)
+    y no degradar throughput más de X% (X depende del hardware; empezar con X≈10–20% en CPU).
+  * Si mejora PPL pero mata tok/s, limitar niveles, ajustar tile_rows y/o alinear mejor al layout/kernel.
+
+---
+
 ## 1) Perf / RAM (sigue siendo el cuello)
 
 Orden recomendado (antes de micro-optimizar):
@@ -123,8 +149,13 @@ Orden recomendado (antes de micro-optimizar):
 ## 2) Calidad / data-aware “de verdad”
 
 * [ ] Mejorar dataset para imatrix por modelo (no depender de `gemma_calibration.txt` para todo).
-* [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar (|WX - \hat W X|) más allá de imatrix diagonal
-  (objetivo funcional: (|WX - \hat W X|) con activaciones reales en `ffn_gate/up/down`).
+* [ ] Añadir un escalón intermedio “data-aware barato” (v1.5) antes de guardar activaciones:
+  * estadísticas en streaming (normas, varianza por canal, percentiles, clipping rates),
+  * sin persistir `X` completo (reduce fricción/IO y aún mejora proxies vs imatrix diagonal).
+* [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar un objetivo funcional bien definido:
+  * offline: $\min \|W X - \hat W X\|_F^2$
+  * por token/posición: $e_i=\|y_i-\hat y_i\|_2$ (reportar mean/p05/p95)
+  * (ideal) hacerlo a nivel de bloque FFN compuesto cuando se trate de `gate/up` (sección 5).
 * [ ] Explorar construir SeedΔ desde F16/Q8 como fuente (evitar “loss-on-loss” de Q4).
 * [ ] Validar gating multi-precisión: repetir builder + policy en al menos tres precisiones (FP16, Q8, Q4)
   para el mismo modelo y documentar diferencias de `cos_x_w` / `stack_budget`.
@@ -135,8 +166,19 @@ Orden recomendado (antes de micro-optimizar):
 
 ## 3) Expandir targets más allá de FFN (Fase 5)
 
-* [ ] Probar policy/gating en QKV/O con budgets conservadores (solo si gating indica que hay margen).
-* [ ] Embeddings/LM head solo con gating ultra estricto (e.g. umbrales de cos muy altos y stack-budget mínimo).
+Orden de ataque recomendado (minimizar riesgo):
+
+1) **FFN** (ya en curso): `ffn_down` suele ser más tolerante; `gate/up` requieren FFN-score.
+
+2) **Attention “menos frágil” primero:**
+
+* [ ] `W_o` (output projection) con budgets conservadores + gating estricto.
+* [ ] `W_v` (value) si el gating lo permite.
+* [ ] `W_q`/`W_k` solo con umbrales aún más estrictos (y preferiblemente con score compuesto de atención).
+
+3) **Embeddings / LM head:**
+
+* [ ] Solo con gating ultra estricto y stack-budget mínimo (riesgo alto de degradar vocab/logits).
 
 ---
 
@@ -144,6 +186,8 @@ Orden recomendado (antes de micro-optimizar):
 
 * [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating
   para detectar regresiones temprano (PPL+greedy pack).
+* [ ] Mantener un set “intermedio” llama-like (Mistral/Llama 7–8B) para validar stack-safety con más headroom que Qwen.
+* [ ] Documentar por modelo: “headroom apilable” observado (cuántos tensores/capas sobreviven greedy + `ΔPPL` aceptable).
 
 ---
 
@@ -161,22 +205,22 @@ Acciones:
 * [ ] Definir un score de calidad **a nivel FFN compuesto** (medible y reproducible):
 
   * Definición del bloque:
-    [
+    $$
     \mathrm{FFN}(x)=W_{down}\big(\mathrm{silu}(W_{gate}x)\odot (W_{up}x)\big)
-    ]
-    [
+    $$
+    $$
     \widehat{\mathrm{FFN}}(x)=\hat W_{down}\big(\mathrm{silu}(\hat W_{gate}x)\odot (\hat W_{up}x)\big)
-    ]
+    $$
   * Score primario (por token/posición (i), y agregación sobre dataset):
-    [
-    c_i=\cos(y_i,\hat y_i)=\frac{\langle y_i,\hat y_i\rangle}{|y_i||\hat y_i|+\epsilon}
-    ]
+    $$
+    c_i=\cos(y_i,\hat y_i)=\frac{\langle y_i,\hat y_i\rangle}{\|y_i\|_2\,\|\hat y_i\|_2+\epsilon}
+    $$
     con (y_i=\mathrm{FFN}(x_i)), (\hat y_i=\widehat{\mathrm{FFN}}(x_i)).
     Reportar: `ffn_cos_mean = mean_i(c_i)` y `ffn_cos_p05 = p05_i(c_i)`.
   * Score secundario (drift de escala):
-    [
-    r_i=\frac{|\hat y_i|}{|y_i|+\epsilon}
-    ]
+    $$
+    r_i=\frac{\|\hat y_i\|_2}{\|y_i\|_2+\epsilon}
+    $$
     Reportar: `ffn_norm_ratio_mean` + `p05/p95`.
   * Dataset/activaciones: usar activaciones reales (x_i) (mismo texto/calib usado para imatrix o un pack representativo).
   * Decisión v1:
@@ -197,9 +241,7 @@ Acciones:
 
 Idea: aproximar el residual en varias etapas pequeñas:
 
-* [
-  \hat W = W_0 + \Delta_1 + \Delta_2 + \cdots + \Delta_m
-  ]
+* $\hat W = W_0 + \Delta_1 + \Delta_2 + \cdots + \Delta_m$
 * Análogo a matching pursuit/OMP: el primer top-K es miope; stages sucesivos pueden capturar estructura que el primer corte no vio.
 
 Acciones:
@@ -207,13 +249,21 @@ Acciones:
 * [ ] Diseñar un esquema de builder “multi-stage”:
 
   * número de stages (m) pequeño (p.ej. 2–3), con K decreciente o constante.
-  * evaluar por stage: (\hat W^{(s)}=W_0+\sum_{j=1}^s \Delta_j) y medir el score funcional (FFN-score o (|WX-\hat WX|)).
+  * evaluar por stage: $\hat W^{(s)} = W_0+\sum_{j=1}^s \Delta_j$ y medir el score funcional (FFN-score o $\|W X-\hat W X\|_F^2$).
   * gating y report JSON por stage (para ver ganancia marginal de cada (\Delta_s)).
 
 * [ ] Definir condición de stop (no “stages infinitos”):
 
   * permitir `stage+1` solo si mejora el score funcional > X% o reduce error > Y por costo adicional.
   * si no hay ganancia marginal clara, no agregar stages (evita matar perf/complexidad).
+
+* [ ] Multi-stage permitido solo si cambia de “familia” (evitar 2× lo mismo):
+  * Stage 1: residual sparse estándar (lo actual).
+  * Stage 2 (opcional): otra familia (ejemplos):
+    * corrección per-channel (scale/bias) barata,
+    * lista de outliers (top-m magnitudes),
+    * low-rank pequeño.
+  * Preferir fusión offline a una sola representación si es posible (evitar dos streams dispersos en runtime).
 
 * [ ] Definir un presupuesto total de compute/memoria por tensor:
 
@@ -233,11 +283,11 @@ Acciones:
 
   * definir utilidad por tile:
 
-    * ideal: (E_t(K)=|W_tX-\hat W_t(K)X|_F^2) o score funcional equivalente,
+    * ideal: $E_t(K)=\|W_t X-\hat W_t(K) X\|_F^2$ o score funcional equivalente,
     * proxy: error ponderado por imatrix/diagonal si no hay (X).
   * medir “beneficio por +ΔK”:
 
-    * (\Delta E_t = E_t(K_{cur}) - E_t(K_{next})),
+    * $\Delta E_t = E_t(K_{cur}) - E_t(K_{next})$,
     * asignar K por niveles hasta consumir presupuesto total (sin solver exacto).
 * [ ] Exponer en policy una forma simple:
 
@@ -265,17 +315,23 @@ Acciones:
   * definir un coste v1 (clamp + estable):
 
     * clamp: `cos := clamp(cos, -1, 1)`
-    * [
+    * $$
       cost = \alpha(1-\bar c) + \beta(1-c_{p05})
-      ]
+      $$
+    * Definición de métricas para `\bar c` y `c_{p05}`:
+      * mientras no exista FFN-score: usar `cos_mean_x_w` y `cos_p05_x_w` del tensor.
+      * cuando exista FFN-score: para `gate/up` usar `ffn_cos_mean` y `ffn_cos_p05` (sección 5).
     * (opcional v2) penalizar drift de escala si está disponible:
-      [
-      cost += \gamma,|\log(\bar r)|
-      ]
-      donde (\bar r) es `norm_ratio_mean` (o del FFN-score).
+      $$
+      cost = cost + \gamma\,|\log(\bar r)|
+      $$
+      donde $\bar r$ es `norm_ratio_mean` (o `ffn_norm_ratio_mean` si existe).
   * permitir más tensores si son “muy buenos” y cortar rápido si son borderline.
 
 * [ ] Integrar stack-safety en policy:
 
   * campos tipo `stack_budget.max_tensors`, `stack_budget.max_gate_up`, etc.
   * decisiones claras en report JSON cuando un tensor no se activa por exceder presupuesto global.
+* [ ] Convertir stack-safety en regla explícita (no solo telemetría):
+  * hard-cap o soft-cap por run (p.ej. “si stack_cost supera T, no emitir más”),
+  * registrar el motivo de rechazo (budget) en el report.
