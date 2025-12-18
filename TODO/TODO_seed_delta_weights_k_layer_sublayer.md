@@ -27,7 +27,8 @@ cuando se implementen.
   * Cada tile $t$ define una submatriz ($W_t = W[r_t:r_{t+1}, :]$).
   * Parámetros v1:
     * `tile_rows`: filas por tile (altura del tile). Debe mantenerse fijo por run (comparabilidad).
-      * Recomendación v1: `tile_rows = 1024` (o `tile_rows = n_out/4` cuando aplique) y el último tile puede ser más pequeño.
+      * Recomendación v1: `tile_rows = 1024` como default, y solo permitir presets `{512, 1024, 2048}`.
+      * Si `n_out < tile_rows`, usar `tile_rows = n_out` (un solo tile).
     * `tile_rows_align`: alineación de `tile_rows` y límites $r_t$ (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
       * Nota: `tile_rows_align` es solo granularidad del tile; no confundir con `--block` del scheme residual.
   * Restricción v1: los límites $r_t$ están alineados a `tile_rows_align`.
@@ -45,6 +46,13 @@ cuando se implementen.
     * **Si el residual es COO-like por filas**: $K_t$ = máximo número de **entradas** activas por fila dentro del tile.
   * (Nota) No mezclar definiciones: el builder debe declarar explícitamente cuál aplica según `--scheme`.
   * (Nota) Si internamente se agrupan filas en `tile_rows_align`, debe ser una optimización; no cambia la semántica de $K_t$.
+  * (Nota) $K_t$ es hard-cap; el builder puede usar menos si autotune/gating no justifica el costo.
+  * Ejemplo numérico (para evitar interpretaciones):
+    * Scheme `block` con `--block B=32`, `tile_rows=1024`:
+      * el tile tiene $1024/32=32$ row-blocks.
+      * si $K_t=4$, cada row-block puede tener como máximo 4 bloques $32\times 32$ activos (en distintas posiciones de columna).
+    * Scheme COO-like por filas con `tile_rows=1024`:
+      * si $K_t=64$, cada fila del tile puede tener como máximo 64 entradas activas.
 
 * **Stage (multi-stage Δ)**:
 
@@ -96,6 +104,11 @@ Sin KPIs por run, el backlog se convierte en wishlist. Para cada experimento/pre
   * `stack_budget`: cuántos tensores SeedΔ activos por tipo (gate/up/down) y total.
   * `stack_cost`: coste ponderado (ver sección 7), y su correlación con greedy/PPL.
 
+* **Trazabilidad (requisito, sin ambigüedad):**
+  * Todo run debe dejar un `report.json` (o equivalente) con:
+    * `accepted/emit`, `strip`, `reject_reason`, `metric_used`, métricas y thresholds/targets por tensor.
+    * si hay tiled-K: `tile_rows`, `tile_rows_align`, `K_levels`, `unique_k_count`, `tiles_rounded_count` y ratio.
+
 Metodología multi-precisión (para conclusiones limpias):
 
 * Para aislar “source_precision”, comparar **el mismo modelo** generado desde la misma base:
@@ -111,8 +124,9 @@ Prioridad por ROI y por reducción de ambigüedad:
 
 1. **Gating FFN compuesto + stack_budget/stack_cost** (secciones 5 y 7): evitar zombies antes de tocar más capas.
 2. **Comparabilidad multi-precisión** (sección 2): misma base F16 → Q8/Q4, y medir headroom real.
-3. **Δ por etapas** (6.1) y **K por tile** (6.2): aumentar capacidad sin subir K global a lo bruto.
-4. Optimización pesada de kernels (`W0x`) solo cuando sepamos qué presets valen la pena acelerar.
+3. **K por tile con niveles discretos (`K_levels`)** (secciones 6.2 + 6.3): high ROI / low risk.
+4. **Δ por etapas** (6.1): solo si cambia de familia y es fusionable offline (alto riesgo de runtime/metadata).
+5. Optimización pesada de kernels (`W0x`) solo cuando sepamos qué presets valen la pena acelerar.
 
 ---
 
@@ -135,6 +149,23 @@ primero corregir métricas/criterios.
   * “K por tile con niveles discretos” (sección 6.2) debe mejorar `PPL/MB` (o bajar `ΔPPL` a igual memoria)
     y no degradar throughput más de X% (X depende del hardware; empezar con X≈10–20% en CPU).
   * Si mejora PPL pero mata tok/s, limitar niveles, ajustar tile_rows y/o alinear mejor al layout/kernel.
+
+---
+
+## 0.4) Ablations obligatorias (proceso repetible)
+
+Las ablations convierten “intuición” en evidencia (y aceleran debugging cuando un modelo se vuelve zombie).
+
+* [ ] Añadir `scripts/seeddelta-ablate.sh`:
+  * genera y evalúa ablations estándar (mismo texto/ctx/threads):
+    * base vs SD (policy completa),
+    * `down-only`,
+    * `gate/up-only`,
+    * “solo 1 capa” (isolar una capa de interés),
+    * “bandas” (p.ej. 8–14, 15–20, 21–27).
+  * corre `llama-perplexity` (Wikitext) + greedy pack, y guarda artefactos en un outdir único.
+* [ ] Emitir `ablate_summary.json` (y/o `ablate_summary.md`) con KPIs comparables:
+  * PPL base/SD, PASS/FAIL greedy, `stack_budget/stack_cost`, y lista de tensores/capas activas por ablation.
 
 ---
 
@@ -233,6 +264,11 @@ Acciones:
     \ell_i=\log(r_i)
     $$
     Reportar: `ffn_log_norm_ratio_mean = mean_i(\ell_i)` + `p05/p95`.
+  * Error absoluto (magnitud):
+    $$
+    e_i=\|y_i-\hat y_i\|_2
+    $$
+    Reportar: `ffn_l2_mean = mean_i(e_i)` + `p05/p95` (alternativa: `ffn_mse_mean` si se normaliza).
   * Dataset/activaciones: usar activaciones reales $x_i$ **a la entrada del FFN** (post-norm del bloque, pre matmul `gate/up`)
     (mismo texto/calib usado para imatrix o un pack representativo).
   * Decisión v1:
@@ -307,6 +343,20 @@ Acciones:
 
 ---
 
+### 6.3) `K_levels` (MVP) vs `K_custom` (experimental, builder-only)
+
+Objetivo: evitar 2 runtimes (levels vs custom) mientras mantenemos control fino.
+
+* **MVP (core):** policy solo usa `K_levels` (2–4 niveles) y `strict`.
+  * Ejemplo: `K_levels = [256, 512, 1024, 1536]`.
+  * Runtime soporta estos niveles explícitos (sin “kernel genérico” para K arbitrario).
+
+* **Experimental (builder-only, round-only):** permitir `K_custom` en policy, pero el builder **redondea** a un `K_levels`:
+  * v1: redondeo al nivel más cercano (empates hacia arriba).
+  * el `report.json` debe registrar `K_requested` vs `K_selected`, y `tiles_rounded_count/ratio`.
+
+---
+
 ## 7) Control global de stack-safety (presupuesto de error acumulado)
 
 Razonamiento:
@@ -336,6 +386,9 @@ Acciones:
     * Definición de targets `\tau_*` (para que tensores “muy buenos” no paguen coste):
       * v1 (configurable, por tipo): targets más altos para `gate/up` que para `down`.
       * Ejemplo inicial: `gate/up`: `\tau_{mean}=0.70`, `\tau_{p05}=0.55`; `down`: `\tau_{mean}=0.60`, `\tau_{p05}=0.45`.
+    * Agregación v1 (sin ambigüedad):
+      * `stack_cost_total = Σ_tensors cost(tensor)` (solo tensores SeedΔ emitidos/activos).
+      * v2: permitir “agregación por bloque” (FFN-score) cuando exista telemetría compuesta estable.
     * (opcional v2) penalizar drift de escala si está disponible (preferir log-ratio):
       $$
       cost = cost + \gamma\,|\bar \ell|
