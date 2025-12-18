@@ -3,11 +3,11 @@
 Este TODO agrupa el backlog **pendiente** del mecanismo SeedΔ multicapa, pero visto desde la óptica
 de “K por capa/subcapa” y estabilidad a través de arquitecturas/precisiones:
 
-- Optimización de kernels/base (`W0x`) y layout.
-- Data-awareness real (activaciones, dataset por modelo).
-- Multi-precisión (FP16/Q8/Q4) como fuente para SeedΔ.
-- Extender SeedΔ fuera de FFN (`ffn_gate/up/down`) hacia QKV/O, embeddings y LM head.
-- Harness de pruebas cruzadas (modelos pequeños vs grandes).
+* Optimización de kernels/base (`W0x`) y layout.
+* Data-awareness real (activaciones, dataset por modelo).
+* Multi-precisión (FP16/Q8/Q4) como fuente para SeedΔ.
+* Extender SeedΔ fuera de FFN (`ffn_gate/up/down`) hacia QKV/O, embeddings y LM head.
+* Harness de pruebas cruzadas (modelos pequeños vs grandes).
 
 Documento de origen: ver también `TODO_seed_delta_weights_llama_k_multicapa.md`
 para el diseño del builder/policy/gating/autotune y resultados actuales.
@@ -19,17 +19,35 @@ para el diseño del builder/policy/gating/autotune y resultados actuales.
 Estas definiciones son **v1 (MVP)** para que “K por subcapa/tile” y “Δ por etapas” signifiquen lo mismo
 cuando se implementen.
 
-- **Tensor objetivo**: en v1, matrices FFN `ffn_gate`, `ffn_up`, `ffn_down` por capa `blk.N`.
-- **Subcapa/tile**:
-  - v1: *tiles por filas* (rangos contiguos de filas de `W`, alineados a `block` y/o a `n_out`).
-  - Ejemplo: `ffn_down` con `n_out=4096`, tiles: `[0..1023]`, `[1024..2047]`, `[2048..3071]`, `[3072..4095]`.
-- **K por tile**:
-  - K aplica al **residual Δ** dentro de ese tile (no al tensor completo).
-  - K se interpreta como “presupuesto de bloques/entradas” del esquema residual (block/COO) para ese tile.
-- **Stage (multi-stage Δ)**:
-  - `\hat W = W_0 + Δ_1 + Δ_2 + ... + Δ_m` con `m` pequeño.
-  - Cada `Δ_s` aproxima el residual restante tras aplicar las etapas anteriores.
-  - Restricción: `Σ_s K_s ≤ K_total` (y/o budget de ops/mem).
+* **Tensor objetivo**: en v1, matrices FFN `ffn_gate`, `ffn_up`, `ffn_down` por capa `blk.N`.
+
+* **Subcapa/tile (v1)**:
+
+  * *Tiles por filas*: rangos contiguos de filas de la matriz (W \in \mathbb{R}^{n_{out}\times n_{in}}).
+  * Cada tile (t) define una submatriz (W_t = W[r_t:r_{t+1}, :]).
+  * Restricción v1: los límites ((r_t)) están alineados a `block_rows` (múltiplos de 32/64) para mantener kernels/layout cache-friendly.
+  * Ejemplo: `ffn_down` con `n_out=4096`, tiles por filas: `[0..1023]`, `[1024..2047]`, `[2048..3071]`, `[3072..4095]`.
+
+* **K por tile (v1)**:
+
+  * K aplica al **residual Δ** dentro de ese tile (no al tensor completo).
+  * K se interpreta como **presupuesto de sparsidad del residual** *en ese tile*.
+  * Definición v1 (para evitar dobles interpretaciones):
+
+    * **Si el residual es block-sparse**: (K_t) = número de **bloques** activos dentro del tile.
+    * **Si el residual es COO-like por filas**: (K_t) = número de **entradas activas por fila** (o por bloque de filas) dentro del tile.
+  * (Nota) No mezclar definiciones: el builder debe declarar explícitamente cuál aplica según `--scheme`.
+
+* **Stage (multi-stage Δ)**:
+
+  * [
+    \hat W = W_0 + \Delta_1 + \Delta_2 + \cdots + \Delta_m,\quad m\ \text{pequeño}
+    ]
+  * Formalmente:
+    [
+    R_0 = W - W_0,\quad \Delta_s \approx R_{s-1},\quad R_s = R_{s-1} - \Delta_s
+    ]
+  * Restricción: (\sum_s K_s \le K_{total}) (y/o budget de ops/mem).
 
 ---
 
@@ -37,28 +55,43 @@ cuando se implementen.
 
 Sin KPIs por run, el backlog se convierte en wishlist. Para cada experimento/preset, reportar:
 
-- **Calidad numérica (termómetro):**
-  - PPL en Wikitext‑2 (`wikitext-2-raw/wiki.test.raw`) con `ctx`/`chunks` fijos.
-  - Reportar `ΔPPL` vs base y `PPL±std` si aplica.
-- **Estabilidad funcional (gate final):**
-  - Greedy pack con prompts duros: `calibration/greedy_zombie_pack.txt`.
-  - Runner: `scripts/seeddelta-greedy-pack.sh` o `scripts/seeddelta-policy-eval.sh --greedy-pack ...`.
-  - Criterio v1: `RESULT: PASS` (0 prompts flagged).
-- **Perf (prompt y gen):**
-  - `tok/s` en prompt eval y gen batch=1 (p.ej. `llama-cli -n 256`), y/o `llama-perplexity` prompt time.
-  - Reportar `Δtok/s` vs base y “overhead por tensor activo” si se puede aislar.
-- **Memoria (steady y pico):**
-  - `Maximum resident set size` (`/usr/bin/time -v`) + `llama_memory_breakdown_print` (Host/CPU_REPACK/ctx/compute).
-  - Distinguir pico (repack) vs steady (host model) explícitamente.
-- **Stack-safety:**
-  - `stack_budget`: cuántos tensores SeedΔ activos por tipo (gate/up/down) y total.
-  - `stack_cost`: coste ponderado (ver sección 7), y su correlación con greedy/PPL.
+* **Calidad numérica (termómetro):**
+
+  * PPL en Wikitext-2 (`wikitext-2-raw/wiki.test.raw`) con `ctx`/`chunks` fijos.
+  * Reportar `ΔPPL` vs base y `PPL±std` si aplica.
+
+* **Estabilidad funcional (gate final):**
+
+  * Greedy pack con prompts duros: `calibration/greedy_zombie_pack.txt`.
+  * Runner: `scripts/seeddelta-greedy-pack.sh` o `scripts/seeddelta-policy-eval.sh --greedy-pack ...`.
+  * Criterio v1: `RESULT: PASS` (0 prompts flagged).
+  * Además (telemetría mínima por prompt, aunque PASS/FAIL sea el gate):
+
+    * `flag.loop` (repetición/atasco),
+    * `flag.lang_drift` (cambio de idioma),
+    * `flag.instruction_break` (rompe restricciones duras).
+
+* **Perf (prompt y gen):**
+
+  * `tok/s` en prompt eval y gen batch=1 (p.ej. `llama-cli -n 256`) y/o `llama-perplexity` prompt time.
+  * Reportar `Δtok/s` vs base y “overhead por tensor activo” si se puede aislar.
+
+* **Memoria (steady y pico):**
+
+  * `Maximum resident set size` (`/usr/bin/time -v`) + `llama_memory_breakdown_print` (Host/CPU_REPACK/ctx/compute).
+  * Distinguir pico (repack) vs steady (host model) explícitamente.
+
+* **Stack-safety:**
+
+  * `stack_budget`: cuántos tensores SeedΔ activos por tipo (gate/up/down) y total.
+  * `stack_cost`: coste ponderado (ver sección 7), y su correlación con greedy/PPL.
 
 Metodología multi-precisión (para conclusiones limpias):
 
-- Para aislar “source_precision”, comparar **el mismo modelo** generado desde la misma base:
-  - HF base → GGUF F16 → cuantizar a Q8/Q4 desde ese mismo F16 → construir SeedΔ en cada uno.
-  - Evitar inferencias fuertes comparando fine-tunes distintos (p.ej. Kimiko FP16 vs Mistral instruct Q8).
+* Para aislar “source_precision”, comparar **el mismo modelo** generado desde la misma base:
+
+  * HF base → GGUF F16 → cuantizar a Q8/Q4 desde ese mismo F16 → construir SeedΔ en cada uno.
+  * Evitar inferencias fuertes comparando fine-tunes distintos (p.ej. Kimiko FP16 vs Mistral instruct Q8).
 
 ---
 
@@ -66,10 +99,10 @@ Metodología multi-precisión (para conclusiones limpias):
 
 Prioridad por ROI y por reducción de ambigüedad:
 
-1) **Gating FFN compuesto + stack_budget/stack_cost** (secciones 5 y 7): evitar zombies antes de tocar más capas.
-2) **Comparabilidad multi-precisión** (sección 2): misma base F16 → Q8/Q4, y medir headroom real.
-3) **Δ por etapas** (6.1) y **K por tile** (6.2): aumentar capacidad sin subir K global a lo bruto.
-4) Optimización pesada de kernels (`W0x`) solo cuando sepamos qué presets valen la pena acelerar.
+1. **Gating FFN compuesto + stack_budget/stack_cost** (secciones 5 y 7): evitar zombies antes de tocar más capas.
+2. **Comparabilidad multi-precisión** (sección 2): misma base F16 → Q8/Q4, y medir headroom real.
+3. **Δ por etapas** (6.1) y **K por tile** (6.2): aumentar capacidad sin subir K global a lo bruto.
+4. Optimización pesada de kernels (`W0x`) solo cuando sepamos qué presets valen la pena acelerar.
 
 ---
 
@@ -77,34 +110,40 @@ Prioridad por ROI y por reducción de ambigüedad:
 
 Orden recomendado (antes de micro-optimizar):
 
-- [ ] Clarificar repack vs RSS: tener medición consistente (time -v + logs) y explicar picos vs steady.
-- [ ] Medir “costo por tensor activo” en runtime:
-      - cuánto sube prompt/gen tok/s y cuánto sube RSS/CPU_REPACK por cada tensor SeedΔ activado.
-- [ ] Instrumentar stack-safety: medir cuántos tensores pasan por policy vs cuántos terminan activos tras endurecer thresholds.
-      - Reportar `build.stack_budget` y `build.stack_cost`.
-- [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
-- [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
+* [ ] Clarificar repack vs RSS: tener medición consistente (time -v + logs) y explicar picos vs steady.
+* [ ] Medir “costo por tensor activo” en runtime:
+  - cuánto sube/baja prompt/gen tok/s y cuánto cambia RSS/CPU_REPACK por cada tensor SeedΔ activado.
+* [ ] Instrumentar stack-safety: medir cuántos tensores pasan por policy vs cuántos terminan activos tras endurecer thresholds.
+  - Reportar `build.stack_budget` y `build.stack_cost`.
+* [ ] Reducir overhead de índices/layout (u16 contiguo, mejor packing por bloque).
+* [ ] Optimizar `W0x` (cache por token/batch; vectorizar base; reducir overhead en base+residual).
+
+---
 
 ## 2) Calidad / data-aware “de verdad”
 
-- [ ] Mejorar dataset para imatrix por modelo (no depender de `gemma_calibration.txt` para todo).
-- [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar `||WX - ŴX||` más allá de imatrix diagonal
-      (objetivo funcional: `||WX - ŴX||` con activaciones reales en `ffn_gate/up/down`).
-- [ ] Explorar construir SeedΔ desde F16/Q8 como fuente (evitar “loss-on-loss” de Q4).
-- [ ] Validar gating multi-precisión: repetir builder + policy en al menos tres precisiones (FP16, Q8, Q4)
-      para el mismo modelo y documentar diferencias de `cos_x_w` / `stack_budget`.
-- [ ] Añadir metadata `seeddelta.source_precision` o similar al GGUF/export para rastrear con qué
-      precisión se generó SeedΔ (p.ej. `fp16`, `q8_0`, `q4_k_m`).
+* [ ] Mejorar dataset para imatrix por modelo (no depender de `gemma_calibration.txt` para todo).
+* [ ] (Opcional) capturar activaciones reales por tensor (`X`) y optimizar (|WX - \hat W X|) más allá de imatrix diagonal
+  (objetivo funcional: (|WX - \hat W X|) con activaciones reales en `ffn_gate/up/down`).
+* [ ] Explorar construir SeedΔ desde F16/Q8 como fuente (evitar “loss-on-loss” de Q4).
+* [ ] Validar gating multi-precisión: repetir builder + policy en al menos tres precisiones (FP16, Q8, Q4)
+  para el mismo modelo y documentar diferencias de `cos_x_w` / `stack_budget`.
+* [ ] Añadir metadata `seeddelta.source_precision` o similar al GGUF/export para rastrear con qué
+  precisión se generó SeedΔ (p.ej. `fp16`, `q8_0`, `q4_k_m`).
+
+---
 
 ## 3) Expandir targets más allá de FFN (Fase 5)
 
-- [ ] Probar policy/gating en QKV/O con budgets conservadores (solo si gating indica que hay margen).
-- [ ] Embeddings/LM head solo con gating ultra estricto (e.g. umbrales de cos muy altos y stack-budget mínimo).
+* [ ] Probar policy/gating en QKV/O con budgets conservadores (solo si gating indica que hay margen).
+* [ ] Embeddings/LM head solo con gating ultra estricto (e.g. umbrales de cos muy altos y stack-budget mínimo).
+
+---
 
 ## 4) Modelos y pruebas cruzadas
 
-- [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating
-      para detectar regresiones temprano (PPL+greedy pack).
+* [ ] Smoke tests obligatorios en modelos pequeños (Gemma 1B/4B) cada vez que se toque policy/gating
+  para detectar regresiones temprano (PPL+greedy pack).
 
 ---
 
@@ -112,25 +151,43 @@ Orden recomendado (antes de micro-optimizar):
 
 Motivación empírica (Qwen 7B Q4, Mistral 7B Q8, Gemma 4B Q4):
 
-- Tensores individuales pueden “pasar” gating (`cos_x_w` decente) pero el bloque completo FFN (`gate+up+down`)
+* Tensores individuales pueden “pasar” gating (`cos_x_w` decente) pero el bloque completo FFN (`gate+up+down`)
   rompe comportamiento greedy al apilar varias capas (loops, drift de idioma, fallos en instrucciones duras).
-- En SwiGLU/SILU el error en `gate`/`up` es multiplicativo: cambia patrón de activación antes de la no-linealidad
-  y luego se amplifica al multiplicar por `up` y proyectar con `down`.
+* En SwiGLU/SILU el error en `gate`/`up` es multiplicativo y selectivo: cambia qué activaciones “se abren”
+  antes de la no-linealidad, y luego ese cambio se amplifica al combinarse y proyectarse con `down`.
 
 Acciones:
 
-- [ ] Definir un score de calidad **a nivel FFN compuesto**:
-      - score primario: `cos_mean` + `cos_p05` de la salida del bloque:
-        - `FFN(x)=W_down(silu(W_gate x) ⊙ (W_up x))`
-        - `\hat{FFN}(x)=\hat W_down(silu(\hat W_gate x) ⊙ (\hat W_up x))`
-      - score secundario (drift): `mean/var` y colas (p05/p95) de `h` y de la salida del bloque.
-      - dataset/activaciones: usar activaciones reales `x` (mismo texto/calib usado para imatrix o un pack representativo).
-      - decisión v1:
-        - `gate/up` solo si el **FFN-score** pasa (no basta con `cos_x_w` por tensor).
-        - `down` puede seguir con gating por tensor mientras FFN-score no esté disponible.
-- [ ] Explorar políticas “down-only por defecto”:
-      - habilitar SeedΔ en `ffn_down` más agresivamente,
-      - requerir thresholds más altos o score FFN compuesto para permitir SeedΔ en `gate/up`.
+* [ ] Definir un score de calidad **a nivel FFN compuesto** (medible y reproducible):
+
+  * Definición del bloque:
+    [
+    \mathrm{FFN}(x)=W_{down}\big(\mathrm{silu}(W_{gate}x)\odot (W_{up}x)\big)
+    ]
+    [
+    \widehat{\mathrm{FFN}}(x)=\hat W_{down}\big(\mathrm{silu}(\hat W_{gate}x)\odot (\hat W_{up}x)\big)
+    ]
+  * Score primario (por token/posición (i), y agregación sobre dataset):
+    [
+    c_i=\cos(y_i,\hat y_i)=\frac{\langle y_i,\hat y_i\rangle}{|y_i||\hat y_i|+\epsilon}
+    ]
+    con (y_i=\mathrm{FFN}(x_i)), (\hat y_i=\widehat{\mathrm{FFN}}(x_i)).
+    Reportar: `ffn_cos_mean = mean_i(c_i)` y `ffn_cos_p05 = p05_i(c_i)`.
+  * Score secundario (drift de escala):
+    [
+    r_i=\frac{|\hat y_i|}{|y_i|+\epsilon}
+    ]
+    Reportar: `ffn_norm_ratio_mean` + `p05/p95`.
+  * Dataset/activaciones: usar activaciones reales (x_i) (mismo texto/calib usado para imatrix o un pack representativo).
+  * Decisión v1:
+
+    * permitir tocar `gate/up` **solo si** el **FFN-score** pasa (no basta con `cos_x_w` por tensor).
+    * `down` puede seguir con gating por tensor mientras FFN-score no esté disponible (pero migrar a FFN-score cuando exista).
+
+* [ ] Explorar políticas “down-only por defecto”:
+
+  * habilitar SeedΔ en `ffn_down` más agresivamente,
+  * requerir thresholds más altos o FFN-score compuesto para permitir SeedΔ en `gate/up`.
 
 ---
 
@@ -140,35 +197,51 @@ Acciones:
 
 Idea: aproximar el residual en varias etapas pequeñas:
 
-- `\hat W = W_0 + Δ_1 + Δ_2 + ... + Δ_m`, donde cada `Δ_s` tiene presupuesto K pequeño y corrige el residual del residual.
-- Análogo a matching pursuit/OMP: el primer top-K es miope; stages sucesivos pueden capturar estructura que el primer corte no vio.
+* [
+  \hat W = W_0 + \Delta_1 + \Delta_2 + \cdots + \Delta_m
+  ]
+* Análogo a matching pursuit/OMP: el primer top-K es miope; stages sucesivos pueden capturar estructura que el primer corte no vio.
 
 Acciones:
 
-- [ ] Diseñar un esquema de builder “multi-stage”:
-      - número de stages `m` pequeño (p.ej. 2–3), con K decreciente o constante.
-      - gating y report JSON por stage (para ver ganancia marginal de cada `Δ_s`).
-- [ ] Definir condición de stop (no “stages infinitos”):
-      - permitir `stage+1` solo si mejora el score funcional > X% o reduce error > Y por costo adicional.
-      - si no hay ganancia marginal clara, no agregar stages (evita matar perf/complexidad).
-- [ ] Definir un presupuesto total de compute/memoria por tensor:
-      - limitar `Σ_s K_s` y el número de stages en función de la ganancia observada en métricas funcionales.
+* [ ] Diseñar un esquema de builder “multi-stage”:
+
+  * número de stages (m) pequeño (p.ej. 2–3), con K decreciente o constante.
+  * evaluar por stage: (\hat W^{(s)}=W_0+\sum_{j=1}^s \Delta_j) y medir el score funcional (FFN-score o (|WX-\hat WX|)).
+  * gating y report JSON por stage (para ver ganancia marginal de cada (\Delta_s)).
+
+* [ ] Definir condición de stop (no “stages infinitos”):
+
+  * permitir `stage+1` solo si mejora el score funcional > X% o reduce error > Y por costo adicional.
+  * si no hay ganancia marginal clara, no agregar stages (evita matar perf/complexidad).
+
+* [ ] Definir un presupuesto total de compute/memoria por tensor:
+
+  * limitar (\sum_s K_s) y el número de stages en función de la ganancia observada.
 
 ### 6.2) K por subcapa/bloque (tiles)
 
 Idea: dividir la matriz en tiles y asignar K distinto según “importancia/dificultad”:
 
-- tiles alineados con el `block` (32/64) y con el layout de cache.
-- pocos niveles de K (p.ej. {256, 512, 1024, 1536}) para evitar explosión de combinatoria.
+* tiles alineados con `block_rows` (32/64) y con el layout de cache.
+* pocos niveles de K (p.ej. {256, 512, 1024, 1536}) para evitar explosión de combinatoria.
 
 Acciones:
 
-- [ ] Definir una factorización por tiles (filas/columnas o bloques 2D) y medir curva “error vs K” por tile.
-- [ ] Formular un “knapsack suave” implementable (greedy allocate):
-      - medir “beneficio por +ΔK” en un subconjunto de tiles (top‑N por importancia imatrix),
-      - asignar K por niveles hasta consumir presupuesto total (sin solver exacto).
-- [ ] Exponer en policy una forma simple de esto:
-      - p.ej. `K_levels` globales + reglas por rango de filas/cols/subcapa (stack inferior, media, superior).
+* [ ] Definir una factorización por tiles (v1: filas) y medir curva “error vs K” por tile.
+* [ ] Formular un “knapsack suave” implementable (greedy allocate):
+
+  * definir utilidad por tile:
+
+    * ideal: (E_t(K)=|W_tX-\hat W_t(K)X|_F^2) o score funcional equivalente,
+    * proxy: error ponderado por imatrix/diagonal si no hay (X).
+  * medir “beneficio por +ΔK”:
+
+    * (\Delta E_t = E_t(K_{cur}) - E_t(K_{next})),
+    * asignar K por niveles hasta consumir presupuesto total (sin solver exacto).
+* [ ] Exponer en policy una forma simple:
+
+  * `K_levels` globales + reglas por rangos de tiles (inferior/media/superior) o por “top-N tiles” según importancia.
 
 ---
 
@@ -176,19 +249,33 @@ Acciones:
 
 Razonamiento:
 
-- El error no se suma linealmente, se **encadena** a través de capas y no-linealidades.
-- Un gating por tensor puede aceptar muchos deltas “borderline” que, al apilarse, degradan PPL y greedy.
+* El error no se suma linealmente, se **encadena** a través de capas y no-linealidades.
+* Un gating por tensor puede aceptar muchos deltas “borderline” que, al apilarse, degradan PPL y greedy.
 
 Acciones:
 
-- [ ] Definir un “presupuesto de stack” global por modelo/config:
-      - máximo número de tensores SeedΔ activos por tipo (`gate/up/down`) y por bloque (FFN/attn).
-      - reglas más estrictas (umbrales más altos) cuando el stack_budget potencial crece.
-- [ ] Hacer el budget más inteligente con un “coste ponderado” (no solo conteo):
-      - intuición: tensores borderline (cola p05 baja) consumen más presupuesto que tensores muy buenos.
-      - ejemplo conceptual:
-        - `cost = α·(1 - cos_mean) + β·(1 - cos_p05)` (por tensor, usando métrica funcional si existe).
-        - permitir más tensores si son “muy buenos” y cortar rápido si son borderline.
-- [ ] Integrar stack-safety en policy:
-      - campos tipo `stack_budget.max_tensors`, `stack_budget.max_gate_up`, etc.
-      - decisiones claras en report JSON cuando un tensor no se activa por exceder presupuesto global.
+* [ ] Definir un “presupuesto de stack” global por modelo/config:
+
+  * máximo número de tensores SeedΔ activos por tipo (`gate/up/down`) y por bloque (FFN/attn),
+  * reglas más estrictas (umbrales más altos) cuando el stack_budget potencial crece.
+
+* [ ] Hacer el budget más inteligente con un “coste ponderado” (no solo conteo):
+
+  * intuición: tensores borderline (cola p05 baja) consumen más presupuesto que tensores muy buenos.
+  * definir un coste v1 (clamp + estable):
+
+    * clamp: `cos := clamp(cos, -1, 1)`
+    * [
+      cost = \alpha(1-\bar c) + \beta(1-c_{p05})
+      ]
+    * (opcional v2) penalizar drift de escala si está disponible:
+      [
+      cost += \gamma,|\log(\bar r)|
+      ]
+      donde (\bar r) es `norm_ratio_mean` (o del FFN-score).
+  * permitir más tensores si son “muy buenos” y cortar rápido si son borderline.
+
+* [ ] Integrar stack-safety en policy:
+
+  * campos tipo `stack_budget.max_tensors`, `stack_budget.max_gate_up`, etc.
+  * decisiones claras en report JSON cuando un tensor no se activa por exceder presupuesto global.
