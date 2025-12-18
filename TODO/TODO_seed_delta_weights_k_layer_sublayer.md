@@ -109,6 +109,34 @@ Sin KPIs por run, el backlog se convierte en wishlist. Para cada experimento/pre
     * `accepted/emit`, `strip`, `reject_reason`, `metric_used`, métricas y thresholds/targets por tensor.
     * si hay tiled-K: `tile_rows`, `tile_rows_align`, `K_levels`, `unique_k_count`, `tiles_rounded_count` y ratio.
 
+### Esquema mínimo `report.json` (claves fijas)
+
+Objetivo: que scripts (ablations, A/B, dashboards) no dependan de “parsear logs” ni de nombres variables.
+
+Por tensor (un objeto por `blk.N/<tensor_name>`):
+
+* `accepted` (bool), `emit` (bool), `strip` (bool)
+* `reject_reason` (enum fijo):
+  * `gating`, `ffn_block_score`, `stack_budget`, `stack_cost`, `perf_budget`, `k_custom_limit`
+* `metric_used` (enum fijo): `cos_x_w` | `ffn_cos`
+* `metrics` (obj): `cos_mean`, `cos_p05`, `ffn_cos_mean`, `ffn_cos_p05`, `norm_ratio_mean`, `ffn_log_norm_ratio_mean`, `ffn_l2_mean`, etc (solo las que apliquen)
+* `thresholds` (obj): umbrales usados por gating
+* `targets_used` (obj): `{ tau_mean, tau_p05 }` usados por `stack_cost` (según `metric_used`)
+* `stack_cost_delta` (float), `stack_cost_total` (float)
+
+Si tiled-K:
+
+* `tile_rows` (int), `tile_rows_align` (int)
+* `k_levels` (lista de int), `k_total_per_tensor` (int)
+* `unique_k_count` (int), `tiles_rounded_count` (int), `tiles_rounded_pct` (float)
+* `k_per_tile` (lista densa por tile, v1): K seleccionado final (post-round) por tile, en el mismo orden de tiles por filas
+
+Si `k_custom`:
+
+* `k_custom_used` (bool)
+* `k_requested_stats` (obj): `{min,max,mean}` + histogram opcional
+* `k_selected_stats` (obj): `{min,max,mean}` + histogram opcional
+
 Metodología multi-precisión (para conclusiones limpias):
 
 * Para aislar “source_precision”, comparar **el mismo modelo** generado desde la misma base:
@@ -343,17 +371,73 @@ Acciones:
 
 ---
 
-### 6.3) `K_levels` (MVP) vs `K_custom` (experimental, builder-only)
+### 6.3) Flags e interfaz `K_levels` (MVP) vs `K_custom` (experimental, builder-only)
 
-Objetivo: evitar 2 runtimes (levels vs custom) mientras mantenemos control fino.
+Objetivo: evitar 2 runtimes (levels vs custom) mientras mantenemos control fino y reproducible.
 
-* **MVP (core):** policy solo usa `K_levels` (2–4 niveles) y `strict`.
-  * Ejemplo: `K_levels = [256, 512, 1024, 1536]`.
-  * Runtime soporta estos niveles explícitos (sin “kernel genérico” para K arbitrario).
+#### Flags (v1)
 
-* **Experimental (builder-only, round-only):** permitir `K_custom` en policy, pero el builder **redondea** a un `K_levels`:
-  * v1: redondeo al nivel más cercano (empates hacia arriba).
-  * el `report.json` debe registrar `K_requested` vs `K_selected`, y `tiles_rounded_count/ratio`.
+Tiles:
+
+* `--k-tiles-enable 0|1`
+* `--k-tile-rows 1024` (clamp: `tile_rows = min(tile_rows, n_out)`)
+* `--k-tile-rows-align 32|64` (clamp: `tile_rows >= tile_rows_align`)
+* `--k-levels 256,512,1024,1536` (2–4 niveles)
+* `--k-levels-mode strict` (runtime SOLO soporta estos niveles; no hay kernel genérico para K arbitrario)
+
+Budget:
+
+* `--k-total-per-tensor N` (hard-cap; misma unidad que `K_t`)
+
+`K_custom` (builder-only, v1 fijo a round):
+
+* `--allow-k-custom 0|1`
+* `--k-custom-file path/to/k_custom.yaml`
+* `--k-custom-mode round`
+* `--k-custom-rounding nearest` (empates hacia arriba)
+* `--k-custom-max-unique 8`
+* `--k-custom-max-tiles-pct 10`
+* `--k-custom-warn 1` (warning agregado por tensor, no por tile)
+
+**Unidades (importante):**
+
+* scheme `block`: `K_t` y `k-total-per-tensor` están en “# bloques 2D activos por row-block (B filas)”.
+* scheme `coo_rows`: están en “# entradas activas por fila”.
+
+#### Formato mínimo `k_custom.yaml` (v1)
+
+```yaml
+version: 1
+defaults:
+  max_unique_k: 8
+  max_tiles_pct: 10
+rules:
+  - name: boost_down_mid
+    priority: 100
+    match:
+      layers: "8..23"
+      tensor: "ffn_down"
+      tiles:
+        row_ranges:
+          - [0, 1024]
+          - [2048, 3072]
+    set:
+      k: 768
+
+  - name: gate_force_level
+    priority: 90
+    match:
+      layers: "0..31"
+      tensor: "ffn_gate"
+    set:
+      k_level: 3
+```
+
+Semántica v1:
+
+* `set.k` se redondea a `K_levels` (round-only). El report deja `k_requested` y `k_selected`.
+* `set.k_level` siempre fast-path.
+* Si excede `max_unique_k` o `max_tiles_pct`: warning agregado por tensor y se aplica una política determinista (definirla y reportarla; p.ej. clamp/ignore con `reject_reason = k_custom_limit`).
 
 ---
 
@@ -383,9 +467,13 @@ Acciones:
     * Definición de métricas para `\bar c` y `c_{p05}`:
       * mientras no exista FFN-score: usar `cos_mean_x_w` y `cos_p05_x_w` del tensor.
       * cuando exista FFN-score: para `gate/up` usar `ffn_cos_mean` y `ffn_cos_p05` (sección 5).
-    * Definición de targets `\tau_*` (para que tensores “muy buenos” no paguen coste):
-      * v1 (configurable, por tipo): targets más altos para `gate/up` que para `down`.
-      * Ejemplo inicial: `gate/up`: `\tau_{mean}=0.70`, `\tau_{p05}=0.55`; `down`: `\tau_{mean}=0.60`, `\tau_{p05}=0.45`.
+    * Targets `\tau_*` separados por métrica (no mezclar escalas):
+      * `tau_tensor_mean/tau_tensor_p05` para `cos_x_w_*` (proxy por tensor).
+      * `tau_ffn_mean/tau_ffn_p05` para `ffn_cos_*` (bloque compuesto).
+      * En `report.json`, por tensor: `metric_used` ∈ `{cos_x_w, ffn_cos}` y `targets_used = {tau_mean,tau_p05}`.
+    * Definición de targets (para que tensores “muy buenos” no paguen coste):
+      * v1 (configurable, por tipo): targets más altos para `gate/up` que para `down` dentro de cada set (tensor vs ffn).
+      * Ejemplo inicial (solo ilustrativo): para `cos_x_w_*` en CPU: `gate/up`: `\tau_{mean}=0.70`, `\tau_{p05}=0.55`; `down`: `\tau_{mean}=0.60`, `\tau_{p05}=0.45`.
     * Agregación v1 (sin ambigüedad):
       * `stack_cost_total = Σ_tensors cost(tensor)` (solo tensores SeedΔ emitidos/activos).
       * v2: permitir “agregación por bloque” (FFN-score) cuando exista telemetría compuesta estable.
