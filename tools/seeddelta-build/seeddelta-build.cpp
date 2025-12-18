@@ -220,6 +220,17 @@ struct eval_metrics {
     double norm_ratio_mean = 0.0;
 };
 
+struct ffn_proxy_metrics {
+    double cos_mean = 0.0;
+    double cos_p05 = 0.0;
+    double l2_mean = 0.0;
+    double l2_p95 = 0.0;
+    double log_norm_ratio_mean = 0.0;
+    double log_norm_ratio_p95 = 0.0;
+    int64_t eval_x = 0;
+    int64_t eval_out = 0;
+};
+
 struct cost_estimate {
     int64_t L = 0;
     int64_t B = 0;
@@ -1362,6 +1373,171 @@ static eval_metrics eval_seeddelta_x(
     return out;
 }
 
+// FFN proxy v0 (logging-only, replace-only-current-tensor, scheme=coo, no base).
+static bool eval_ffn_proxy_coo_replace_one(
+        const std::string & kind,
+        const ggml_tensor * W_gate,
+        const ggml_tensor * W_up,
+        const ggml_tensor * W_down,
+        const std::vector<int32_t> & d_idx,
+        const std::vector<float> & d_val,
+        int64_t K,
+        int64_t eval_x,
+        int64_t eval_cols,
+        int seed,
+        ffn_proxy_metrics & out) {
+    if (!W_gate || !W_up || !W_down) {
+        return false;
+    }
+    if (eval_x <= 0) {
+        return false;
+    }
+
+    const int64_t n_in = W_gate->ne[0];
+    const int64_t n_hidden = W_gate->ne[1];
+    const int64_t n_out = W_down->ne[1];
+
+    const int64_t n_x = std::min<int64_t>(eval_x, 128);
+    const int64_t n_hidden_samp = std::min<int64_t>(n_hidden, eval_cols > 0 ? eval_cols : 128);
+    const int64_t n_out_samp = std::min<int64_t>(n_out, eval_cols > 0 ? eval_cols : 128);
+
+    std::mt19937 rng(seed);
+    std::vector<int64_t> hid_idx(n_hidden);
+    std::iota(hid_idx.begin(), hid_idx.end(), 0);
+    std::shuffle(hid_idx.begin(), hid_idx.end(), rng);
+    hid_idx.resize((size_t) n_hidden_samp);
+
+    std::vector<int64_t> out_idx(n_out);
+    std::iota(out_idx.begin(), out_idx.end(), 0);
+    std::shuffle(out_idx.begin(), out_idx.end(), rng);
+    out_idx.resize((size_t) n_out_samp);
+
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    std::vector<float> x((size_t) n_in);
+    std::vector<float> col;
+    std::vector<double> y_true;
+    std::vector<double> y_hat;
+    y_true.reserve((size_t) n_out_samp);
+    y_hat.reserve((size_t) n_out_samp);
+
+    std::vector<double> gate_true((size_t) n_hidden_samp);
+    std::vector<double> gate_hat((size_t) n_hidden_samp);
+    std::vector<double> up_true((size_t) n_hidden_samp);
+    std::vector<double> up_hat((size_t) n_hidden_samp);
+
+    std::vector<double> l2_all;
+    std::vector<double> cos_all;
+    std::vector<double> log_nr_all;
+    l2_all.reserve((size_t) n_x);
+    cos_all.reserve((size_t) n_x);
+    log_nr_all.reserve((size_t) n_x);
+
+    auto silu = [](double v) -> double {
+        return v / (1.0 + std::exp(-v));
+    };
+
+    auto dot_dense_col = [&](const ggml_tensor * W, int64_t col_idx, const std::vector<float> & xv) -> double {
+        read_column_f32(W, col_idx, col);
+        double acc = 0.0;
+        for (int64_t i = 0; i < n_in; ++i) {
+            acc += (double) col[(size_t) i] * (double) xv[(size_t) i];
+        }
+        return acc;
+    };
+
+    auto dot_delta_col = [&](int64_t col_idx, const std::vector<float> & xv) -> double {
+        const int32_t * idx_col = d_idx.data() + (size_t) col_idx * (size_t) K;
+        const float *   val_col = d_val.data() + (size_t) col_idx * (size_t) K;
+        double acc = 0.0;
+        for (int64_t r = 0; r < K; ++r) {
+            const int32_t ii = idx_col[r];
+            if (ii < 0 || ii >= (int32_t) n_in) continue;
+            acc += (double) val_col[r] * (double) xv[(size_t) ii];
+        }
+        return acc;
+    };
+
+    for (int64_t xi = 0; xi < n_x; ++xi) {
+        for (int64_t i = 0; i < n_in; ++i) {
+            x[(size_t) i] = nd(rng);
+        }
+
+        for (int64_t hi = 0; hi < n_hidden_samp; ++hi) {
+            const int64_t h = hid_idx[(size_t) hi];
+            const double g_true = dot_dense_col(W_gate, h, x);
+            const double u_true = dot_dense_col(W_up,   h, x);
+            gate_true[(size_t) hi] = g_true;
+            up_true[(size_t) hi]   = u_true;
+
+            double g_hat = g_true;
+            double u_hat = u_true;
+            if (kind == \"ffn_gate\") {
+                g_hat = dot_delta_col(h, x);
+            } else if (kind == \"ffn_up\") {
+                u_hat = dot_delta_col(h, x);
+            }
+            gate_hat[(size_t) hi] = g_hat;
+            up_hat[(size_t) hi]   = u_hat;
+        }
+
+        y_true.assign((size_t) n_out_samp, 0.0);
+        y_hat.assign((size_t) n_out_samp, 0.0);
+
+        for (int64_t oi = 0; oi < n_out_samp; ++oi) {
+            const int64_t outcol = out_idx[(size_t) oi];
+            read_column_f32(W_down, outcol, col);
+            double yt = 0.0, yh = 0.0;
+            for (int64_t hi = 0; hi < n_hidden_samp; ++hi) {
+                const int64_t h = hid_idx[(size_t) hi];
+                const double a_true = silu(gate_true[(size_t) hi]);
+                const double a_hat  = silu(gate_hat[(size_t) hi]);
+                const double up_t = up_true[(size_t) hi];
+                const double up_h = up_hat[(size_t) hi];
+                const double w = (h < (int64_t) col.size()) ? (double) col[(size_t) h] : 0.0;
+                yt += a_true * up_t * w;
+                yh += a_hat  * up_h * w;
+            }
+            y_true[(size_t) oi] = yt;
+            y_hat[(size_t) oi]  = yh;
+        }
+
+        double dot = 0.0;
+        double n1 = 0.0;
+        double n2 = 0.0;
+        double l2 = 0.0;
+        for (size_t i = 0; i < y_true.size(); ++i) {
+            const double a = y_true[i];
+            const double b = y_hat[i];
+            dot += a * b;
+            n1  += a * a;
+            n2  += b * b;
+            const double d = a - b;
+            l2 += d * d;
+        }
+        const double denom = std::sqrt(std::max(n1, 1e-20)) * std::sqrt(std::max(n2, 1e-20));
+        const double cos = denom > 0.0 ? dot / denom : 0.0;
+        const double l2n = std::sqrt(std::max(l2, 0.0));
+        const double nr = (n1 > 0.0) ? std::sqrt(std::max(n2, 1e-20)) / std::sqrt(std::max(n1, 1e-20)) : 0.0;
+
+        cos_all.push_back(cos);
+        l2_all.push_back(l2n);
+        if (nr > 0.0) {
+            log_nr_all.push_back(std::log(nr));
+        }
+    }
+
+    out.eval_x = n_x;
+    out.eval_out = n_out_samp;
+    out.cos_mean = cos_all.empty() ? 0.0 : std::accumulate(cos_all.begin(), cos_all.end(), 0.0) / (double) cos_all.size();
+    out.cos_p05  = percentile_vec(cos_all, 0.05);
+    out.l2_mean  = l2_all.empty() ? 0.0 : std::accumulate(l2_all.begin(), l2_all.end(), 0.0) / (double) l2_all.size();
+    out.l2_p95   = percentile_vec(l2_all, 0.95);
+    out.log_norm_ratio_mean = log_nr_all.empty() ? 0.0 : std::accumulate(log_nr_all.begin(), log_nr_all.end(), 0.0) / (double) log_nr_all.size();
+    out.log_norm_ratio_p95  = percentile_vec(log_nr_all, 0.95);
+    return true;
+}
+
 static eval_metrics eval_seeddelta_x_block(
         const ggml_tensor * W,
         const base_fit * base,
@@ -1908,6 +2084,21 @@ struct report_entry {
     k_stats k_requested_stats;
     k_stats k_selected_stats;
 
+    // FFN proxy metrics (v0: replace-only-current-tensor; logging only)
+    bool ffn_proxy_available = false;
+    std::string ffn_proxy_reason;
+    std::string ffn_proxy_scope;
+    bool ffn_proxy_base_used = false;
+    int64_t ffn_proxy_eval_x = 0;
+    int64_t ffn_proxy_eval_out = 0;
+    int64_t ffn_proxy_seed = 0;
+    double ffn_proxy_cos_mean = 0.0;
+    double ffn_proxy_cos_p05 = 0.0;
+    double ffn_proxy_l2_mean = 0.0;
+    double ffn_proxy_l2_p95 = 0.0;
+    double ffn_proxy_log_norm_ratio_mean = 0.0;
+    double ffn_proxy_log_norm_ratio_p95 = 0.0;
+
     struct autotune_attempt {
         int64_t K_budget = 0;
         int64_t K_eff = 0;
@@ -1950,6 +2141,16 @@ static std::string metric_kind_to_string(sd_metric_kind m) {
         case sd_metric_kind::cos:     return "cos";
     }
     return "cos";
+}
+
+static double percentile_vec(std::vector<double> v, double p) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const double x = p * double(v.size() - 1);
+    const size_t i = (size_t) x;
+    const size_t j = std::min(i + 1, v.size() - 1);
+    const double a = x - double(i);
+    return v[i] * (1.0 - a) + v[j] * a;
 }
 
 static double pick_metric_value(const report_entry & re, sd_metric_kind m) {
@@ -2828,6 +3029,39 @@ int main(int argc, char ** argv) {
             const int64_t n_blocks_keep = re.n_blocks;
             const int64_t K_eff = re.K;
 
+            // FFN proxy v0 (logging-only): replace only this tensor (coo, no base).
+            if (scheme == RESID_COO && !write_base && eval_x > 0) {
+                const std::string wg_name = "blk." + std::to_string(il) + ".ffn_gate.weight";
+                const std::string wu_name = "blk." + std::to_string(il) + ".ffn_up.weight";
+                const std::string wd_name = "blk." + std::to_string(il) + ".ffn_down.weight";
+                ggml_tensor * W_gate = ggml_get_tensor(ctx_data, wg_name.c_str());
+                ggml_tensor * W_up   = ggml_get_tensor(ctx_data, wu_name.c_str());
+                ggml_tensor * W_down = ggml_get_tensor(ctx_data, wd_name.c_str());
+
+                ffn_proxy_metrics fpm;
+                const int proxy_seed = seed + (int) il * 101 + (int) (kind == "ffn_gate" ? 1 : (kind == "ffn_up" ? 2 : 3));
+                if (eval_ffn_proxy_coo_replace_one(kind, W_gate, W_up, W_down, d_idx, d_val, K_eff, eval_x, eval_cols, proxy_seed, fpm)) {
+                    re.ffn_proxy_available = true;
+                    re.ffn_proxy_scope = "replace_only_current_tensor";
+                    re.ffn_proxy_base_used = false;
+                    re.ffn_proxy_eval_x = fpm.eval_x;
+                    re.ffn_proxy_eval_out = fpm.eval_out;
+                    re.ffn_proxy_seed = proxy_seed;
+                    re.ffn_proxy_cos_mean = fpm.cos_mean;
+                    re.ffn_proxy_cos_p05 = fpm.cos_p05;
+                    re.ffn_proxy_l2_mean = fpm.l2_mean;
+                    re.ffn_proxy_l2_p95 = fpm.l2_p95;
+                    re.ffn_proxy_log_norm_ratio_mean = fpm.log_norm_ratio_mean;
+                    re.ffn_proxy_log_norm_ratio_p95 = fpm.log_norm_ratio_p95;
+                } else {
+                    re.ffn_proxy_available = false;
+                    re.ffn_proxy_reason = "proxy_unavailable";
+                }
+            } else {
+                re.ffn_proxy_available = false;
+                re.ffn_proxy_reason = write_base ? "proxy_requires_no_base" : "proxy_requires_coo_evalx";
+            }
+
             // Stack-cost (v1): simple affine penalty vs targets; zero if not emitted or metric missing.
             {
                 const double metric_mean = re.gating_value;
@@ -3194,6 +3428,19 @@ int main(int argc, char ** argv) {
             out << "      \"targets_used\": {\"tau_mean\": " << e.target_tau_mean << ", \"tau_p05\": " << e.target_tau_p05 << "},\n";
             out << "      \"stack_cost_delta\": " << e.stack_cost_delta << ",\n";
             out << "      \"stack_cost_total\": " << e.stack_cost_total << ",\n";
+            out << "      \"ffn_proxy_available\": " << (e.ffn_proxy_available ? "true" : "false") << ",\n";
+            out << "      \"ffn_proxy_reason\": \"" << json_escape(e.ffn_proxy_reason) << "\",\n";
+            out << "      \"ffn_proxy_scope\": \"" << json_escape(e.ffn_proxy_scope) << "\",\n";
+            out << "      \"ffn_proxy_base_used\": " << (e.ffn_proxy_base_used ? "true" : "false") << ",\n";
+            out << "      \"ffn_proxy_eval_x\": " << e.ffn_proxy_eval_x << ",\n";
+            out << "      \"ffn_proxy_eval_out\": " << e.ffn_proxy_eval_out << ",\n";
+            out << "      \"ffn_proxy_seed\": " << e.ffn_proxy_seed << ",\n";
+            out << "      \"ffn_proxy_cos_mean\": " << e.ffn_proxy_cos_mean << ",\n";
+            out << "      \"ffn_proxy_cos_p05\": " << e.ffn_proxy_cos_p05 << ",\n";
+            out << "      \"ffn_proxy_l2_mean\": " << e.ffn_proxy_l2_mean << ",\n";
+            out << "      \"ffn_proxy_l2_p95\": " << e.ffn_proxy_l2_p95 << ",\n";
+            out << "      \"ffn_proxy_log_norm_ratio_mean\": " << e.ffn_proxy_log_norm_ratio_mean << ",\n";
+            out << "      \"ffn_proxy_log_norm_ratio_p95\": " << e.ffn_proxy_log_norm_ratio_p95 << ",\n";
             out << "      \"emit\": " << (e.emit ? "true" : "false") << ",\n";
             out << "      \"strip_dense\": " << (e.strip_applied ? "true" : "false") << ",\n";
             out << "      \"decision\": \"" << json_escape(e.decision_reason) << "\",\n";
