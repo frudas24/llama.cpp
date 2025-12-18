@@ -388,6 +388,7 @@ Tiles:
 Budget:
 
 * `--k-total-per-tensor N` (hard-cap; misma unidad que `K_t`)
+  * Semántica v1: se aplica como cap por tile (p.ej. `K_selected = min(K_selected, N)`), no como sumatoria global.
 
 `K_custom` (builder-only, v1 fijo a round):
 
@@ -402,7 +403,7 @@ Budget:
 **Unidades (importante):**
 
 * scheme `block`: `K_t` y `k-total-per-tensor` están en “# bloques 2D activos por row-block (B filas)”.
-* scheme `coo_rows`: están en “# entradas activas por fila”.
+* scheme `coo`: están en “# entradas activas por fila”.
 
 #### Formato mínimo `k_custom.yaml` (v1)
 
@@ -436,8 +437,15 @@ rules:
 Semántica v1:
 
 * `set.k` se redondea a `K_levels` (round-only). El report deja `k_requested` y `k_selected`.
-* `set.k_level` siempre fast-path.
-* Si excede `max_unique_k` o `max_tiles_pct`: warning agregado por tensor y se aplica una política determinista (definirla y reportarla; p.ej. clamp/ignore con `reject_reason = k_custom_limit`).
+* `set.k_level` siempre fast-path (índice 0-based en `K_levels`).
+* Rangos:
+  * `match.layers: "L..R"` es inclusivo (0-based) y debe referir a `blk.N` tal como aparece en nombres GGUF.
+  * `row_ranges: [row_lo, row_hi)` es half-open y está en índices de fila de $W$ (dimensión $n_{out}$).
+    * Recomendación v1: los límites deben coincidir con bordes de tile (`tile_rows`) para mantener trazabilidad simple.
+* Límites y política determinista (v1):
+  * `max_tiles_pct` limita el % de tiles con override (`k_custom_used`) por tensor.
+  * `max_unique_k` limita `unique_k_count` (post-round) y debe ser `<= len(k_levels)` (con 2–4 niveles suele ser redundante, pero deja el contrato listo).
+  * Si se excede un límite: aplicar overrides en orden de `priority` (mayor primero) y descartar el resto hasta cumplir; registrar `reject_reason = k_custom_limit` + contadores (`tiles_dropped_count`, `tiles_dropped_pct`).
 
 ---
 
