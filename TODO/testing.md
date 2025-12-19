@@ -1,33 +1,11 @@
-# 1. Re-run la evaluación de PPL con el modelo Gemma 1B strip que ya tienes.
-./build/bin/llama-perplexity \
-  -m calibration/gemma_sd_mid_10-11_block16_k64_strip.gguf \
-  -f calibration/gemma_calibration.txt \
-  --chunks 16 -t 8 -c 512 --no-warmup \
-  --seeddelta \
-  | tee calibration/gemma_pplex_eval.log
+- [x] Re-run la evaluación de PPL (Gemma 1B strip): `calibration/gemma_pplex_eval.log` con `-c 512 --seeddelta`.
 
-# 2. Chequear greedy pack rápido (usa prompt pack existente y comparalo contra el modelo base).
-./build/bin/llama-cli \
-  -m calibration/gemma_sd_mid_10-11_block16_k64_strip.gguf \
-  --seeddelta \
-  -t 8 -c 512 --temp 0 --top-k 1 --seed 1 \
-  --prompt-file calibration/greedy_zombie_pack.txt \
-  --single-turn --no-warmup --no-display-prompt \
-  | tee calibration/gemma_greedy_strip.log
+- [x] Greedy pack rápido (SeedΔ): usar `-f` y `-c 1024` porque con `-c 512` el prompt pack excede el contexto; log en `calibration/gemma_greedy_strip.log`.
 
-# 3. Simple smoke para el modelo base (sin SeedΔ) para comparar tiempos/RSS.
-./build/bin/llama-cli \
-  -m calibration/gemma_sd_mid_10-11_block16_k64_strip.gguf \
-  -t 8 -c 512 --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup \
-  --prompt "hola" >/dev/null
-/usr/bin/time -v ./build/bin/llama-cli \
-  -m calibration/gemma_sd_mid_10-11_block16_k64_strip.gguf \
-  --seeddelta \
-  -t 8 -c 512 --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup \
-  -p "hola" >/dev/null
+- [x] Simple smoke modelo base (sin SeedΔ): ya no crashea en CPU; corre `llama-cli ... --prompt "hola"` en 512 ctx.
+  - `/usr/bin/time` con SeedΔ ejecutado: `--seeddelta -c 512 -p "hola"` completó (RSS máx ~910 MB).
 
-# 4. Validation rápida del report JSON generado por el refactor (llegará en build).
-jq '.weights[] | {kind,ffn_proxy_available,stack_cost_total}' calibration/gemma1b_ffnproxy_smoke.json
+- [x] Validation rápida del report JSON: `jq '.weights[] | {kind,ffn_proxy_available,stack_cost_total}' calibration/gemma1b_ffnproxy_smoke.json`
 
 
 

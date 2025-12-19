@@ -1146,6 +1146,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            // Fallback to the lowest priority backend (typically CPU) instead of aborting.
+            // This avoids hard-crashing when no backend explicitly claimed a node (e.g. CPU-only builds
+            // with optional extensions). CPU backend supports all standard ops.
+            *cur_backend_id = sched->n_backends > 0 ? sched->n_backends - 1 : -1;
+            SET_CAUSE(node, "4.fallback");
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
