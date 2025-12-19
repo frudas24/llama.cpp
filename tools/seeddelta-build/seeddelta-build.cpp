@@ -1,5 +1,5 @@
-#include "sd_cli.h"
-#include "sd_runner.h"
+#include "include/sd_cli.h"
+#include "include/sd_runner.h"
 
 int main(int argc, char ** argv) {
     sd_args args;
