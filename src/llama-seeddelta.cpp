@@ -234,6 +234,13 @@ static inline float llama_seeddelta_debug_compare(
             std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " out=%g dense=%g diff=%g\n",
                          name ? name : "(unnamed)", o, t, y, y_dense, diff);
         }
+    } else {
+        const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
+        if (prev > 0) {
+            const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
+            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " fallback-unavailable\n",
+                         name ? name : "(unnamed)", o, t);
+        }
     }
     return y;
 }
