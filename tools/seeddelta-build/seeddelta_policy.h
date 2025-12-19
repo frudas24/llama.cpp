@@ -21,6 +21,7 @@ enum class sd_metric_kind {
     cos_x,    // cos_mean_x / cos_p05_x
     cos_w,    // cos_mean_w / cos_p05_w
     cos_x_w,  // cos_mean_x_w / cos_p05_x_w
+    ffn_score // composite FFN score (min(mean, p05), preferring x_w -> x -> w -> base)
 };
 
 struct sd_gating_thresholds {
@@ -94,4 +95,3 @@ sd_resolved_tensor sd_policy_resolve(
 
 // Helper: parse a layer selector string ("8-20,24") into a sorted unique list.
 std::vector<int64_t> sd_parse_layer_selector(const std::string & s);
-

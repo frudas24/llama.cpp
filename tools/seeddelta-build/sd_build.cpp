@@ -558,6 +558,7 @@ sd_build_result sd_build_layers(
                     }
                 }
 
+                t.re.ffn_score = sd_report::ffn_score_from_entry(t.re);
                 t.seconds = double(ggml_time_us() - t0_total) / 1e6;
                 return t;
             };
@@ -569,6 +570,14 @@ sd_build_result sd_build_layers(
             if (schedule.empty()) {
                 schedule.push_back(K_budget);
             }
+
+            auto select_gating_metric = [&](const report_entry & re) -> sd_metric_kind {
+                const bool prefer_ffn_block = (kind == "ffn_gate" || kind == "ffn_up");
+                if (prefer_ffn_block && re.has_x) {
+                    return sd_metric_kind::ffn_score;
+                }
+                return cfg.metric;
+            };
 
             std::unordered_set<int64_t> seen;
             std::vector<int64_t> sched_unique;
@@ -600,12 +609,15 @@ sd_build_result sd_build_layers(
                 trial_data td = run_trial(K_try);
 
                 td.re.gating_enabled = cfg.gating_enabled;
-                td.re.gating_metric_used = sd_report::metric_kind_to_string(cfg.metric);
                 td.re.gating_min_mean = gating_min_mean;
                 td.re.gating_min_p05  = gating_min_p05;
 
-                const bool metric_needs_x = (cfg.metric == sd_metric_kind::cos_x || cfg.metric == sd_metric_kind::cos_x_w);
-                const bool metric_needs_w = (cfg.metric == sd_metric_kind::cos_w || cfg.metric == sd_metric_kind::cos_x_w);
+                const sd_metric_kind gating_metric = select_gating_metric(td.re);
+                td.re.gating_metric_used = sd_report::metric_kind_to_string(gating_metric);
+                td.re.metric_used = td.re.gating_metric_used;
+
+                const bool metric_needs_x = (gating_metric == sd_metric_kind::cos_x || gating_metric == sd_metric_kind::cos_x_w || gating_metric == sd_metric_kind::ffn_score);
+                const bool metric_needs_w = (gating_metric == sd_metric_kind::cos_w || gating_metric == sd_metric_kind::cos_x_w);
                 bool metric_available = true;
                 if (cfg.gating_enabled) {
                     if (metric_needs_x && !td.re.has_x) {
@@ -616,8 +628,8 @@ sd_build_result sd_build_layers(
                     }
                 }
 
-                const double metric_val = sd_report::pick_metric_value(td.re, cfg.metric);
-                const double metric_p05 = sd_report::pick_metric_p05(td.re, cfg.metric);
+                const double metric_val = sd_report::pick_metric_value(td.re, gating_metric);
+                const double metric_p05 = sd_report::pick_metric_p05(td.re, gating_metric);
                 bool gating_pass = true;
                 if (cfg.gating_enabled) {
                     gating_pass = metric_available && metric_val >= gating_min_mean && metric_p05 >= gating_min_p05;
@@ -672,8 +684,11 @@ sd_build_result sd_build_layers(
                 best_trial.re.emit = false;
                 best_trial.re.gating_enabled = cfg.gating_enabled;
                 best_trial.re.gating_metric_used = sd_report::metric_kind_to_string(cfg.metric);
+                best_trial.re.metric_used = best_trial.re.gating_metric_used;
                 best_trial.re.gating_min_mean = gating_min_mean;
                 best_trial.re.gating_min_p05 = gating_min_p05;
+                best_trial.re.target_tau_mean = gating_min_mean;
+                best_trial.re.target_tau_p05 = gating_min_p05;
                 best_trial.re.decision_reason = "metric_unavailable";
                 have_best = true;
             }

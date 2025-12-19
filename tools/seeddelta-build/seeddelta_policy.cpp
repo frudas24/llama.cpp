@@ -14,6 +14,7 @@ static sd_metric_kind sd_metric_from_string(const std::string & s) {
     if (s == "cos_x_w" || s == "cos-x-w") return sd_metric_kind::cos_x_w;
     if (s == "cos_x"   || s == "cos-x")   return sd_metric_kind::cos_x;
     if (s == "cos_w"   || s == "cos-w")   return sd_metric_kind::cos_w;
+    if (s == "ffn_score" || s == "ffn-score" || s == "ffn") return sd_metric_kind::ffn_score;
     return sd_metric_kind::cos;
 }
 
@@ -305,8 +306,8 @@ sd_resolved_tensor sd_policy_resolve(
 
     const bool gating_requested = !(out.min_mean < 0.0f || out.min_p05 < 0.0f);
     out.gating_enabled = gating_requested;
-    out.require_eval_x = gating_requested && (out.metric == sd_metric_kind::cos_x || out.metric == sd_metric_kind::cos_x_w);
-    out.require_imatrix = gating_requested && (out.metric == sd_metric_kind::cos_w || out.metric == sd_metric_kind::cos_x_w);
+    out.require_eval_x = gating_requested && (out.metric == sd_metric_kind::cos_x || out.metric == sd_metric_kind::cos_x_w || out.metric == sd_metric_kind::ffn_score);
+    out.require_imatrix = gating_requested && (out.metric == sd_metric_kind::cos_w || out.metric == sd_metric_kind::cos_x_w || out.metric == sd_metric_kind::ffn_score);
 
     return out;
 }

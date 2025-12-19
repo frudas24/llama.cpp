@@ -63,9 +63,28 @@ std::string sd_report::metric_kind_to_string(sd_metric_kind m) {
         case sd_metric_kind::cos_x_w: return "cos_x_w";
         case sd_metric_kind::cos_x:   return "cos_x";
         case sd_metric_kind::cos_w:   return "cos_w";
+        case sd_metric_kind::ffn_score: return "ffn_score";
         case sd_metric_kind::cos:     return "cos";
     }
     return "cos";
+}
+
+static double ffn_score_from_metrics(const eval_metrics & em) {
+    return std::min(em.cos_mean, em.cos_p05);
+}
+
+double sd_report::ffn_score_from_entry(const report_entry & re) {
+    // Prefer x_w -> x -> w -> base
+    if (re.has_x && re.has_w && (re.em_x_w.cos_mean != 0.0 || re.em_x_w.cos_p05 != 0.0)) {
+        return ffn_score_from_metrics(re.em_x_w);
+    }
+    if (re.has_x && (re.em_x.cos_mean != 0.0 || re.em_x.cos_p05 != 0.0)) {
+        return ffn_score_from_metrics(re.em_x);
+    }
+    if (re.has_w && (re.em_w.cos_mean != 0.0 || re.em_w.cos_p05 != 0.0)) {
+        return ffn_score_from_metrics(re.em_w);
+    }
+    return ffn_score_from_metrics(re.em);
 }
 
 double sd_report::pick_metric_value(const report_entry & re, sd_metric_kind m) {
@@ -73,6 +92,7 @@ double sd_report::pick_metric_value(const report_entry & re, sd_metric_kind m) {
         case sd_metric_kind::cos_x_w: return re.em_x_w.cos_mean;
         case sd_metric_kind::cos_x:   return re.em_x.cos_mean;
         case sd_metric_kind::cos_w:   return re.em_w.cos_mean;
+        case sd_metric_kind::ffn_score: return ffn_score_from_entry(re);
         case sd_metric_kind::cos:     return re.em.cos_mean;
     }
     return re.em.cos_mean;
@@ -83,6 +103,7 @@ double sd_report::pick_metric_p05(const report_entry & re, sd_metric_kind m) {
         case sd_metric_kind::cos_x_w: return re.em_x_w.cos_p05;
         case sd_metric_kind::cos_x:   return re.em_x.cos_p05;
         case sd_metric_kind::cos_w:   return re.em_w.cos_p05;
+        case sd_metric_kind::ffn_score: return ffn_score_from_entry(re);
         case sd_metric_kind::cos:     return re.em.cos_p05;
     }
     return re.em.cos_p05;
@@ -191,6 +212,7 @@ bool sd_report::write_report_json(
         out << "      \"targets_used\": {\"tau_mean\": " << e.target_tau_mean << ", \"tau_p05\": " << e.target_tau_p05 << "},\n";
         out << "      \"stack_cost_delta\": " << e.stack_cost_delta << ",\n";
         out << "      \"stack_cost_total\": " << e.stack_cost_total << ",\n";
+        out << "      \"ffn_score\": " << e.ffn_score << ",\n";
         out << "      \"ffn_proxy_available\": " << (e.ffn_proxy_available ? "true" : "false") << ",\n";
         out << "      \"ffn_proxy_reason\": \"" << json_escape(e.ffn_proxy_reason) << "\",\n";
         out << "      \"ffn_proxy_scope\": \"" << json_escape(e.ffn_proxy_scope) << "\",\n";

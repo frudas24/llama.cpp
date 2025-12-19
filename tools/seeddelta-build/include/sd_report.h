@@ -41,6 +41,7 @@ struct report_entry {
     std::string reject_reason;
     double stack_cost_delta = 0.0;
     double stack_cost_total = 0.0;
+    double ffn_score = 0.0;
 
     // Tiled-K metadata (v1: may be empty if no tiles)
     int64_t tile_rows = 0;
@@ -136,6 +137,7 @@ void finalize_report_entry(report_entry & e);
 std::string metric_kind_to_string(sd_metric_kind m);
 double pick_metric_value(const report_entry & re, sd_metric_kind m);
 double pick_metric_p05(const report_entry & re, sd_metric_kind m);
+double ffn_score_from_entry(const report_entry & re);
 
 bool write_report_json(
         const std::string & path,
