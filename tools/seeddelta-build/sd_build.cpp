@@ -1,225 +1,64 @@
-#include "common.h"
-#include "ggml.h"
-#include "gguf.h"
-#include "seeddelta_policy.h"
-#include "seeddelta_policy_export.h"
-#include "seeddelta_policy_selftest.h"
-#include "sd_cli.h"
-#include "sd_policy_resolve.h"
-#include "sd_utils.h"
-#include "sd_runner.h"
-#include "sd_cost.h"
-#include "sd_eval.h"
-#include "sd_ffn_proxy.h"
-#include "sd_report.h"
-#include "sd_constants.h"
-#include "sd_build.h"
-#include "sd_write.h"
+#include "include/sd_build.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cinttypes>
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <limits>
-#include <map>
 #include <numeric>
 #include <random>
 #include <regex>
-#include <sstream>
-#include <string>
 #include <thread>
-#include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
-int sd_run(const sd_args & args) {
-    const std::string in_fname = args.in_fname;
-    const std::string out_fname = args.out_fname;
-    const std::string layers_range = args.layers_range;
-    const std::string imatrix_file = args.imatrix_file;
-    const std::string report_json = args.report_json;
-    const std::string policy_file = args.policy_file;
-    const std::string policy_export_file = args.policy_export_file;
+#include "sd_cost.h"
+#include "sd_eval.h"
+#include "sd_ffn_proxy.h"
+#include "sd_constants.h"
+#include "sd_utils.h"
 
-    const std::string scheme_str = args.scheme_str;
-    const int64_t block = args.block;
+sd_build_result sd_build_layers(
+        const sd_args & args,
+        gguf_context * src,
+        ggml_context * ctx_data,
+        const std::vector<int64_t> & layers,
+        sd_resid_scheme scheme,
+        ggml_type idx_type,
+        ggml_type val_type,
+        int64_t block,
+        int64_t K_gate_eff,
+        int64_t K_up_eff,
+        int64_t K_down_eff,
+        const sd_policy * policy_ptr,
+        bool policy_dump_resolved,
+        bool overwrite_existing,
+        bool have_imatrix,
+        const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
+        float imatrix_eps,
+        float imatrix_power,
+        double stack_cost_cap) {
+    sd_build_result result;
 
-    const int64_t K = args.K;
-    const int64_t K_gate = args.K_gate;
-    const int64_t K_up   = args.K_up;
-    const int64_t K_down = args.K_down;
-    const std::string idx_type_str = args.idx_type_str;
-    const std::string val_type_str = args.val_type_str;
+    const std::vector<std::string> kinds = { "ffn_gate", "ffn_up", "ffn_down" };
+
+    std::mt19937 rng(args.seed);
+
+    int64_t n_added = 0;
+    std::vector<report_entry> report;
+    std::vector<pending_tensor_set> pending;
+    std::unordered_set<std::string> strip_weights;
+    bool any_strip = false;
+    double stack_cost_running = 0.0;
+
     const bool write_row_scale = args.write_row_scale;
     const bool write_base = args.write_base;
-    const bool strip_dense = args.strip_dense;
     const int64_t base_max_samples = args.base_max_samples;
     const int base_perm_trials = args.base_perm_trials;
+    const int n_threads = args.n_threads;
     int64_t eval_cols = args.eval_cols;
     const int64_t eval_x = args.eval_x;
-    const float imatrix_eps = args.imatrix_eps;
-    const float imatrix_power = args.imatrix_power;
-    const bool policy_strict = args.policy_strict;
-    const bool policy_dump_resolved = args.policy_dump_resolved;
-    const bool policy_self_test = args.policy_self_test;
-    const bool overwrite_existing = args.overwrite_existing;
-    const double stack_cost_cap = args.stack_cost_cap;
-
-    if (policy_self_test) {
-        return sd_policy_self_test();
-    }
-
-    sd_resid_scheme scheme = sd_resid_scheme::coo;
-    if (scheme_str == "coo") {
-        scheme = sd_resid_scheme::coo;
-    } else if (scheme_str == "block") {
-        scheme = sd_resid_scheme::block;
-    } else {
-        throw std::runtime_error("invalid --scheme (expected: coo|block)");
-    }
-    if (scheme == sd_resid_scheme::block) {
-        if (block <= 0 || block > 4096) {
-            throw std::runtime_error("invalid --block (expected: 1..4096)");
-        }
-    }
-
-    ggml_type idx_type = GGML_TYPE_I16;
-    if (idx_type_str == "i16") idx_type = GGML_TYPE_I16;
-    else if (idx_type_str == "i32") idx_type = GGML_TYPE_I32;
-    else throw std::runtime_error("invalid --idx-type");
-
-    ggml_type val_type = GGML_TYPE_F16;
-    if (val_type_str == "f16") val_type = GGML_TYPE_F16;
-    else if (val_type_str == "f32") val_type = GGML_TYPE_F32;
-    else throw std::runtime_error("invalid --val-type");
-
-    ggml_context * ctx_data = nullptr;
-    gguf_init_params params = { false, &ctx_data };
-    gguf_context * src = gguf_init_from_file(in_fname.c_str(), params);
-    if (!src || !ctx_data) {
-        fprintf(stderr, "failed to load %s\n", in_fname.c_str());
-        return 1;
-    }
-
-    std::vector<std::string> imatrix_datasets;
-    std::unordered_map<std::string, std::vector<float>> imatrix_data;
-    const bool have_imatrix = !imatrix_file.empty();
-    if (have_imatrix) {
-    const int rc = sd_load_imatrix(imatrix_file, imatrix_datasets, imatrix_data);
-        if (rc < 0) {
-            fprintf(stderr, "seeddelta-build: failed to load imatrix %s\n", imatrix_file.c_str());
-            return 1;
-        }
-    }
-
-    const int64_t n_tensors = gguf_get_n_tensors(src);
-
-    sd_policy policy;
-    sd_policy * policy_ptr = nullptr;
-    std::string policy_hash;
-    sd_policy_state policy_state = sd_policy_load_from_file(policy_file, policy_strict);
-    if (!policy_state.error.empty()) {
-        fprintf(stderr, "seeddelta-build: %s\n", policy_state.error.c_str());
-        return 1;
-    }
-    for (const auto & w : policy_state.warnings) {
-        fprintf(stderr, "seeddelta-build: policy warning: %s\n", w.c_str());
-    }
-    if (policy_state.has_policy) {
-        policy = policy_state.policy;
-        policy_ptr = &policy;
-        policy_hash = policy_state.hash;
-    }
-
-    // Discover number of layers from tensor names.
-    int64_t max_layer_id = -1;
-    std::regex re_layer(R"(blk\.(\d+)\.)");
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * name = gguf_get_tensor_name(src, ti);
-        std::cmatch m;
-        if (std::regex_search(name, m, re_layer)) {
-            max_layer_id = std::max<int64_t>(max_layer_id, std::stoll(m[1]));
-        }
-    }
-    const int64_t n_layer = max_layer_id + 1;
-    auto layers = sd_parse_layer_range(layers_range, n_layer);
-
-    const int64_t K_default = std::max<int64_t>(1, K);
-    const int64_t K_gate_eff = (K_gate > 0 ? K_gate : K_default);
-    const int64_t K_up_eff   = (K_up   > 0 ? K_up   : K_default);
-    const int64_t K_down_eff = (K_down > 0 ? K_down : K_default);
-    const bool K_variable = (K_gate_eff != K_default) || (K_up_eff != K_default) || (K_down_eff != K_default);
-
-    sd_build_result build_res = sd_build_layers(
-            args,
-            src,
-            ctx_data,
-            layers,
-            scheme,
-            idx_type,
-            val_type,
-            block,
-            K_gate_eff,
-            K_up_eff,
-            K_down_eff,
-            policy_ptr,
-            policy_dump_resolved,
-            overwrite_existing,
-            have_imatrix,
-            imatrix_data,
-            imatrix_eps,
-            imatrix_power,
-            stack_cost_cap);
-
-    if (!build_res.ok) {
-        return 1;
-    }
-
-    sd_write_params wparams;
-    wparams.src = src;
-    wparams.ctx_data = ctx_data;
-    wparams.scheme = scheme;
-    wparams.idx_type = idx_type;
-    wparams.val_type = val_type;
-    wparams.block = block;
-    wparams.K_default = K_default;
-    wparams.K_gate_eff = K_gate_eff;
-    wparams.K_up_eff = K_up_eff;
-    wparams.K_down_eff = K_down_eff;
-    wparams.K_variable = K_variable;
-    wparams.write_row_scale = write_row_scale;
-    wparams.write_base = write_base;
-    wparams.strip_dense = strip_dense;
-    wparams.any_strip = build_res.any_strip;
-    wparams.strip_weights = &build_res.strip_weights;
-    wparams.pending = &build_res.pending;
-    wparams.sd_contexts = &build_res.sd_contexts;
-    wparams.report = &build_res.report;
-    wparams.stack_guard = &build_res.stack_guard;
-    wparams.n_added = build_res.n_added;
-    wparams.in_fname = in_fname;
-    wparams.out_fname = out_fname;
-    wparams.report_json = report_json;
-    wparams.policy_file = policy_file;
-    wparams.policy_hash = policy_hash;
-    wparams.policy_export_file = policy_export_file;
-    wparams.have_imatrix = have_imatrix;
-    wparams.imatrix_file = imatrix_file;
-    wparams.imatrix_eps = imatrix_eps;
-    wparams.imatrix_power = imatrix_power;
-    wparams.imatrix_datasets = imatrix_datasets;
-    wparams.eval_cols = eval_cols;
-    wparams.eval_x = eval_x;
-    wparams.base_max_samples = base_max_samples;
-    wparams.base_perm_trials = base_perm_trials;
-
-    return sd_write_output(wparams);
-
-#if 0
+    const bool strip_dense = args.strip_dense;
 
     sd_resolved_tensor baseline_cfg;
     baseline_cfg.block = block;
@@ -235,7 +74,9 @@ int sd_run(const sd_args & args) {
 
     if (policy_ptr && eval_cols <= 0) {
         fprintf(stderr, "seeddelta-build: --policy requires --eval-cols > 0 for gating/autotune\n");
-        return 1;
+        result.ok = false;
+        result.report = std::move(report);
+        return result;
     }
 
     stack_safety_tracker stack_guard;
@@ -273,15 +114,19 @@ int sd_run(const sd_args & args) {
 
             if (cfg.require_eval_x && (eval_x <= 0 || eval_cols <= 0)) {
                 fprintf(stderr, "seeddelta-build: gating metric requires --eval-x and --eval-cols > 0 for %s\n", weight_name.c_str());
-                return 1;
+                result.ok = false;
+                result.report = std::move(report);
+                return result;
             }
             if (cfg.require_imatrix && !have_imatrix) {
                 fprintf(stderr, "seeddelta-build: gating metric requires imatrix for %s\n", weight_name.c_str());
-                return 1;
+                result.ok = false;
+                result.report = std::move(report);
+                return result;
             }
 
             if (!have_weight) {
-                if (policy_ptr || !report_json.empty()) {
+                if (policy_ptr || !args.report_json.empty()) {
                     report_entry re;
                     re.layer = il;
                     re.kind = kind;
@@ -351,8 +196,8 @@ int sd_run(const sd_args & args) {
                                         cfg.K_down;
             const int64_t K_budget = std::max<int64_t>(1, std::min<int64_t>(K_kind, n_in));
             const bool is_tall = n_out >= n_in;
-            const int64_t block_here = (scheme == RESID_BLOCK) ? cfg.block : block;
-            const int64_t block = block_here; // shadow global block for per-tensor overrides
+            const int64_t block_here = (scheme == sd_resid_scheme::block) ? cfg.block : block;
+            const int64_t block_used = block_here; // shadow global block for per-tensor overrides
 
             std::vector<float> w_scale;
             const bool have_w = have_imatrix && sd_make_imatrix_sqrt_scale(imatrix_data, weight_name, n_in, imatrix_eps, imatrix_power, w_scale);
@@ -404,37 +249,33 @@ int sd_run(const sd_args & args) {
 
                 int64_t n_blocks_keep = 0;
                 int64_t K_eff = K_budget_clamped;
-                if (scheme == RESID_BLOCK) {
-                    const int64_t n_blocks_total = (n_in + block - 1) / block;
-                    n_blocks_keep = std::max<int64_t>(1, std::min<int64_t>((K_budget_clamped + block - 1) / block, n_blocks_total));
-                    K_eff = n_blocks_keep * block;
-                }
 
-                if (scheme == RESID_BLOCK) {
-                    printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=block block=%" PRId64 " nb=%" PRId64 " K=%" PRId64 " (budget=%" PRId64 ")%s\n",
-                           il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), block, n_blocks_keep, K_eff, K_budget_clamped,
-                           have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+                if (scheme == sd_resid_scheme::block) {
+                    n_blocks_keep = (K_eff + block_used - 1) / block_used;
+                    K_eff = n_blocks_keep * block_used;
                 } else {
-                    printf("seeddelta-build: layer %" PRId64 " %s [% " PRId64 " x %" PRId64 "] type=%s scheme=coo K=%" PRId64 "%s\n",
-                           il, kind.c_str(), n_in, n_out, ggml_type_name(W->type), K_eff,
-                           have_w ? " imatrix=on" : (have_imatrix ? " imatrix=missing" : ""));
+                    n_blocks_keep = (K_eff + block_used - 1) / block_used;
                 }
 
                 t.re.layer = il;
                 t.re.kind = kind;
+                t.re.block = block_used;
+                t.re.K_budget = K_budget_trial;
+                t.re.K = K_eff;
+                t.re.n_blocks = n_blocks_keep;
                 t.re.n_in = n_in;
                 t.re.n_out = n_out;
-                t.re.K_budget = K_budget_clamped;
-                t.re.K = K_eff;
-                t.re.block = (scheme == RESID_BLOCK) ? block : 0;
-                t.re.n_blocks = (scheme == RESID_BLOCK) ? n_blocks_keep : 0;
+                t.re.strip_applied = cfg.strip_dense;
+                t.re.metric_used = sd_report::metric_kind_to_string(cfg.metric);
+                t.re.target_tau_mean = gating_min_mean;
+                t.re.target_tau_p05 = gating_min_p05;
                 t.re.has_w = have_w;
                 t.re.cost = estimate_cost(write_base ? &base : nullptr, n_in, n_out, K_eff, write_row_scale);
 
-                if (scheme == RESID_BLOCK) {
+                if (scheme == sd_resid_scheme::block) {
                     GGML_ASSERT(n_blocks_keep > 0);
                     t.b_idx.assign((size_t) n_blocks_keep * (size_t) n_out, -1);
-                    t.b_val.assign((size_t) block * (size_t) n_blocks_keep * (size_t) n_out, 0.0f);
+                    t.b_val.assign((size_t) block_used * (size_t) n_blocks_keep * (size_t) n_out, 0.0f);
                 } else {
                     t.d_idx.assign((size_t) K_eff * (size_t) n_out, -1);
                     t.d_val.assign((size_t) K_eff * (size_t) n_out, 0.0f);
@@ -519,9 +360,9 @@ int sd_run(const sd_args & args) {
                                     }
                                 }
 
-                                if (scheme == RESID_BLOCK) {
-                                    const std::vector<float> & src = write_base ? r : w;
-                                    topk_blocks_energy_weighted(src, have_w ? &w_scale : nullptr, block, n_blocks_keep, top_blocks);
+                                if (scheme == sd_resid_scheme::block) {
+                                    const std::vector<float> & src_block = write_base ? r : w;
+                                    topk_blocks_energy_weighted(src_block, have_w ? &w_scale : nullptr, block_used, n_blocks_keep, top_blocks);
 
                                     float ss = 1.0f;
                                     if (write_row_scale) {
@@ -531,8 +372,8 @@ int sd_run(const sd_args & args) {
                                                 if (blk < 0) {
                                                     continue;
                                                 }
-                                                const int64_t in0 = (int64_t) blk * block;
-                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                                const int64_t in0 = (int64_t) blk * block_used;
+                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block_used);
                                                 for (int64_t ii = in0; ii < in1; ++ii) {
                                                     const double wi = (double) w[(size_t) ii];
                                                     const double di = (double) r[(size_t) ii];
@@ -547,8 +388,8 @@ int sd_run(const sd_args & args) {
                                                 if (blk < 0) {
                                                     continue;
                                                 }
-                                                const int64_t in0 = (int64_t) blk * block;
-                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block);
+                                                const int64_t in0 = (int64_t) blk * block_used;
+                                                const int64_t in1 = std::min<int64_t>(n_in, in0 + block_used);
                                                 for (int64_t ii = in0; ii < in1; ++ii) {
                                                     const double wi  = (double) w[(size_t) ii];
                                                     const double whi = (double) w[(size_t) ii];
@@ -569,14 +410,14 @@ int sd_run(const sd_args & args) {
                                         const int32_t blk = bi < (int64_t) top_blocks.size() ? top_blocks[(size_t) bi] : -1;
                                         t.b_idx[(size_t) col * (size_t) n_blocks_keep + (size_t) bi] = blk;
 
-                                        const int64_t in0 = (blk >= 0) ? (int64_t) blk * block : 0;
-                                        for (int64_t tt = 0; tt < block; ++tt) {
+                                        const int64_t in0 = (blk >= 0) ? (int64_t) blk * block_used : 0;
+                                        for (int64_t tt = 0; tt < block_used; ++tt) {
                                             const int64_t ii = in0 + tt;
                                             float vv = 0.0f;
                                             if (blk >= 0 && ii >= 0 && ii < n_in) {
                                                 vv = write_base ? r[(size_t) ii] : w[(size_t) ii];
                                             }
-                                            t.b_val[((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block + (size_t) tt] = vv;
+                                            t.b_val[((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block_used + (size_t) tt] = vv;
                                         }
                                     }
                                 } else {
@@ -658,10 +499,10 @@ int sd_run(const sd_args & args) {
                 if (eval_cols > 0) {
                     const int64_t t0 = ggml_time_us();
                     eval_metrics em;
-                    if (scheme == RESID_BLOCK) {
+                    if (scheme == sd_resid_scheme::block) {
                         em = write_base
-                                ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng)
-                                : eval_block_residual(W, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng);
+                                ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng)
+                                : eval_block_residual(W, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, rng);
                     } else {
                         em = write_base
                                 ? eval_seeddelta_base_residual(W, base, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, nullptr, K_eff, eval_cols, rng)
@@ -675,10 +516,10 @@ int sd_run(const sd_args & args) {
 
                     if (have_w) {
                         eval_metrics em_w;
-                        if (scheme == RESID_BLOCK) {
+                        if (scheme == sd_resid_scheme::block) {
                             em_w = write_base
-                                    ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng)
-                                    : eval_block_residual(W, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng);
+                                    ? eval_seeddelta_base_block_residual(W, base, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng)
+                                    : eval_block_residual(W, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, rng);
                         } else {
                             em_w = write_base
                                     ? eval_seeddelta_base_residual(W, base, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, K_eff, eval_cols, rng)
@@ -693,8 +534,8 @@ int sd_run(const sd_args & args) {
                 if (eval_cols > 0 && eval_x > 0) {
                     const int64_t t0 = ggml_time_us();
                     eval_metrics emx;
-                    if (scheme == RESID_BLOCK) {
-                        emx = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, eval_x, rng);
+                    if (scheme == sd_resid_scheme::block) {
+                        emx = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, nullptr, eval_cols, eval_x, rng);
                     } else {
                         emx = eval_seeddelta_x(W, write_base ? &base : nullptr, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, nullptr, K_eff, eval_cols, eval_x, rng);
                     }
@@ -706,8 +547,8 @@ int sd_run(const sd_args & args) {
 
                     if (have_w) {
                         eval_metrics emx_w;
-                        if (scheme == RESID_BLOCK) {
-                            emx_w = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, eval_x, rng);
+                        if (scheme == sd_resid_scheme::block) {
+                            emx_w = eval_seeddelta_x_block(W, write_base ? &base : nullptr, t.b_idx, t.b_val, block_used, n_blocks_keep, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, eval_cols, eval_x, rng);
                         } else {
                             emx_w = eval_seeddelta_x(W, write_base ? &base : nullptr, t.d_idx, t.d_val, write_row_scale ? &t.d_row_scale : nullptr, &w_scale, K_eff, eval_cols, eval_x, rng);
                         }
@@ -729,7 +570,6 @@ int sd_run(const sd_args & args) {
                 schedule.push_back(K_budget);
             }
 
-            // De-dup schedule while keeping order.
             std::unordered_set<int64_t> seen;
             std::vector<int64_t> sched_unique;
             for (int64_t v : schedule) {
@@ -866,8 +706,7 @@ int sd_run(const sd_args & args) {
             const int64_t n_blocks_keep = re.n_blocks;
             const int64_t K_eff = re.K;
 
-            // FFN proxy v0 (logging-only): replace only this tensor (coo, no base).
-            if (scheme == RESID_COO && !write_base && eval_x > 0) {
+            if (scheme == sd_resid_scheme::coo && !write_base && eval_x > 0) {
                 const std::string wg_name = "blk." + std::to_string(il) + ".ffn_gate.weight";
                 const std::string wu_name = "blk." + std::to_string(il) + ".ffn_up.weight";
                 const std::string wd_name = "blk." + std::to_string(il) + ".ffn_down.weight";
@@ -876,7 +715,7 @@ int sd_run(const sd_args & args) {
                 ggml_tensor * W_down = ggml_get_tensor(ctx_data, wd_name.c_str());
 
                 ffn_proxy_metrics fpm;
-                const int proxy_seed = seed + (int) il * 101 + (int) (kind == "ffn_gate" ? 1 : (kind == "ffn_up" ? 2 : 3));
+                const int proxy_seed = args.seed + (int) il * 101 + (int) (kind == "ffn_gate" ? 1 : (kind == "ffn_up" ? 2 : 3));
                 bool proxy_ok = eval_ffn_proxy_coo_replace_one(kind, W_gate, W_up, W_down, d_idx, d_val, write_base ? &base : nullptr, write_base, K_eff, eval_x, eval_cols, proxy_seed, fpm);
                 if (proxy_ok) {
                     re.ffn_proxy_available = true;
@@ -904,7 +743,6 @@ int sd_run(const sd_args & args) {
                         : sd_constants::ffn_proxy_reason_requires_coo;
             }
 
-            // Stack-cost (v1): simple affine penalty vs targets; zero if not emitted or metric missing.
             {
                 const double metric_mean = re.gating_value;
                 const double metric_p05  = re.gating_p05;
@@ -914,7 +752,7 @@ int sd_run(const sd_args & args) {
                 if (re.emit && std::isfinite(metric_mean) && std::isfinite(metric_p05)) {
                     const double d_mean = std::max(0.0, tau_mean - metric_mean);
                     const double d_p05  = std::max(0.0, tau_p05  - metric_p05);
-                    cost_delta = d_mean + d_p05; // weights (alpha=beta=1) v1
+                    cost_delta = d_mean + d_p05;
                 }
                 re.stack_cost_delta = cost_delta;
                 re.stack_cost_total = stack_cost_running + (re.emit ? cost_delta : 0.0);
@@ -929,7 +767,6 @@ int sd_run(const sd_args & args) {
                 continue;
             }
 
-            // Enforce global stack_cost cap if provided.
             if (stack_cost_running > stack_cost_cap) {
                 re.emit = false;
                 re.strip_applied = false;
@@ -950,12 +787,11 @@ int sd_run(const sd_args & args) {
             sd_report::finalize_report_entry(re);
             report.push_back(std::move(re));
 
-            // Allocate a dedicated ggml context for new tensors to avoid a giant arena.
-            const size_t size_idx = scheme == RESID_BLOCK
+            const size_t size_idx = scheme == sd_resid_scheme::block
                     ? (size_t) n_blocks_keep * (size_t) n_out * ggml_type_size(idx_type)
                     : (size_t) K_eff * (size_t) n_out * ggml_type_size(idx_type);
-            const size_t size_val = scheme == RESID_BLOCK
-                    ? (size_t) block * (size_t) n_blocks_keep * (size_t) n_out * ggml_type_size(val_type)
+            const size_t size_val = scheme == sd_resid_scheme::block
+                    ? (size_t) block_used * (size_t) n_blocks_keep * (size_t) n_out * ggml_type_size(val_type)
                     : (size_t) K_eff * (size_t) n_out * ggml_type_size(val_type);
             const size_t size_row_scale = write_row_scale ? (size_t) n_out * sizeof(ggml_fp16_t) : 0;
             const ggml_type perm_type = write_base ? (base.L <= 32768 ? GGML_TYPE_I16 : GGML_TYPE_I32) : GGML_TYPE_I16;
@@ -967,11 +803,11 @@ int sd_run(const sd_args & args) {
 
             ggml_init_params sd_params = { mem_size_sd, nullptr, false };
             ggml_context * ctx_sd = ggml_init(sd_params);
-            sd_contexts.push_back(ctx_sd);
+            result.sd_contexts.push_back(ctx_sd);
 
             ggml_tensor * t_idx = nullptr;
             ggml_tensor * t_val = nullptr;
-            if (scheme == RESID_BLOCK) {
+            if (scheme == sd_resid_scheme::block) {
                 t_idx = ggml_new_tensor_2d(ctx_sd, idx_type, n_blocks_keep, n_out);
                 ggml_set_name(t_idx, b_idx_name.c_str());
                 if (idx_type == GGML_TYPE_I16) {
@@ -986,16 +822,16 @@ int sd_run(const sd_args & args) {
                     std::memcpy(t_idx->data, b_idx.data(), b_idx.size() * sizeof(int32_t));
                 }
 
-                t_val = ggml_new_tensor_3d(ctx_sd, val_type, block, n_blocks_keep, n_out);
+                t_val = ggml_new_tensor_3d(ctx_sd, val_type, block_used, n_blocks_keep, n_out);
                 ggml_set_name(t_val, b_val_name.c_str());
                 if (val_type == GGML_TYPE_F16) {
                     auto * dst_f16 = (ggml_fp16_t *) t_val->data;
                     for (int64_t col = 0; col < n_out; ++col) {
                         for (int64_t bi = 0; bi < n_blocks_keep; ++bi) {
                             ggml_fp32_to_fp16_row(
-                                    b_val.data() + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block,
-                                    dst_f16 + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block,
-                                    (int) block);
+                                    b_val.data() + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block_used,
+                                    dst_f16 + ((size_t) col * (size_t) n_blocks_keep + (size_t) bi) * (size_t) block_used,
+                                    (int) block_used);
                         }
                     }
                 } else {
@@ -1087,126 +923,11 @@ int sd_run(const sd_args & args) {
         }
     }
 
-    if (n_added == 0) {
-        fprintf(stderr, "no new SeedΔ tensors added\n");
-    }
-
-    gguf_context * dst = gguf_init_empty();
-    gguf_set_kv(dst, src);
-
-    // Add original tensors, skipping those strippeados.
-    for (int64_t ti = 0; ti < n_tensors; ++ti) {
-        const char * name = gguf_get_tensor_name(src, ti);
-        if (any_strip && strip_weights.count(name) > 0) {
-            continue;
-        }
-        ggml_tensor * t = ggml_get_tensor(ctx_data, name);
-        if (!t) {
-            fprintf(stderr, "warning: missing tensor %s in ctx_data\n", name);
-            continue;
-        }
-        gguf_add_tensor(dst, t);
-    }
-
-    for (const auto & pts : pending) {
-        for (ggml_tensor * t : pts.tensors) {
-            gguf_add_tensor(dst, t);
-        }
-    }
-
-    gguf_set_val_bool(dst, "seeddelta.enabled", n_added > 0);
-    gguf_set_val_u32(dst, "seeddelta.version", 1);
-    gguf_set_val_u32(dst, "seeddelta.scheme", (uint32_t) scheme);
-    gguf_set_val_bool(dst, "seeddelta.row_scale", write_row_scale);
-    gguf_set_val_u32(dst, "seeddelta.resid.K", (uint32_t) K_default);
-    gguf_set_val_bool(dst, "seeddelta.strip_dense", any_strip);
-    if (scheme == RESID_BLOCK) {
-        gguf_set_val_u32(dst, "seeddelta.resid.block", (uint32_t) block);
-    }
-    gguf_set_val_bool(dst, "seeddelta.resid.K_variable", K_variable);
-    if (K_variable) {
-        gguf_set_val_u32(dst, "seeddelta.resid.K_gate", (uint32_t) K_gate_eff);
-        gguf_set_val_u32(dst, "seeddelta.resid.K_up",   (uint32_t) K_up_eff);
-        gguf_set_val_u32(dst, "seeddelta.resid.K_down", (uint32_t) K_down_eff);
-    }
-    gguf_set_val_bool(dst, "seeddelta.base.enabled", write_base);
-    if (write_base) {
-        gguf_set_val_u32(dst, "seeddelta.base.kind", 1);  // hadamard_acdc_stack
-        gguf_set_val_u32(dst, "seeddelta.base.depth", 2); // D3*H*D2*H*D1
-        gguf_set_val_u32(dst, "seeddelta.base.R", 1);
-        gguf_set_val_u32(dst, "seeddelta.base.max_samples", (uint32_t) std::max<int64_t>(0, base_max_samples));
-        gguf_set_val_u32(dst, "seeddelta.base.perm_trials", (uint32_t) std::max(1, base_perm_trials));
-    }
-
-    // Per-tensor audit metadata (minimal, per GGUF kv).
-    for (const auto & re : report) {
-        const std::string prefix = "seeddelta.blk." + std::to_string(re.layer) + "." + re.kind;
-        gguf_set_val_bool(dst, (prefix + ".enabled").c_str(), re.emit);
-        gguf_set_val_bool(dst, (prefix + ".gating_pass").c_str(), re.gating_pass);
-        gguf_set_val_bool(dst, (prefix + ".strip_dense").c_str(), re.strip_applied);
-        gguf_set_val_u32(dst, (prefix + ".K").c_str(), (uint32_t) std::max<int64_t>(0, re.K));
-    }
-
-    printf("writing %s with %" PRId64 " new tensors\n", out_fname.c_str(), n_added);
-    if (!gguf_write_to_file(dst, out_fname.c_str(), false)) {
-        fprintf(stderr, "seeddelta-build: failed to write %s\n", out_fname.c_str());
-        return 1;
-    }
-
-    if (!report_json.empty()) {
-        sd_report::report_config cfg;
-        cfg.input = in_fname;
-        cfg.output = out_fname;
-        cfg.write_base = write_base;
-        cfg.base_max_samples = base_max_samples;
-        cfg.base_perm_trials = base_perm_trials;
-        cfg.policy_file = policy_file;
-        cfg.policy_hash = policy_hash;
-        cfg.have_imatrix = have_imatrix;
-        cfg.imatrix_file = imatrix_file;
-        cfg.imatrix_eps = imatrix_eps;
-        cfg.imatrix_power = imatrix_power;
-        cfg.imatrix_datasets = imatrix_datasets;
-        cfg.resid.scheme = (scheme == RESID_BLOCK) ? sd_report::seeddelta_scheme::block : sd_report::seeddelta_scheme::coo;
-        cfg.resid.block = block;
-        cfg.resid.K = K_default;
-        cfg.resid.K_gate = K_gate_eff;
-        cfg.resid.K_up = K_up_eff;
-        cfg.resid.K_down = K_down_eff;
-        cfg.resid.idx_type = idx_type_str;
-        cfg.resid.val_type = val_type_str;
-        cfg.resid.row_scale = write_row_scale;
-        cfg.eval_cols = eval_cols;
-        cfg.eval_x = eval_x;
-        cfg.stack_pass_gate_up = stack_guard.gate_up_pass;
-        cfg.stack_pass_down = stack_guard.down_pass;
-        if (!sd_report::write_report_json(report_json, cfg, report)) {
-            return 1;
-        }
-    }
-
-    if (!policy_export_file.empty()) {
-        std::vector<sd_tensor_decision> decisions;
-        decisions.reserve(report.size());
-        for (const auto & e : report) {
-            sd_tensor_decision d;
-            d.layer = e.layer;
-            d.kind = e.kind;
-            d.enabled = e.emit;
-            d.strip_dense = e.strip_applied;
-            d.block = e.block;
-            d.K_budget = e.K_budget;
-            decisions.push_back(std::move(d));
-        }
-
-        auto pres = sd_policy_export_write_canonical(policy_export_file, decisions);
-        if (!pres.ok) {
-            fprintf(stderr, "seeddelta-build: failed to export policy: %s\n", pres.error.c_str());
-            return 1;
-        }
-        fprintf(stderr, "seeddelta-build: wrote policy export %s\n", policy_export_file.c_str());
-    }
-
-    return 0;
-#endif
+    result.n_added = n_added;
+    result.report = std::move(report);
+    result.pending = std::move(pending);
+    result.strip_weights = std::move(strip_weights);
+    result.any_strip = any_strip;
+    result.stack_guard = stack_guard;
+    return result;
 }

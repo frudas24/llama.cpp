@@ -11,6 +11,9 @@ add_executable(${TARGET}
     sd_cost.cpp
     sd_ffn_proxy.cpp
     sd_report.cpp
+    sd_policy_resolve.cpp
+    sd_build.cpp
+    sd_write.cpp
 )
 target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 target_include_directories(${TARGET} PRIVATE
