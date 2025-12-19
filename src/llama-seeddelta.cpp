@@ -74,6 +74,8 @@ static inline int32_t read_base_i16_i32(const ggml_tensor * t, const uint8_t * b
 static std::atomic_flag llama_seeddelta_nan_warned = ATOMIC_FLAG_INIT;
 static std::atomic<int64_t> llama_seeddelta_nan_count{0};
 static thread_local std::vector<float> llama_seeddelta_wcol_tls;
+static thread_local std::vector<uint8_t> llama_seeddelta_wbuf_tls;
+static thread_local std::vector<uint8_t> llama_seeddelta_xbuf_tls;
 static const bool llama_seeddelta_debug_data = std::getenv("LLAMA_SEEDDELTA_DEBUG_DATA") != nullptr;
 static std::atomic<int> llama_seeddelta_debug_budget{16};
 
@@ -97,9 +99,6 @@ static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t c
     if (!w->data) {
         return false;
     }
-    if (w->buffer && !ggml_backend_buffer_is_host(w->buffer)) {
-        return false;
-    }
 
     const int64_t n_in  = w->ne[0];
     const int64_t n_out = w->ne[1];
@@ -107,9 +106,18 @@ static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t c
         return false;
     }
 
+    const bool w_host = !w->buffer || ggml_backend_buffer_is_host(w->buffer);
+    const uint8_t * w_data = (const uint8_t *) w->data;
+    if (!w_host) {
+        const size_t nbytes = ggml_nbytes(w);
+        llama_seeddelta_wbuf_tls.resize(nbytes);
+        ggml_backend_tensor_get(w, llama_seeddelta_wbuf_tls.data(), 0, nbytes);
+        w_data = llama_seeddelta_wbuf_tls.data();
+    }
+
     out.resize((size_t) n_in);
 
-    const uint8_t * base = (const uint8_t *) w->data + col * w->nb[1];
+    const uint8_t * base = w_data + col * w->nb[1];
     const auto * traits = ggml_get_type_traits(w->type);
     if (!traits) {
         return false;
@@ -163,9 +171,6 @@ static bool llama_seeddelta_dense_fallback(
     if (!x->data) {
         return fail(llama_seeddelta_fb_status::no_x);
     }
-    if (x->buffer && !ggml_backend_buffer_is_host(x->buffer)) {
-        return fail(llama_seeddelta_fb_status::non_host);
-    }
     if (ggml_n_dims(x) < 2) {
         return fail(llama_seeddelta_fb_status::dim_mismatch);
     }
@@ -188,7 +193,15 @@ static bool llama_seeddelta_dense_fallback(
         return fail(llama_seeddelta_fb_status::read_fail);
     }
 
+    const bool x_host = !x->buffer || ggml_backend_buffer_is_host(x->buffer);
     const uint8_t * x_data = (const uint8_t *) x->data;
+    if (!x_host) {
+        const size_t nbytes = ggml_nbytes(x);
+        llama_seeddelta_xbuf_tls.resize(nbytes);
+        ggml_backend_tensor_get(x, llama_seeddelta_xbuf_tls.data(), 0, nbytes);
+        x_data = llama_seeddelta_xbuf_tls.data();
+    }
+
     double acc = 0.0;
     for (int64_t i = 0; i < n_in; ++i) {
         const float xv = read_x_f16_or_f32(x, x_data, i, t);

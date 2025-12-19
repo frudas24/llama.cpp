@@ -51,7 +51,7 @@ bool test_policy_merge() {
 
 bool test_report_serialization() {
     const std::string path = "sd_selftest_report.json";
-    sd_report::report_entry entry;
+    report_entry entry;
     entry.layer = 3;
     entry.kind = "ffn_gate";
     entry.has_w = true;
@@ -89,7 +89,8 @@ bool test_report_serialization() {
     cfg.stack_pass_gate_up = 0;
     cfg.stack_pass_down = 0;
 
-    if (!sd_report::write_report_json(path, cfg, { entry })) {
+    const std::vector<report_entry> report{entry};
+    if (!sd_report::write_report_json(path, cfg, report)) {
         std::cerr << "report serialization: failed to write JSON\n";
         return false;
     }
