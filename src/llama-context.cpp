@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -140,6 +141,7 @@ llama_context::llama_context(
     seeddelta_ctx.enabled = params.seeddelta;
     seeddelta_ctx.gap_tol = params.seeddelta_gap_tol;
     if (seeddelta_ctx.enabled) {
+        const bool sd_debug = std::getenv("LLAMA_SEEDDELTA_DEBUG") != nullptr;
         auto try_add_seeddelta = [&](ggml_tensor * w,
                                     ggml_tensor * d_idx, ggml_tensor * d_val,
                                     ggml_tensor * b_idx, ggml_tensor * b_val,
@@ -272,6 +274,15 @@ llama_context::llama_context(
                 base_d1, base_d2, base_d3,
                 base_perm1, base_perm2,
             });
+            if (sd_debug) {
+                const int64_t k_coo    = d_idx ? d_idx->ne[0] : 0;
+                const int64_t n_out_sd = w->ne[1];
+                LLAMA_LOG_INFO("%s: seeddelta add %s (%s%s) n_out=%" PRId64 " k_coo=%" PRId64 " block_rows=%" PRId64 "\n",
+                               __func__, name,
+                               d_idx ? "coo" : "",
+                               b_idx ? (d_idx ? "+block" : "block") : "",
+                               n_out_sd, k_coo, b_idx ? b_idx->ne[0] : 0);
+            }
         };
 
         for (int il = 0; il < (int) hparams.n_layer; ++il) {
@@ -303,6 +314,8 @@ llama_context::llama_context(
         if (seeddelta_ctx.weights.empty()) {
             LLAMA_LOG_WARN("%s: seeddelta enabled but no delta tensors found, disabling\n", __func__);
             seeddelta_ctx.enabled = false;
+        } else if (sd_debug) {
+            LLAMA_LOG_INFO("%s: seeddelta enabled with %" PRId64 " tensors\n", __func__, (int64_t) seeddelta_ctx.weights.size());
         }
     }
 
