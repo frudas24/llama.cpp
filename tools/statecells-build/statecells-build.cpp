@@ -2,8 +2,9 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
-#include "sc_eval.h"
-#include "sc_imatrix.h"
+#include "include/sc_eval.h"
+#include "include/sc_imatrix.h"
+#include "include/sc_report.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1203,6 +1204,28 @@ int main(int argc, char ** argv) {
         }
     }
 
+    sc_report_config report_cfg;
+    report_cfg.input = in_fname;
+    report_cfg.source = src_fname;
+    report_cfg.output = out_fname;
+    report_cfg.resume = resume;
+    report_cfg.write_vals = write_vals;
+    report_cfg.write_row_scale = write_row_scale;
+    report_cfg.imatrix.enabled = !imatrix_file.empty();
+    report_cfg.imatrix.file = imatrix_file;
+    if (!imatrix_datasets.empty()) {
+        report_cfg.imatrix.dataset = imatrix_datasets[0];
+    }
+    report_cfg.imatrix.chunks = imatrix_chunk_count;
+    report_cfg.imatrix.eps = imatrix_eps;
+    report_cfg.imatrix.power = imatrix_power;
+    report_cfg.dict.M = dict_M;
+    report_cfg.dict.k = dict_k;
+    report_cfg.dict.eta = dict_eta;
+    report_cfg.dict.iters = dict_iters;
+    report_cfg.dict.max_samples = dict_max_samples;
+    report_cfg.eval_cols = eval_cols;
+
     ggml_context * ctx_data = nullptr;
     gguf_init_params params = { false, &ctx_data };
     gguf_context * src = gguf_init_from_file(src_fname.c_str(), params);
@@ -1262,18 +1285,7 @@ int main(int argc, char ** argv) {
     // Keep per-weight ggml contexts alive until we write the output.
     std::vector<ggml_context *> sc_contexts;
 
-    struct report_row {
-        int64_t layer = 0;
-        std::string kind;
-        int64_t n_in = 0;
-        int64_t n_out = 0;
-        int64_t M_eff = 0;
-        int k_eff = 0;
-        int64_t eval_cols = 0;
-        eval_metrics em;
-        bool imatrix = false;
-    };
-    std::vector<report_row> report_rows;
+    std::vector<sc_report_row> report_rows;
 
     const auto select_M_for_kind = [&](const std::string & kind) -> int64_t {
         if (kind == "ffn_gate" && dict_M_gate > 0) return dict_M_gate;
@@ -1536,7 +1548,7 @@ int main(int argc, char ** argv) {
             layer_added_any = true;
 
             if (!report_json.empty() || eval_cols > 0) {
-                report_rows.push_back(report_row{ il, kind, n_in, n_out, M_eff, k_eff, eval_cols, em, w_scale_train != nullptr });
+                report_rows.push_back(sc_report_row{ il, kind, n_in, n_out, M_eff, k_eff, eval_cols, em, w_scale_train != nullptr });
             }
         }
 
@@ -1576,62 +1588,8 @@ int main(int argc, char ** argv) {
     }
 
     if (!report_json.empty()) {
-        std::ofstream ofs(report_json);
-        if (!ofs) {
+        if (!sc_write_report_json(report_json, report_cfg, report_rows)) {
             fprintf(stderr, "failed to write report to %s\n", report_json.c_str());
-        } else {
-            ofs << "{\n";
-            ofs << "  \"input\": "   << "\"" << in_fname  << "\",\n";
-            ofs << "  \"source\": "  << "\"" << src_fname << "\",\n";
-            ofs << "  \"output\": "  << "\"" << out_fname << "\",\n";
-            ofs << "  \"resume\": "  << (resume ? "true" : "false") << ",\n";
-            ofs << "  \"vals\": "    << (write_vals ? "true" : "false") << ",\n";
-            ofs << "  \"row_scale\": " << (write_row_scale ? "true" : "false") << ",\n";
-            ofs << "  \"imatrix\": ";
-            if (imatrix_file.empty()) {
-                ofs << "null,\n";
-            } else {
-                ofs << "{\n";
-                ofs << "    \"file\": " << "\"" << imatrix_file << "\"" << ",\n";
-                if (!imatrix_datasets.empty()) {
-                    ofs << "    \"dataset\": " << "\"" << imatrix_datasets[0] << "\"" << ",\n";
-                }
-                ofs << "    \"chunks\": " << imatrix_chunk_count << ",\n";
-                ofs << "    \"eps\": " << imatrix_eps << ",\n";
-                ofs << "    \"power\": " << imatrix_power << "\n";
-                ofs << "  },\n";
-            }
-            ofs << "  \"dict\": {\n";
-            ofs << "    \"M\": " << dict_M << ",\n";
-            ofs << "    \"k\": " << dict_k << ",\n";
-            ofs << "    \"eta\": " << dict_eta << ",\n";
-            ofs << "    \"iters\": " << dict_iters << ",\n";
-            ofs << "    \"max_samples\": " << dict_max_samples << "\n";
-            ofs << "  },\n";
-            ofs << "  \"eval_cols\": " << eval_cols << ",\n";
-            ofs << "  \"weights\": [\n";
-            for (size_t i = 0; i < report_rows.size(); ++i) {
-                const auto & r = report_rows[i];
-                ofs << "    {\n";
-                ofs << "      \"layer\": " << r.layer << ",\n";
-                ofs << "      \"kind\": " << "\"" << r.kind << "\"" << ",\n";
-                ofs << "      \"n_in\": " << r.n_in << ",\n";
-                ofs << "      \"n_out\": " << r.n_out << ",\n";
-                ofs << "      \"M\": " << r.M_eff << ",\n";
-                ofs << "      \"k\": " << r.k_eff << ",\n";
-                ofs << "      \"imatrix\": " << (r.imatrix ? "true" : "false") << ",\n";
-                ofs << "      \"rel_l2_mean\": " << r.em.rel_l2_mean << ",\n";
-                ofs << "      \"rel_l2_p95\": "  << r.em.rel_l2_p95  << ",\n";
-                ofs << "      \"cos_mean\": "    << r.em.cos_mean    << ",\n";
-                ofs << "      \"cos_p05\": "     << r.em.cos_p05     << ",\n";
-                ofs << "      \"rel_l2_mean_w\": " << r.em.rel_l2_mean_w << ",\n";
-                ofs << "      \"rel_l2_p95_w\": "  << r.em.rel_l2_p95_w  << ",\n";
-                ofs << "      \"cos_mean_w\": "    << r.em.cos_mean_w    << ",\n";
-                ofs << "      \"cos_p05_w\": "     << r.em.cos_p05_w     << "\n";
-                ofs << "    }" << (i + 1 == report_rows.size() ? "\n" : ",\n");
-            }
-            ofs << "  ]\n";
-            ofs << "}\n";
         }
     }
 
