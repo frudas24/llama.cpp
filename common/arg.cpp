@@ -1162,6 +1162,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_CONTEXT_SHIFT"));
     add_opt(common_arg(
+        {"--seeddelta"},
+        "enable SeedΔ weights if present in GGUF (default: false)",
+        [](common_params & params) {
+            params.seeddelta = true;
+        }
+    ).set_env("LLAMA_ARG_SEEDDELTA"));
+    add_opt(common_arg(
+        {"--seeddelta-gap"}, "F",
+        string_format("SeedΔ fallback gap tolerance vs dense (default: %.3f)", params.seeddelta_gap_tol),
+        [](common_params & params, const std::string & value) {
+            params.seeddelta_gap_tol = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_SEEDDELTA_GAP"));
+    add_opt(common_arg(
         {"--chunks"}, "N",
         string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
         [](common_params & params, int value) {
