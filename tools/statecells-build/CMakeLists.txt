@@ -2,6 +2,7 @@ set(TARGET llama-statecells-build)
 add_executable(${TARGET}
     statecells-build.cpp
     sc_cli.cpp
+    sc_build.cpp
     sc_runner.cpp
     sc_imatrix.cpp
     sc_eval.cpp
