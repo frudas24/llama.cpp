@@ -705,12 +705,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
             }
             if (sd_debug) {
-                LLAMA_LOG_INFO("%s: apply seeddelta tensor=%s %s%s%s\n",
-                               __func__,
-                               wname ? wname : "(unnamed)",
-                               sdw->b_idx ? "block" : (sdw->d_idx ? "coo" : "none"),
-                               sdw->base_d1 ? "+base" : "",
-                               sdw->row_scale ? "+row_scale" : "");
+                fprintf(stderr, "[seeddelta-debug] apply tensor=%s %s%s%s\n",
+                        wname ? wname : "(unnamed)",
+                        sdw->b_idx ? "block" : (sdw->d_idx ? "coo" : "none"),
+                        sdw->base_d1 ? "+base" : "",
+                        sdw->row_scale ? "+row_scale" : "");
             }
         }
     }

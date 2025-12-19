@@ -277,11 +277,11 @@ llama_context::llama_context(
             if (sd_debug) {
                 const int64_t k_coo    = d_idx ? d_idx->ne[0] : 0;
                 const int64_t n_out_sd = w->ne[1];
-                LLAMA_LOG_INFO("%s: seeddelta add %s (%s%s) n_out=%" PRId64 " k_coo=%" PRId64 " block_rows=%" PRId64 "\n",
-                               __func__, name,
-                               d_idx ? "coo" : "",
-                               b_idx ? (d_idx ? "+block" : "block") : "",
-                               n_out_sd, k_coo, b_idx ? b_idx->ne[0] : 0);
+                fprintf(stderr, "[seeddelta-debug] add %s (%s%s) n_out=%" PRId64 " k_coo=%" PRId64 " block_rows=%" PRId64 "\n",
+                        name,
+                        d_idx ? "coo" : "",
+                        b_idx ? (d_idx ? "+block" : "block") : "",
+                        n_out_sd, k_coo, b_idx ? b_idx->ne[0] : 0);
             }
         };
 
@@ -315,7 +315,7 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: seeddelta enabled but no delta tensors found, disabling\n", __func__);
             seeddelta_ctx.enabled = false;
         } else if (sd_debug) {
-            LLAMA_LOG_INFO("%s: seeddelta enabled with %" PRId64 " tensors\n", __func__, (int64_t) seeddelta_ctx.weights.size());
+            fprintf(stderr, "[seeddelta-debug] enabled with %" PRId64 " tensors\n", (int64_t) seeddelta_ctx.weights.size());
         }
     }
 
