@@ -6,6 +6,7 @@ add_executable(${TARGET}
     sc_runner.cpp
     sc_imatrix.cpp
     sc_eval.cpp
+    sc_utils.cpp
     sc_report.cpp
 )
 target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
