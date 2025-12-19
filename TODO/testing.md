@@ -62,3 +62,30 @@ jq '.weights[] | {layer, kind, stack_cost_total, ffn_proxy_cos_mean, ffn_proxy_a
   -t 4
 
 jq '.weights[] | {kind, K, stack_cost_total, ffn_proxy_cos_mean, ffn_proxy_p05}' calibration/gemma1b_K32_proxy.json
+
+
+#remote server deploy and testing
+'/bin/bash -lc "cd /home/frudas/synapp2/llama.cpp && ssh -i .codex/do_droplet_ed25519 -o StrictHostKeyChecking=no devgpt@REMOTE_32GB_HOST '"'"'cd llama.cpp && THREADS=8 CTX=512 ./scripts/seeddelta-policy-eval.sh --base ../models/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf --policy tools/seeddelta-build/policies/policy.example.gemma.json --layers 10-11 --imatrix calibration/gemma4b.imatrix.gguf --text wikitext-2-raw/wiki.test.raw --threads 8 --ctx 512 --chunks 4 --no-strip-dense --greedy-pack calibration/greedy_zombie_pack.txt --outdir calibration/seeddelta-policy-eval-gemma4b-10-11-greedy 2>&1 | tail -n 80'"'"'"'
+
+#local
+
+./scripts/seeddelta-policy-eval.sh --base ~/.cache/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf --policy tools/seeddelta-build/policies/policy.example.gemma.json --layers 10-11 --imatrix calibration/gemma4b.imatrix.gguf --text wikitext-2-raw/wiki.test.raw --th
+reads 8 --ctx 512 --chunks 4 --no-strip-dense --greedy-pack calibration/greedy_zombie_pack.txt --outdir calibration/seeddelta-policy-eval-gemma4b-10-11-greedy.txt
+
+
+#En tamaño (líneas), los más grandes quedaron así:
+
+tools/seeddelta-build/seeddelta-build.cpp: 1598
+tools/seeddelta-build/sd_eval.cpp: 1419
+src/llama-seeddelta.cpp: 1167
+tools/statecells-build/sc_encode.cpp: 572
+tools/statecells-build/sc_process.cpp: 323
+tools/seeddelta-build/seeddelta_policy.cpp: 312
+tools/statecells-build/sc_imatrix.cpp: 287
+tools/seeddelta-build/sd_report.cpp: 262
+tools/seeddelta-build/sd_ffn_proxy.cpp: 247
+tools/seeddelta-build/seeddelta_policy_selftest.cpp: 226
+src/llama-statecells.cpp: 176
+tools/statecells-build/sc_utils.cpp: 176
+tools/statecells-build/sc_eval.cpp: 181
+tools/statecells-build/sc_build.cpp: 142

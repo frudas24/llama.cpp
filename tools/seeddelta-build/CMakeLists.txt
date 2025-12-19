@@ -1,6 +1,8 @@
 set(TARGET llama-seeddelta-build)
 add_executable(${TARGET}
     seeddelta-build.cpp
+    sd_cli.cpp
+    sd_runner.cpp
     seeddelta_policy.cpp
     seeddelta_policy_export.cpp
     seeddelta_policy_selftest.cpp
