@@ -92,6 +92,33 @@ enum class llama_seeddelta_fb_status {
     read_fail,
 };
 
+static bool llama_seeddelta_tensor_read(
+        const ggml_tensor * t,
+        size_t offset,
+        size_t size,
+        std::vector<uint8_t> & buf,
+        const uint8_t ** out) {
+    if (!t || !out || size == 0) {
+        return false;
+    }
+    const ggml_tensor * base = t->view_src ? t->view_src : t;
+    ggml_backend_buffer_t buffer = base->buffer;
+    if (!buffer || !base->data) {
+        return false;
+    }
+    if (offset + size > ggml_nbytes(t)) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_host(buffer)) {
+        *out = (const uint8_t *) t->data + offset;
+        return true;
+    }
+    buf.resize(size);
+    ggml_backend_tensor_get(t, buf.data(), offset, size);
+    *out = buf.data();
+    return true;
+}
+
 static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t col, std::vector<float> & out) {
     if (!w || ggml_n_dims(w) != 2) {
         return false;
@@ -106,18 +133,16 @@ static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t c
         return false;
     }
 
-    const bool w_host = !w->buffer || ggml_backend_buffer_is_host(w->buffer);
-    const uint8_t * w_data = (const uint8_t *) w->data;
-    if (!w_host) {
-        const size_t nbytes = ggml_nbytes(w);
-        llama_seeddelta_wbuf_tls.resize(nbytes);
-        ggml_backend_tensor_get(w, llama_seeddelta_wbuf_tls.data(), 0, nbytes);
-        w_data = llama_seeddelta_wbuf_tls.data();
+    const size_t row_bytes = (size_t) w->nb[1];
+    const size_t offset = (size_t) col * w->nb[1];
+    const uint8_t * w_data = nullptr;
+    if (!llama_seeddelta_tensor_read(w, offset, row_bytes, llama_seeddelta_wbuf_tls, &w_data)) {
+        return false;
     }
 
     out.resize((size_t) n_in);
 
-    const uint8_t * base = w_data + col * w->nb[1];
+    const uint8_t * base = w_data;
     const auto * traits = ggml_get_type_traits(w->type);
     if (!traits) {
         return false;
@@ -193,18 +218,16 @@ static bool llama_seeddelta_dense_fallback(
         return fail(llama_seeddelta_fb_status::read_fail);
     }
 
-    const bool x_host = !x->buffer || ggml_backend_buffer_is_host(x->buffer);
-    const uint8_t * x_data = (const uint8_t *) x->data;
-    if (!x_host) {
-        const size_t nbytes = ggml_nbytes(x);
-        llama_seeddelta_xbuf_tls.resize(nbytes);
-        ggml_backend_tensor_get(x, llama_seeddelta_xbuf_tls.data(), 0, nbytes);
-        x_data = llama_seeddelta_xbuf_tls.data();
+    const size_t row_bytes = (size_t) n_in * x->nb[0];
+    const size_t x_offset = (size_t) t * x->nb[1];
+    const uint8_t * x_data = nullptr;
+    if (!llama_seeddelta_tensor_read(x, x_offset, row_bytes, llama_seeddelta_xbuf_tls, &x_data)) {
+        return fail(llama_seeddelta_fb_status::no_data);
     }
 
     double acc = 0.0;
     for (int64_t i = 0; i < n_in; ++i) {
-        const float xv = read_x_f16_or_f32(x, x_data, i, t);
+        const float xv = read_f16_or_f32_1d(x, x_data, i);
         acc += (double) llama_seeddelta_wcol_tls[(size_t) i] * (double) xv;
     }
 
