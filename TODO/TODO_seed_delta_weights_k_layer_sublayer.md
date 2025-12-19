@@ -375,6 +375,13 @@ Acciones:
 * [ ] Exponer en policy una forma simple:
 
   * `K_levels` globales + reglas por rangos de tiles (inferior/media/superior) o por “top-N tiles” según importancia.
+  * **Selector TT-cross/maxvol (idea del TODO N6, explícito):**
+    * Muestrear solo 3–6 tiles por capa (fibras representativas) antes de decidir K.
+    * Calcular features de importancia por K (o por tile): `proxy_cos_p50/p05`, `residual_L2`, `sparsity`, `stack_cost_norm` (todas ya presentes en report/metrics).
+    * Elegir {K1,(K2)} vía maxvol aproximado: K1 = argmax‖f‖; K2 = argmax‖f‖·(1–cos²(f,fK1)) para evitar colinealidad (rank-2 opcional).
+    * Asignar K a cada tile por afinidad (similitud de features) con {K1,(K2)}; fallback al ciclo uniforme actual para comparabilidad.
+    * Métricas en report: `kselector.rank`, `kselector.gap_vs_uniform`, `kselector.tiles_sampled`.
+    * (Opcional) Autotuner seguro (bandit) que alterna selector `uniform` vs `ttcross` y rank 1/2 con recompensa `-quality_gap/lat_ms`, con hysteresis y rollback a `uniform` si empeora.
 
 ---
 

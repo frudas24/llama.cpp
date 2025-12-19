@@ -55,6 +55,11 @@ struct report_entry {
     int64_t tiles_dropped_count = 0;
     double tiles_dropped_pct = 0.0;
     bool k_custom_used = false;
+    // K selector metadata
+    std::string kselector_mode;
+    int64_t kselector_rank = 0;
+    int64_t kselector_tiles_sampled = 0;
+    double kselector_gap_vs_uniform = 0.0;
     struct k_stats {
         double min = 0.0;
         double max = 0.0;

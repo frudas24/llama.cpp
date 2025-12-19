@@ -42,6 +42,9 @@ struct sd_args {
     double stack_cost_cap = 0.0;
     int64_t tile_rows = 0;
     int64_t tile_rows_align = 32;
+    std::string k_selector = "cycle"; // uniform/cycle/ttcross
+    int k_selector_samples = 4;
+    int k_selector_rank = 1;
 };
 
 bool sd_parse_args(int argc, char ** argv, sd_args & args);

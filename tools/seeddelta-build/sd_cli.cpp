@@ -39,6 +39,9 @@ namespace {
     printf("  --stack-cost-cap F   hard cap for accumulated stack_cost (default: +inf => no cap)\n");
     printf("  --tile-rows N        enable tiling metadata: rows per tile (default: 0 = disabled)\n");
     printf("  --tile-align N       alignment for tile rows/boundaries (default: 32)\n");
+    printf("  --k-selector NAME    K assignment: cycle (default), uniform, ttcross\n");
+    printf("  --k-selector-samples N  tiles to sample for selector heuristics (default: 4)\n");
+    printf("  --k-selector-rank N  rank for selector heuristics (1 or 2, default: 1)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -97,6 +100,9 @@ bool sd_parse_args(int argc, char ** argv, sd_args & args) {
         if (arg == "--stack-cost-cap" && i + 1 < argc) { args.stack_cost_cap = std::stod(argv[++i]); continue; }
         if (arg == "--tile-rows" && i + 1 < argc) { args.tile_rows = std::stoll(argv[++i]); continue; }
         if (arg == "--tile-align" && i + 1 < argc) { args.tile_rows_align = std::max<int64_t>(1, std::stoll(argv[++i])); continue; }
+        if (arg == "--k-selector" && i + 1 < argc) { args.k_selector = argv[++i]; continue; }
+        if (arg == "--k-selector-samples" && i + 1 < argc) { args.k_selector_samples = std::stoi(argv[++i]); continue; }
+        if (arg == "--k-selector-rank" && i + 1 < argc) { args.k_selector_rank = std::stoi(argv[++i]); continue; }
         if (arg == "--overwrite-existing") { args.overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { args.n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { args.eval_cols = std::stoll(argv[++i]); continue; }

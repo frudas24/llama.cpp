@@ -250,6 +250,10 @@ bool sd_report::write_report_json(
             out << e.k_per_tile[ti];
         }
         out << "],\n";
+        out << "      \"kselector_mode\": \"" << json_escape(e.kselector_mode) << "\",\n";
+        out << "      \"kselector_rank\": " << e.kselector_rank << ",\n";
+        out << "      \"kselector_tiles_sampled\": " << e.kselector_tiles_sampled << ",\n";
+        out << "      \"kselector_gap_vs_uniform\": " << e.kselector_gap_vs_uniform << ",\n";
         out << "      \"k_custom_used\": " << (e.k_custom_used ? "true" : "false") << ",\n";
         out << "      \"k_requested_stats\": {\"has\": " << (e.k_requested_stats.has ? "true" : "false") << ", \"min\": " << e.k_requested_stats.min << ", \"max\": " << e.k_requested_stats.max << ", \"mean\": " << e.k_requested_stats.mean << "},\n";
         out << "      \"k_selected_stats\": {\"has\": " << (e.k_selected_stats.has ? "true" : "false") << ", \"min\": " << e.k_selected_stats.min << ", \"max\": " << e.k_selected_stats.max << ", \"mean\": " << e.k_selected_stats.mean << "},\n";

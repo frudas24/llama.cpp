@@ -1,6 +1,7 @@
 #include "include/sd_build.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cinttypes>
@@ -17,6 +18,201 @@
 #include "sd_ffn_proxy.h"
 #include "sd_constants.h"
 #include "sd_utils.h"
+
+struct sd_tile_stats {
+    double l2 = 0.0;
+    double abs_sum = 0.0;
+    double max_abs = 0.0;
+    int64_t cols = 0;
+};
+
+static std::vector<sd_tile_stats> sd_compute_tile_stats(
+        ggml_tensor * W,
+        int64_t tile_rows,
+        int64_t n_in,
+        int64_t n_out) {
+    const int64_t n_tiles = (tile_rows > 0 && n_out > 0) ? (n_out + tile_rows - 1) / tile_rows : (n_out > 0 ? 1 : 0);
+    std::vector<sd_tile_stats> stats((size_t) n_tiles);
+    if (n_tiles <= 0) {
+        return stats;
+    }
+    std::vector<float> col;
+    col.reserve((size_t) n_in);
+    for (int64_t col_idx = 0; col_idx < n_out; ++col_idx) {
+        read_column_f32(W, col_idx, col);
+        double l2 = 0.0;
+        double abs_sum = 0.0;
+        double max_abs = 0.0;
+        for (float v : col) {
+            const double dv = (double) v;
+            l2 += dv * dv;
+            const double av = std::fabs(dv);
+            abs_sum += av;
+            if (av > max_abs) {
+                max_abs = av;
+            }
+        }
+        const int64_t tile = tile_rows > 0 ? col_idx / tile_rows : 0;
+        auto & ts = stats[(size_t) tile];
+        ts.l2 += l2;
+        ts.abs_sum += abs_sum;
+        ts.max_abs = std::max(ts.max_abs, max_abs);
+        ts.cols += 1;
+    }
+    return stats;
+}
+
+static std::vector<int64_t> sd_assign_k_per_tile(
+        const std::vector<sd_tile_stats> & stats,
+        const std::vector<int64_t> & k_levels,
+        const sd_args & args,
+        int64_t n_in,
+        double & gap_vs_uniform,
+        int64_t & tiles_sampled,
+        int64_t & selector_rank) {
+    const size_t n_tiles = stats.size();
+    gap_vs_uniform = 0.0;
+    tiles_sampled = 0;
+    selector_rank = 0;
+
+    if (n_tiles == 0 || k_levels.empty()) {
+        return {};
+    }
+
+    std::vector<int64_t> k_per_tile((size_t) n_tiles, k_levels.back());
+
+    if (stats.empty()) {
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            k_per_tile[ti] = k_levels[ti % k_levels.size()];
+        }
+        selector_rank = 1;
+        return k_per_tile;
+    }
+
+    const std::string selector = args.k_selector.empty() ? "cycle" : args.k_selector;
+    if (selector == "uniform") {
+        std::fill(k_per_tile.begin(), k_per_tile.end(), k_levels.back());
+        selector_rank = 1;
+    } else if (selector == "cycle") {
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            k_per_tile[ti] = k_levels[ti % k_levels.size()];
+        }
+        selector_rank = 1;
+    } else { // ttcross / unknown -> treat as ttcross heuristic
+        const int rank = std::max(1, std::min(args.k_selector_rank, 2));
+        selector_rank = rank;
+        tiles_sampled = std::max<int64_t>(1, std::min<int64_t>(args.k_selector_samples, (int64_t) n_tiles));
+
+        // Build feature matrix: [log1p(l2), mean_abs, max_abs]
+        std::vector<std::array<double, 3>> feats(n_tiles);
+        std::array<double, 3> mean = {0.0, 0.0, 0.0};
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            const auto & ts = stats[ti];
+            const double denom = (double) ts.cols * (double) std::max<int64_t>(1, n_in);
+            const double mean_abs = denom > 0.0 ? ts.abs_sum / denom : 0.0;
+            feats[ti] = { std::log1p(ts.l2), mean_abs, ts.max_abs };
+            for (int d = 0; d < 3; ++d) mean[d] += feats[ti][d];
+        }
+        for (int d = 0; d < 3; ++d) mean[d] /= (double) n_tiles;
+        std::array<double, 3> stdev = {0.0, 0.0, 0.0};
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            for (int d = 0; d < 3; ++d) {
+                const double diff = feats[ti][d] - mean[d];
+                stdev[d] += diff * diff;
+            }
+        }
+        for (int d = 0; d < 3; ++d) {
+            stdev[d] = std::sqrt(stdev[d] / std::max<size_t>(1, n_tiles));
+            if (stdev[d] < 1e-9) stdev[d] = 1.0;
+        }
+
+        std::vector<std::array<double, 3>> zfeats(n_tiles);
+        std::vector<double> norms(n_tiles, 0.0);
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            double norm = 0.0;
+            for (int d = 0; d < 3; ++d) {
+                const double z = (feats[ti][d] - mean[d]) / stdev[d];
+                zfeats[ti][d] = z;
+                norm += z * z;
+            }
+            norms[ti] = std::sqrt(norm);
+        }
+
+        const double eps = 1e-9;
+        size_t j1 = 0;
+        for (size_t ti = 1; ti < n_tiles; ++ti) {
+            if (norms[ti] > norms[j1]) j1 = ti;
+        }
+        size_t j2 = n_tiles;
+        if (rank > 1 && n_tiles > 1) {
+            double best = -1.0;
+            for (size_t ti = 0; ti < n_tiles; ++ti) {
+                if (ti == j1) continue;
+                double dot = 0.0;
+                for (int d = 0; d < 3; ++d) dot += zfeats[ti][d] * zfeats[j1][d];
+                const double denom = (norms[ti] * norms[j1]) + eps;
+                const double cos2 = denom > 0.0 ? (dot / denom) * (dot / denom) : 0.0;
+                const double score = norms[ti] * (1.0 - std::min(0.999, cos2));
+                if (score > best) {
+                    best = score;
+                    j2 = ti;
+                }
+            }
+            if (best <= 0.0) {
+                j2 = n_tiles; // fallback to rank-1 if no diverse second fiber
+                selector_rank = 1;
+            }
+        } else {
+            selector_rank = 1;
+        }
+
+        std::vector<std::pair<double, size_t>> order;
+        order.reserve(n_tiles);
+        for (size_t ti = 0; ti < n_tiles; ++ti) {
+            double sim1 = 0.0;
+            double sim2 = 0.0;
+            if (norms[ti] > eps && norms[j1] > eps) {
+                double dot = 0.0;
+                for (int d = 0; d < 3; ++d) dot += zfeats[ti][d] * zfeats[j1][d];
+                sim1 = dot / ((norms[ti] * norms[j1]) + eps);
+            }
+            if (selector_rank > 1 && j2 < n_tiles && norms[ti] > eps && norms[j2] > eps) {
+                double dot = 0.0;
+                for (int d = 0; d < 3; ++d) dot += zfeats[ti][d] * zfeats[j2][d];
+                sim2 = dot / ((norms[ti] * norms[j2]) + eps);
+            }
+            double score = sim1;
+            if (selector_rank > 1 && j2 < n_tiles) {
+                score = (sim1 >= sim2) ? sim1 : -sim2;
+            }
+            order.emplace_back(score, ti);
+        }
+        std::sort(order.begin(), order.end(), [](const auto & a, const auto & b) {
+            return a.first > b.first;
+        });
+
+        // Assign higher K to highest score tiles.
+        for (size_t idx = 0; idx < order.size(); ++idx) {
+            const size_t tile = order[idx].second;
+            size_t level_idx = (size_t) ((double) idx * (double) k_levels.size() / (double) n_tiles);
+            if (level_idx >= k_levels.size()) level_idx = k_levels.size() - 1;
+            const size_t rev_idx = (k_levels.size() - 1) - level_idx;
+            k_per_tile[tile] = k_levels[rev_idx];
+        }
+    }
+
+    double mean_uniform = 0.0;
+    for (size_t ti = 0; ti < n_tiles; ++ti) {
+        mean_uniform += (double) k_levels[ti % k_levels.size()];
+    }
+    mean_uniform /= (double) n_tiles;
+    double mean_sel = 0.0;
+    for (int64_t v : k_per_tile) mean_sel += (double) v;
+    mean_sel /= (double) n_tiles;
+    gap_vs_uniform = mean_sel - mean_uniform;
+
+    return k_per_tile;
+}
 
 sd_build_result sd_build_layers(
         const sd_args & args,
@@ -740,12 +936,37 @@ sd_build_result sd_build_layers(
                 }
                 re.k_levels = k_levels;
 
-                re.k_per_tile.clear();
-                re.k_per_tile.reserve((size_t) n_tiles);
-                for (int64_t ti = 0; ti < n_tiles; ++ti) {
-                    const int64_t k_here = k_levels[(size_t) ti % k_levels.size()];
-                    re.k_per_tile.push_back(k_here);
+                double kselector_gap = 0.0;
+                int64_t kselector_tiles = 0;
+                int64_t kselector_rank = 0;
+                std::vector<int64_t> k_per_tile;
+                const std::string selector = args.k_selector.empty() ? "cycle" : args.k_selector;
+                if (selector == "uniform") {
+                    kselector_rank = 1;
+                    kselector_tiles = n_tiles;
+                    k_per_tile.assign((size_t) n_tiles, k_levels.empty() ? K_eff : k_levels.back());
+                } else if (selector == "cycle") {
+                    kselector_rank = 1;
+                    kselector_tiles = n_tiles;
+                    k_per_tile.reserve((size_t) n_tiles);
+                    for (int64_t ti = 0; ti < n_tiles; ++ti) {
+                        const int64_t k_here = k_levels[(size_t) ti % k_levels.size()];
+                        k_per_tile.push_back(k_here);
+                    }
+                } else { // ttcross heuristic
+                    std::vector<sd_tile_stats> stats = sd_compute_tile_stats(W, tile_rows, n_in, n_out);
+                    k_per_tile = sd_assign_k_per_tile(stats, k_levels, args, n_in, kselector_gap, kselector_tiles, kselector_rank);
+                    if (k_per_tile.empty()) {
+                        k_per_tile.reserve((size_t) n_tiles);
+                        for (int64_t ti = 0; ti < n_tiles; ++ti) {
+                            const int64_t k_here = k_levels[(size_t) ti % k_levels.size()];
+                            k_per_tile.push_back(k_here);
+                        }
+                        kselector_rank = 1;
+                    }
                 }
+
+                re.k_per_tile = std::move(k_per_tile);
                 re.k_total_per_tensor = 0;
                 for (int64_t v : re.k_per_tile) re.k_total_per_tensor += v;
                 std::unordered_set<int64_t> uniq(re.k_per_tile.begin(), re.k_per_tile.end());
@@ -753,6 +974,10 @@ sd_build_result sd_build_layers(
                 const bool rounded = (re.n_out > 0) && (re.n_out % tile_rows != 0);
                 re.tiles_rounded_count = rounded ? 1 : 0;
                 re.tiles_rounded_pct = n_tiles > 0 ? (double) re.tiles_rounded_count * 100.0 / (double) n_tiles : 0.0;
+                re.kselector_mode = args.k_selector;
+                re.kselector_rank = kselector_rank;
+                re.kselector_tiles_sampled = kselector_tiles;
+                re.kselector_gap_vs_uniform = kselector_gap;
             }
 
             if (scheme == sd_resid_scheme::coo && !write_base && eval_x > 0) {
