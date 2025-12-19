@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #if defined(__AVX2__)
@@ -72,6 +74,8 @@ static inline int32_t read_base_i16_i32(const ggml_tensor * t, const uint8_t * b
 static std::atomic_flag llama_seeddelta_nan_warned = ATOMIC_FLAG_INIT;
 static std::atomic<int64_t> llama_seeddelta_nan_count{0};
 static thread_local std::vector<float> llama_seeddelta_wcol_tls;
+static const bool llama_seeddelta_debug_data = std::getenv("LLAMA_SEEDDELTA_DEBUG_DATA") != nullptr;
+static std::atomic<int> llama_seeddelta_debug_budget{16};
 
 static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t col, std::vector<float> & out) {
     if (!w || ggml_n_dims(w) != 2) {
@@ -205,6 +209,32 @@ static inline float llama_seeddelta_nan_guard(
                 name ? name : "<unnamed>");
     }
 
+    return y;
+}
+
+static inline float llama_seeddelta_debug_compare(
+        const ggml_tensor * w_ref,
+        const ggml_tensor * x,
+        int64_t o,
+        int64_t t,
+        float y) {
+    if (!llama_seeddelta_debug_data) {
+        return y;
+    }
+    int budget = llama_seeddelta_debug_budget.load(std::memory_order_relaxed);
+    if (budget <= 0) {
+        return y;
+    }
+    float y_dense = 0.0f;
+    if (llama_seeddelta_dense_fallback(w_ref, x, o, t, y_dense)) {
+        const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
+        if (prev > 0) {
+            const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
+            const double diff = (double) y - (double) y_dense;
+            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " out=%g dense=%g diff=%g\n",
+                         name ? name : "(unnamed)", o, t, y, y_dense, diff);
+        }
+    }
     return y;
 }
 
@@ -395,6 +425,7 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
                     }
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     dst_data[o + t * n_out] = out;
                 }
             }
@@ -417,6 +448,7 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
                     }
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     dst_data[o + t * n_out] = out;
                 }
             }
@@ -448,6 +480,7 @@ static void llama_seeddelta_coo_op(struct ggml_tensor * dst, int ith, int nth, v
             }
             float out = (scale != 1.0f) ? (y * scale) : y;
             out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+            out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
             *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
         }
     }
@@ -538,6 +571,7 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                     }
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     dst_data[o + t * n_out] = out;
                 }
             }
@@ -569,6 +603,7 @@ static void llama_seeddelta_block_op(struct ggml_tensor * dst, int ith, int nth,
                     }
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     dst_data[o + t * n_out] = out;
                 }
             }
