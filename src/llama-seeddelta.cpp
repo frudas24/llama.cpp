@@ -77,6 +77,19 @@ static thread_local std::vector<float> llama_seeddelta_wcol_tls;
 static const bool llama_seeddelta_debug_data = std::getenv("LLAMA_SEEDDELTA_DEBUG_DATA") != nullptr;
 static std::atomic<int> llama_seeddelta_debug_budget{16};
 
+enum class llama_seeddelta_fb_status {
+    ok,
+    no_w,
+    no_x,
+    no_data,
+    non_host,
+    dim_mismatch,
+    n_in_mismatch,
+    o_range,
+    t_range,
+    read_fail,
+};
+
 static bool llama_seeddelta_read_weight_col_f32(const ggml_tensor * w, int64_t col, std::vector<float> & out) {
     if (!w || ggml_n_dims(w) != 2) {
         return false;
@@ -138,36 +151,41 @@ static bool llama_seeddelta_dense_fallback(
         const ggml_tensor * x,
         int64_t o,
         int64_t t,
-        float & y_out) {
-    if (!w_ref || !x) {
+        float & y_out,
+        llama_seeddelta_fb_status * fb_status = nullptr) {
+    auto fail = [&](llama_seeddelta_fb_status st) {
+        if (fb_status) *fb_status = st;
         return false;
+    };
+    if (!w_ref || !x) {
+        return fail(llama_seeddelta_fb_status::no_w);
     }
     if (!x->data) {
-        return false;
+        return fail(llama_seeddelta_fb_status::no_x);
     }
     if (x->buffer && !ggml_backend_buffer_is_host(x->buffer)) {
-        return false;
+        return fail(llama_seeddelta_fb_status::non_host);
     }
     if (ggml_n_dims(x) < 2) {
-        return false;
+        return fail(llama_seeddelta_fb_status::dim_mismatch);
     }
     if (ggml_n_dims(w_ref) != 2) {
-        return false;
+        return fail(llama_seeddelta_fb_status::dim_mismatch);
     }
 
     const int64_t n_in = x->ne[0];
     if (w_ref->ne[0] != n_in) {
-        return false;
+        return fail(llama_seeddelta_fb_status::n_in_mismatch);
     }
     if (o < 0 || o >= w_ref->ne[1]) {
-        return false;
+        return fail(llama_seeddelta_fb_status::o_range);
     }
     if (t < 0 || t >= x->ne[1]) {
-        return false;
+        return fail(llama_seeddelta_fb_status::t_range);
     }
 
     if (!llama_seeddelta_read_weight_col_f32(w_ref, o, llama_seeddelta_wcol_tls)) {
-        return false;
+        return fail(llama_seeddelta_fb_status::read_fail);
     }
 
     const uint8_t * x_data = (const uint8_t *) x->data;
@@ -178,6 +196,7 @@ static bool llama_seeddelta_dense_fallback(
     }
 
     y_out = (float) acc;
+    if (fb_status) *fb_status = llama_seeddelta_fb_status::ok;
     return std::isfinite(y_out);
 }
 
@@ -226,7 +245,8 @@ static inline float llama_seeddelta_debug_compare(
         return y;
     }
     float y_dense = 0.0f;
-    if (llama_seeddelta_dense_fallback(w_ref, x, o, t, y_dense)) {
+    llama_seeddelta_fb_status fb = llama_seeddelta_fb_status::ok;
+    if (llama_seeddelta_dense_fallback(w_ref, x, o, t, y_dense, &fb)) {
         const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
         if (prev > 0) {
             const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
@@ -238,8 +258,19 @@ static inline float llama_seeddelta_debug_compare(
         const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
         if (prev > 0) {
             const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
-            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " fallback-unavailable\n",
-                         name ? name : "(unnamed)", o, t);
+            const char * reason =
+                fb == llama_seeddelta_fb_status::no_w ? "no_w" :
+                fb == llama_seeddelta_fb_status::no_x ? "no_x" :
+                fb == llama_seeddelta_fb_status::no_data ? "no_data" :
+                fb == llama_seeddelta_fb_status::non_host ? "non_host" :
+                fb == llama_seeddelta_fb_status::dim_mismatch ? "dim_mismatch" :
+                fb == llama_seeddelta_fb_status::n_in_mismatch ? "n_in_mismatch" :
+                fb == llama_seeddelta_fb_status::o_range ? "o_range" :
+                fb == llama_seeddelta_fb_status::t_range ? "t_range" :
+                fb == llama_seeddelta_fb_status::read_fail ? "read_fail" :
+                "unknown";
+            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " fallback-unavailable (%s)\n",
+                         name ? name : "(unnamed)", o, t, reason);
         }
     }
     return y;
