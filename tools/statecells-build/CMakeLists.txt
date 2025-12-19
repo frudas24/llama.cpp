@@ -5,7 +5,9 @@ add_executable(${TARGET}
     sc_build.cpp
     sc_runner.cpp
     sc_imatrix.cpp
-    sc_encode.cpp
+    sc_encode_train.cpp
+    sc_encode_codes.cpp
+    sc_encode_row_scale.cpp
     sc_eval.cpp
     sc_utils.cpp
     sc_process.cpp

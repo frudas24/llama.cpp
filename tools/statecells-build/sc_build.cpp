@@ -3,7 +3,6 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "include/sc_cli.h"
-#include "include/sc_encode.h"
 #include "include/sc_eval.h"
 #include "include/sc_imatrix.h"
 #include "include/sc_build.h"
@@ -100,6 +99,16 @@ int sc_build(
     auto & report_rows = proc.report_rows;
     const int64_t n_added = proc.n_added;
     const int64_t n_sc_existing = proc.n_sc_existing;
+
+    if (!proc.ok) {
+        for (auto * c : sc_contexts) {
+            ggml_free(c);
+        }
+        ggml_free(ctx_data);
+        gguf_free(dst);
+        gguf_free(src);
+        return 1;
+    }
 
     if (n_sc_existing + n_added == 0) {
         fprintf(stderr, "no FFN weights found for StateCells\n");

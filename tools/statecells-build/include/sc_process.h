@@ -16,6 +16,7 @@ struct sc_process_result {
     int64_t n_sc_existing = 0;
     std::vector<sc_report_row> report_rows;
     std::vector<ggml_context *> sc_contexts;
+    bool ok = true;
 };
 
 sc_process_result sc_process_layers(
