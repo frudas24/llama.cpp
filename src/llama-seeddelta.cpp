@@ -98,6 +98,7 @@ static bool llama_seeddelta_tensor_read(
         size_t size,
         std::vector<uint8_t> & buf,
         const uint8_t ** out) {
+    (void) buf;
     if (!t || !out || size == 0) {
         return false;
     }
@@ -106,16 +107,13 @@ static bool llama_seeddelta_tensor_read(
     if (!buffer || !base->data) {
         return false;
     }
+    if (!ggml_backend_buffer_is_host(buffer)) {
+        return false;
+    }
     if (offset + size > ggml_nbytes(t)) {
         return false;
     }
-    if (ggml_backend_buffer_is_host(buffer)) {
-        *out = (const uint8_t *) t->data + offset;
-        return true;
-    }
-    buf.resize(size);
-    ggml_backend_tensor_get(t, buf.data(), offset, size);
-    *out = buf.data();
+    *out = (const uint8_t *) t->data + offset;
     return true;
 }
 
@@ -195,6 +193,18 @@ static bool llama_seeddelta_dense_fallback(
     }
     if (!x->data) {
         return fail(llama_seeddelta_fb_status::no_x);
+    }
+    {
+        const ggml_tensor * w_base = w_ref->view_src ? w_ref->view_src : w_ref;
+        if (w_base->buffer && !ggml_backend_buffer_is_host(w_base->buffer)) {
+            return fail(llama_seeddelta_fb_status::non_host);
+        }
+    }
+    {
+        const ggml_tensor * x_base = x->view_src ? x->view_src : x;
+        if (x_base->buffer && !ggml_backend_buffer_is_host(x_base->buffer)) {
+            return fail(llama_seeddelta_fb_status::non_host);
+        }
     }
     if (ggml_n_dims(x) < 2) {
         return fail(llama_seeddelta_fb_status::dim_mismatch);
