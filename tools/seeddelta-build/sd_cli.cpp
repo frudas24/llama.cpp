@@ -18,6 +18,7 @@ namespace {
     printf("  --K-gate N           override top-K for ffn_gate\n");
     printf("  --K-up N             override top-K for ffn_up\n");
     printf("  --K-down N           override top-K for ffn_down\n");
+    printf("  --K-levels CSV       optional discrete K levels for tiling (e.g. 32,64). Falls back to K if omitted.\n");
     printf("  --idx-type i16|i32   index tensor type (default: i16)\n");
     printf("  --val-type f16|f32   value tensor type (default: f16)\n");
     printf("  --row-scale          write per-output d_row_scale tensor (default: off)\n");
@@ -63,6 +64,20 @@ bool sd_parse_args(int argc, char ** argv, sd_args & args) {
         if (arg == "--K-gate" && i + 1 < argc) { args.K_gate = std::stoll(argv[++i]); continue; }
         if (arg == "--K-up"   && i + 1 < argc) { args.K_up   = std::stoll(argv[++i]); continue; }
         if (arg == "--K-down" && i + 1 < argc) { args.K_down = std::stoll(argv[++i]); continue; }
+        if (arg == "--K-levels" && i + 1 < argc) {
+            std::string csv = argv[++i];
+            size_t pos = 0;
+            while (pos < csv.size()) {
+                size_t comma = csv.find(',', pos);
+                std::string tok = csv.substr(pos, comma == std::string::npos ? csv.size() - pos : comma - pos);
+                if (!tok.empty()) {
+                    args.K_levels.push_back(std::stoll(tok));
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            continue;
+        }
         if (arg == "--idx-type" && i + 1 < argc) { args.idx_type_str = argv[++i]; continue; }
         if (arg == "--val-type" && i + 1 < argc) { args.val_type_str = argv[++i]; continue; }
         if (arg == "--row-scale") { args.write_row_scale = true; continue; }

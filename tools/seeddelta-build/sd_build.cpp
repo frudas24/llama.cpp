@@ -730,10 +730,26 @@ sd_build_result sd_build_layers(
 
                 re.tile_rows = tile_rows;
                 re.tile_rows_align = align;
-                re.k_total_per_tensor = n_tiles * K_eff;
-                re.k_levels = { K_eff };
-                re.k_per_tile.assign((size_t) n_tiles, K_eff);
-                re.unique_k_count = n_tiles > 0 ? 1 : 0;
+                // choose K levels: if user provided, use unique positive sorted, else fallback to K_eff
+                std::vector<int64_t> k_levels = args.K_levels;
+                k_levels.erase(std::remove_if(k_levels.begin(), k_levels.end(), [](int64_t v){ return v <= 0; }), k_levels.end());
+                std::sort(k_levels.begin(), k_levels.end());
+                k_levels.erase(std::unique(k_levels.begin(), k_levels.end()), k_levels.end());
+                if (k_levels.empty()) {
+                    k_levels.push_back(K_eff);
+                }
+                re.k_levels = k_levels;
+
+                re.k_per_tile.clear();
+                re.k_per_tile.reserve((size_t) n_tiles);
+                for (int64_t ti = 0; ti < n_tiles; ++ti) {
+                    const int64_t k_here = k_levels[(size_t) ti % k_levels.size()];
+                    re.k_per_tile.push_back(k_here);
+                }
+                re.k_total_per_tensor = 0;
+                for (int64_t v : re.k_per_tile) re.k_total_per_tensor += v;
+                std::unordered_set<int64_t> uniq(re.k_per_tile.begin(), re.k_per_tile.end());
+                re.unique_k_count = (int64_t) uniq.size();
                 const bool rounded = (re.n_out > 0) && (re.n_out % tile_rows != 0);
                 re.tiles_rounded_count = rounded ? 1 : 0;
                 re.tiles_rounded_pct = n_tiles > 0 ? (double) re.tiles_rounded_count * 100.0 / (double) n_tiles : 0.0;

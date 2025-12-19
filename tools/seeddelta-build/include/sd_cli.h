@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct sd_args {
     std::string in_fname;
@@ -20,6 +21,7 @@ struct sd_args {
     int64_t K_gate = -1;
     int64_t K_up   = -1;
     int64_t K_down = -1;
+    std::vector<int64_t> K_levels;
     std::string idx_type_str = "i16";
     std::string val_type_str = "f16";
     bool write_row_scale = false;
