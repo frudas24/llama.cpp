@@ -4,6 +4,8 @@
 
 - [x] Simple smoke modelo base (sin SeedΔ): ya no crashea en CPU; corre `llama-cli ... --prompt "hola"` en 512 ctx.
   - `/usr/bin/time` con SeedΔ ejecutado: `--seeddelta -c 512 -p "hola"` completó (RSS máx ~910 MB).
+  - Nota CLI local: la UI interactiva puede quedarse colgada sin TTY; usar `--simple-io --no-display-prompt` para salida directa. Ejemplo:  
+    `./build/bin/llama-cli -m calibration/gemma_sd_mid_10-11_block16_k64_strip.gguf --seeddelta -t 8 -c 512 --temp 0 --top-k 1 --seed 1 -n 8 --single-turn --no-warmup --simple-io --no-display-prompt --prompt "hola"` (resp. OK, prompt ~114 t/s, gen ~38 t/s, RSS ~910 MB).
 
 - [x] Validation rápida del report JSON: `jq '.weights[] | {kind,ffn_proxy_available,stack_cost_total}' calibration/gemma1b_ffnproxy_smoke.json`
 

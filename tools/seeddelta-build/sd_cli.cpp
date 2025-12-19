@@ -36,6 +36,8 @@ namespace {
     printf("  --policy-self-test   run internal policy merge tests and exit\n");
     printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
     printf("  --stack-cost-cap F   hard cap for accumulated stack_cost (default: +inf => no cap)\n");
+    printf("  --tile-rows N        enable tiling metadata: rows per tile (default: 0 = disabled)\n");
+    printf("  --tile-align N       alignment for tile rows/boundaries (default: 32)\n");
     printf("  -t, --threads N      worker threads (default: nproc)\n");
     printf("  --eval-cols N        evaluate reconstruction gap on N random outputs per weight (default: 0=off)\n");
     printf("  --eval-x N           evaluate functional gap on N random x vectors (requires --eval-cols, default: 0=off)\n");
@@ -78,6 +80,8 @@ bool sd_parse_args(int argc, char ** argv, sd_args & args) {
         if (arg == "--policy-export" && i + 1 < argc) { args.policy_export_file = argv[++i]; continue; }
         if (arg == "--policy-self-test") { args.policy_self_test = true; continue; }
         if (arg == "--stack-cost-cap" && i + 1 < argc) { args.stack_cost_cap = std::stod(argv[++i]); continue; }
+        if (arg == "--tile-rows" && i + 1 < argc) { args.tile_rows = std::stoll(argv[++i]); continue; }
+        if (arg == "--tile-align" && i + 1 < argc) { args.tile_rows_align = std::max<int64_t>(1, std::stoll(argv[++i])); continue; }
         if (arg == "--overwrite-existing") { args.overwrite_existing = true; continue; }
         if ((arg == "-t" || arg == "--threads") && i + 1 < argc) { args.n_threads = std::stoi(argv[++i]); continue; }
         if (arg == "--eval-cols" && i + 1 < argc) { args.eval_cols = std::stoll(argv[++i]); continue; }

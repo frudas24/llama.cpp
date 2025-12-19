@@ -720,6 +720,24 @@ sd_build_result sd_build_layers(
 
             const int64_t n_blocks_keep = re.n_blocks;
             const int64_t K_eff = re.K;
+            // Populate tile metadata: if --tile-rows is set, emit one tile per contiguous chunk; otherwise single tile.
+            {
+                const int64_t align = std::max<int64_t>(1, args.tile_rows_align);
+                const int64_t base_rows = (args.tile_rows > 0) ? std::min<int64_t>(args.tile_rows, re.n_out) : re.n_out;
+                const int64_t tile_rows_aligned = (base_rows + align - 1) / align * align;
+                const int64_t tile_rows = std::min<int64_t>(tile_rows_aligned, re.n_out > 0 ? re.n_out : 0);
+                const int64_t n_tiles = (tile_rows > 0 && re.n_out > 0) ? (re.n_out + tile_rows - 1) / tile_rows : (re.n_out > 0 ? 1 : 0);
+
+                re.tile_rows = tile_rows;
+                re.tile_rows_align = align;
+                re.k_total_per_tensor = n_tiles * K_eff;
+                re.k_levels = { K_eff };
+                re.k_per_tile.assign((size_t) n_tiles, K_eff);
+                re.unique_k_count = n_tiles > 0 ? 1 : 0;
+                const bool rounded = (re.n_out > 0) && (re.n_out % tile_rows != 0);
+                re.tiles_rounded_count = rounded ? 1 : 0;
+                re.tiles_rounded_pct = n_tiles > 0 ? (double) re.tiles_rounded_count * 100.0 / (double) n_tiles : 0.0;
+            }
 
             if (scheme == sd_resid_scheme::coo && !write_base && eval_x > 0) {
                 const std::string wg_name = "blk." + std::to_string(il) + ".ffn_gate.weight";
