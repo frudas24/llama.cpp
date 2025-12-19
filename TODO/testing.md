@@ -9,6 +9,11 @@
 
 - [x] Validation rápida del report JSON: `jq '.weights[] | {kind,ffn_proxy_available,stack_cost_total}' calibration/gemma1b_ffnproxy_smoke.json`
 
+- [x] Flags nuevos (TODO k_layer/sublayer): tiling básico para K por tile.
+  - `--tile-rows N` habilita tiles por filas (default 0=off); `--tile-align N` alinea límites (default 32).
+  - Ejemplo smoke (remoto): `./build/bin/llama-seeddelta-build -i ../models/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf -o tmp-bin/gemma4b_tile.gguf --layers 10-11 --scheme block --block 16 --K 64 --tile-rows 1024 --tile-align 32 --eval-cols 16 --eval-x 4 --report-json tmp-bin/gemma4b_tile_report.json -t 8 --overwrite-existing`
+  - `report.json` ahora rellena `tile_rows`, `tile_rows_align`, `k_levels`, `k_per_tile`, `unique_k_count`, `k_total_per_tensor`.
+
 
 
 
