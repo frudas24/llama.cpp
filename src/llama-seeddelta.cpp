@@ -83,6 +83,22 @@ static const bool llama_seeddelta_debug_stats = std::getenv("LLAMA_SEEDDELTA_DEB
 static std::atomic<int> llama_seeddelta_debug_budget{16};
 static std::atomic<int64_t> llama_seeddelta_debug_stats_budget{100000};
 
+static int64_t llama_seeddelta_env_int64(const char * name, int64_t fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (!end || end == value) {
+        return fallback;
+    }
+    return parsed;
+}
+
+static const int64_t llama_seeddelta_debug_stats_per_tensor =
+    llama_seeddelta_env_int64("LLAMA_SEEDDELTA_DEBUG_STATS_PER_TENSOR", 1024);
+
 struct llama_seeddelta_debug_stats_entry {
     std::string name;
     uint64_t count = 0;
@@ -93,7 +109,18 @@ struct llama_seeddelta_debug_stats_entry {
 
 class llama_seeddelta_debug_stats_accum {
 public:
-    explicit llama_seeddelta_debug_stats_accum(bool enabled) : enabled_(enabled) {}
+    llama_seeddelta_debug_stats_accum(bool enabled, int64_t per_tensor_cap)
+        : enabled_(enabled),
+          per_tensor_cap_(per_tensor_cap > 0 ? (uint64_t) per_tensor_cap : 0) {}
+
+    bool should_sample(const ggml_tensor * w_ref) {
+        if (!enabled_ || per_tensor_cap_ == 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        auto & entry = entries_[w_ref];
+        return entry.count < per_tensor_cap_;
+    }
 
     void add(const ggml_tensor * w_ref, double diff) {
         if (!enabled_) {
@@ -157,11 +184,14 @@ public:
 
 private:
     bool enabled_ = false;
+    uint64_t per_tensor_cap_ = 0;
     std::mutex mu_;
     std::unordered_map<const ggml_tensor *, llama_seeddelta_debug_stats_entry> entries_;
 };
 
-static llama_seeddelta_debug_stats_accum llama_seeddelta_debug_stats_accum_instance(llama_seeddelta_debug_stats);
+static llama_seeddelta_debug_stats_accum llama_seeddelta_debug_stats_accum_instance(
+    llama_seeddelta_debug_stats,
+    llama_seeddelta_debug_stats_per_tensor);
 
 enum class llama_seeddelta_fb_status {
     ok,
@@ -374,8 +404,10 @@ static inline float llama_seeddelta_debug_compare(
     }
     bool do_stats = false;
     if (want_stats) {
-        const int64_t prev = llama_seeddelta_debug_stats_budget.fetch_sub(1, std::memory_order_relaxed);
-        do_stats = prev > 0;
+        if (llama_seeddelta_debug_stats_accum_instance.should_sample(w_ref)) {
+            const int64_t prev = llama_seeddelta_debug_stats_budget.fetch_sub(1, std::memory_order_relaxed);
+            do_stats = prev > 0;
+        }
     }
     if (!want_print && !do_stats) {
         return y;
