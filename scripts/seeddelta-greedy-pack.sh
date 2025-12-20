@@ -102,8 +102,11 @@ def run(model: str, prompt: str, out_path: pathlib.Path) -> None:
         "-n", str(ngen),
         "-p", prompt,
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out_path.write_bytes(proc.stdout)
+    if proc.stderr:
+        (outdir_p / "logs").mkdir(parents=True, exist_ok=True)
+        (outdir_p / "logs" / f"{out_path.stem}.err").write_bytes(proc.stderr)
 
 for pid, body in prompts:
     run(base, body, outdir_p / "base" / f"{pid}.txt")
@@ -127,6 +130,16 @@ outdir = pathlib.Path(sys.argv[1])
 def read_text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
+def extract_response(s: str) -> str:
+    lines = s.splitlines()
+    prompt_idx = -1
+    for i, line in enumerate(lines):
+        if line.startswith("> "):
+            prompt_idx = i
+    if prompt_idx >= 0:
+        return "\n".join(lines[prompt_idx + 1:]).strip()
+    return s.strip()
+
 def repetition_score(s: str) -> int:
     words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+", s.lower())
     best = 1
@@ -147,6 +160,13 @@ def english_ratio_proxy(s: str) -> float:
     ascii_alpha = [c for c in alpha if ("A" <= c <= "Z") or ("a" <= c <= "z")]
     return len(ascii_alpha) / len(alpha)
 
+def marker_ratio(s: str, markers: set[str]) -> float:
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", s.lower())
+    if not words:
+        return 0.0
+    hits = sum(1 for w in words if w in markers)
+    return hits / len(words)
+
 def strict_ok(pid: str, s: str) -> bool:
     t = s.strip().lower()
     if pid == "P03_follow_instruction_single_word":
@@ -154,16 +174,6 @@ def strict_ok(pid: str, s: str) -> bool:
     if pid == "P20_sentinel":
         return t == "fin"
     return True
-
-rows = []
-for pid_file in sorted((outdir / "sd").glob("*.txt")):
-    pid = pid_file.stem
-    base = read_text(outdir / "base" / f"{pid}.txt")
-    sd = read_text(pid_file)
-    rep = repetition_score(sd)
-    er = english_ratio_proxy(sd)
-    ok = strict_ok(pid, sd)
-    rows.append((pid, rep, er, ok))
 
 spanish_pids = {
     "P01_greeting_es",
@@ -177,13 +187,36 @@ spanish_pids = {
     "P19_instruction_priority",
 }
 
+spanish_markers = {
+    "hola", "gracias", "por", "para", "que", "de", "la", "el", "los", "las",
+    "un", "una", "y", "en", "como", "estas", "estoy", "puedes", "ayuda",
+}
+
+english_markers = {
+    "the", "and", "to", "of", "is", "are", "you", "your", "can", "please",
+    "with", "for", "this", "that", "what", "how",
+}
+
+rows = []
+for pid_file in sorted((outdir / "sd").glob("*.txt")):
+    pid = pid_file.stem
+    base = read_text(outdir / "base" / f"{pid}.txt")
+    sd = read_text(pid_file)
+    sd_resp = extract_response(sd)
+    rep = repetition_score(sd_resp)
+    er = english_ratio_proxy(sd_resp)
+    sm = marker_ratio(sd_resp, spanish_markers)
+    em = marker_ratio(sd_resp, english_markers)
+    ok = strict_ok(pid, sd_resp)
+    rows.append((pid, rep, er, sm, em, ok))
+
 print("=== Greedy pack summary (SeedΔ) ===")
 bad = 0
-for pid, rep, er, ok in rows:
+for pid, rep, er, sm, em, ok in rows:
     flags = []
     if rep >= 8:
         flags.append(f"REPEATx{rep}")
-    if er > 0.85 and pid in spanish_pids:
+    if er > 0.85 and pid in spanish_pids and em > 0.02 and sm < 0.02:
         flags.append(f"DRIFT~{er:.2f}")
     if not ok:
         flags.append("STRICT_FAIL")
@@ -197,4 +230,3 @@ print(f"\nPrompts flagged: {bad}/{total}")
 print(f"RESULT: {result}")
 print(f"Outputs in: {outdir}")
 PY
-
