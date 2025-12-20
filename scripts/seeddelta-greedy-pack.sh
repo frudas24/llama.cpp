@@ -136,9 +136,13 @@ def extract_response(s: str) -> str:
     for i, line in enumerate(lines):
         if line.startswith("> "):
             prompt_idx = i
-    if prompt_idx >= 0:
-        return "\n".join(lines[prompt_idx + 1:]).strip()
-    return s.strip()
+    start = prompt_idx + 1 if prompt_idx >= 0 else 0
+    resp_lines = []
+    for line in lines[start:]:
+        if line.startswith("[ Prompt:") or line.startswith("Exiting") or line.startswith("llama_"):
+            break
+        resp_lines.append(line)
+    return "\n".join(resp_lines).strip()
 
 def repetition_score(s: str) -> int:
     words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_]+", s.lower())
