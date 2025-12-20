@@ -985,6 +985,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                     const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
                 }
             }
@@ -1032,6 +1033,7 @@ static void llama_seeddelta_base_op(struct ggml_tensor * dst, int ith, int nth, 
                 const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
                 float out = (scale != 1.0f) ? (y * scale) : y;
                 out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                 *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
             }
         }
@@ -1159,6 +1161,7 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                     const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
                     float out = (scale != 1.0f) ? (y * scale) : y;
                     out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                    out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                     *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
                 }
             }
@@ -1214,6 +1217,7 @@ static void llama_seeddelta_base_block_op(struct ggml_tensor * dst, int ith, int
                 const float scale = row_scale ? read_f16_or_f32_1d(row_scale, rs_data, o) : 1.0f;
                 float out = (scale != 1.0f) ? (y * scale) : y;
                 out = llama_seeddelta_nan_guard(w_ref, x, o, t, out);
+                out = llama_seeddelta_debug_compare(w_ref, x, o, t, out);
                 *(float *)(dst_data + o * dst->nb[0] + t * dst->nb[1]) = out;
             }
         }
