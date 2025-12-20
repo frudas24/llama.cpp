@@ -10,7 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__)
@@ -77,7 +79,89 @@ static thread_local std::vector<float> llama_seeddelta_wcol_tls;
 static thread_local std::vector<uint8_t> llama_seeddelta_wbuf_tls;
 static thread_local std::vector<uint8_t> llama_seeddelta_xbuf_tls;
 static const bool llama_seeddelta_debug_data = std::getenv("LLAMA_SEEDDELTA_DEBUG_DATA") != nullptr;
+static const bool llama_seeddelta_debug_stats = std::getenv("LLAMA_SEEDDELTA_DEBUG_STATS") != nullptr;
 static std::atomic<int> llama_seeddelta_debug_budget{16};
+static std::atomic<int64_t> llama_seeddelta_debug_stats_budget{100000};
+
+struct llama_seeddelta_debug_stats_entry {
+    std::string name;
+    uint64_t count = 0;
+    double sum_abs = 0.0;
+    double sum_diff = 0.0;
+    double max_abs = 0.0;
+};
+
+class llama_seeddelta_debug_stats_accum {
+public:
+    explicit llama_seeddelta_debug_stats_accum(bool enabled) : enabled_(enabled) {}
+
+    void add(const ggml_tensor * w_ref, double diff) {
+        if (!enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        auto & entry = entries_[w_ref];
+        if (entry.name.empty()) {
+            const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
+            entry.name = (name && name[0]) ? name : "(unnamed)";
+        }
+        entry.count += 1;
+        const double abs_diff = std::abs(diff);
+        entry.sum_abs += abs_diff;
+        entry.sum_diff += diff;
+        if (abs_diff > entry.max_abs) {
+            entry.max_abs = abs_diff;
+        }
+    }
+
+    ~llama_seeddelta_debug_stats_accum() {
+        if (!enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (entries_.empty()) {
+            std::fprintf(stderr, "[seeddelta-debug-stats] no samples collected\n");
+            return;
+        }
+
+        struct row_view {
+            const llama_seeddelta_debug_stats_entry * entry;
+        };
+        std::vector<row_view> rows;
+        rows.reserve(entries_.size());
+
+        uint64_t total = 0;
+        for (const auto & it : entries_) {
+            rows.push_back({ &it.second });
+            total += it.second.count;
+        }
+
+        std::sort(rows.begin(), rows.end(), [](const row_view & a, const row_view & b) {
+            return a.entry->max_abs > b.entry->max_abs;
+        });
+
+        std::fprintf(stderr, "[seeddelta-debug-stats] tensors=%zu samples=%" PRIu64 "\n",
+                     entries_.size(), total);
+        std::fprintf(stderr, "[seeddelta-debug-stats] top by max_abs:\n");
+
+        const size_t limit = std::min<size_t>(16, rows.size());
+        for (size_t i = 0; i < limit; ++i) {
+            const auto * e = rows[i].entry;
+            const double mean_abs = e->count ? (e->sum_abs / (double) e->count) : 0.0;
+            const double mean_diff = e->count ? (e->sum_diff / (double) e->count) : 0.0;
+            std::fprintf(stderr,
+                         "  %s count=%" PRIu64 " mean_abs=%.6g max_abs=%.6g mean_diff=%.6g\n",
+                         e->name.c_str(), e->count, mean_abs, e->max_abs, mean_diff);
+        }
+    }
+
+private:
+    bool enabled_ = false;
+    std::mutex mu_;
+    std::unordered_map<const ggml_tensor *, llama_seeddelta_debug_stats_entry> entries_;
+};
+
+static llama_seeddelta_debug_stats_accum llama_seeddelta_debug_stats_accum_instance(llama_seeddelta_debug_stats);
 
 enum class llama_seeddelta_fb_status {
     ok,
@@ -283,40 +367,59 @@ static inline float llama_seeddelta_debug_compare(
         int64_t o,
         int64_t t,
         float y) {
-    if (!llama_seeddelta_debug_data) {
+    const bool want_print = llama_seeddelta_debug_data;
+    const bool want_stats = llama_seeddelta_debug_stats;
+    if (!want_print && !want_stats) {
+        return y;
+    }
+    bool do_stats = false;
+    if (want_stats) {
+        const int64_t prev = llama_seeddelta_debug_stats_budget.fetch_sub(1, std::memory_order_relaxed);
+        do_stats = prev > 0;
+    }
+    if (!want_print && !do_stats) {
         return y;
     }
     int budget = llama_seeddelta_debug_budget.load(std::memory_order_relaxed);
     if (budget <= 0) {
-        return y;
+        if (!do_stats) {
+            return y;
+        }
     }
     float y_dense = 0.0f;
     llama_seeddelta_fb_status fb = llama_seeddelta_fb_status::ok;
     if (llama_seeddelta_dense_fallback(w_ref, x, o, t, y_dense, &fb)) {
-        const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
-        if (prev > 0) {
-            const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
-            const double diff = (double) y - (double) y_dense;
-            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " out=%g dense=%g diff=%g\n",
-                         name ? name : "(unnamed)", o, t, y, y_dense, diff);
+        const double diff = (double) y - (double) y_dense;
+        if (do_stats) {
+            llama_seeddelta_debug_stats_accum_instance.add(w_ref, diff);
+        }
+        if (want_print) {
+            const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
+            if (prev > 0) {
+                const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
+                std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " out=%g dense=%g diff=%g\n",
+                             name ? name : "(unnamed)", o, t, y, y_dense, diff);
+            }
         }
     } else {
-        const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
-        if (prev > 0) {
-            const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
-            const char * reason =
-                fb == llama_seeddelta_fb_status::no_w ? "no_w" :
-                fb == llama_seeddelta_fb_status::no_x ? "no_x" :
-                fb == llama_seeddelta_fb_status::no_data ? "no_data" :
-                fb == llama_seeddelta_fb_status::non_host ? "non_host" :
-                fb == llama_seeddelta_fb_status::dim_mismatch ? "dim_mismatch" :
-                fb == llama_seeddelta_fb_status::n_in_mismatch ? "n_in_mismatch" :
-                fb == llama_seeddelta_fb_status::o_range ? "o_range" :
-                fb == llama_seeddelta_fb_status::t_range ? "t_range" :
-                fb == llama_seeddelta_fb_status::read_fail ? "read_fail" :
-                "unknown";
-            std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " fallback-unavailable (%s)\n",
-                         name ? name : "(unnamed)", o, t, reason);
+        if (want_print) {
+            const int prev = llama_seeddelta_debug_budget.fetch_sub(1, std::memory_order_relaxed);
+            if (prev > 0) {
+                const char * name = w_ref ? ggml_get_name(w_ref) : nullptr;
+                const char * reason =
+                    fb == llama_seeddelta_fb_status::no_w ? "no_w" :
+                    fb == llama_seeddelta_fb_status::no_x ? "no_x" :
+                    fb == llama_seeddelta_fb_status::no_data ? "no_data" :
+                    fb == llama_seeddelta_fb_status::non_host ? "non_host" :
+                    fb == llama_seeddelta_fb_status::dim_mismatch ? "dim_mismatch" :
+                    fb == llama_seeddelta_fb_status::n_in_mismatch ? "n_in_mismatch" :
+                    fb == llama_seeddelta_fb_status::o_range ? "o_range" :
+                    fb == llama_seeddelta_fb_status::t_range ? "t_range" :
+                    fb == llama_seeddelta_fb_status::read_fail ? "read_fail" :
+                    "unknown";
+                std::fprintf(stderr, "[seeddelta-debug-data] tensor=%s o=%" PRId64 " t=%" PRId64 " fallback-unavailable (%s)\n",
+                             name ? name : "(unnamed)", o, t, reason);
+            }
         }
     }
     return y;
