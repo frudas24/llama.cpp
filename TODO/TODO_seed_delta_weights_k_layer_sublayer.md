@@ -383,6 +383,14 @@ Acciones:
     * Métricas en report: `kselector.rank`, `kselector.gap_vs_uniform`, `kselector.tiles_sampled`.
     * (Opcional) Autotuner seguro (bandit) que alterna selector `uniform` vs `ttcross` y rank 1/2 con recompensa `-quality_gap/lat_ms`, con hysteresis y rollback a `uniform` si empeora.
 
+Plan realista (recuperar greedy/PPL sin humo):
+
+* [x] Baseline controlado con Gemma 4B Q4: mismo build (base+row_scale), `greedy_pack` + `ppl` y report guardado.
+* [x] Ablation por subcapa (mismo K/bloque): `down-only` vs `gate/up-only` para localizar el culpable.
+* [x] Ajuste conservador: `K_down` alto + `K_gate/K_up` bajo, y comparar `block=16` vs `block=32`.
+* [x] Comparar `scheme=block` vs `scheme=coo` en el caso ganador de la ablation.
+* [x] Repetir el mejor preset con fuente **Q8 y F16** (misma familia de modelo) para medir “loss-on-loss”.
+
 ---
 
 ### 6.3) Flags e interfaz `K_levels` (MVP) vs `K_custom` (experimental, builder-only)
@@ -513,3 +521,7 @@ Acciones:
 * [ ] Convertir stack-safety en regla explícita (no solo telemetría):
   * hard-cap o soft-cap por run (p.ej. “si stack_cost supera T, no emitir más”),
   * registrar el motivo de rechazo (budget) en el report.
+
+### Notas de pruebas
+
+* 2025-12-21: el greedy pack fallaba porque el script evaluaba stderr/logs junto con stdout (base vs base daba 11/20). Fix: capturar stdout, guardar stderr aparte, y recortar respuesta (después del prompt, antes de líneas `llama_`). Ahora base vs base pasa 0/20.
