@@ -25,7 +25,8 @@ Esperamos encontrar:
 
 - [x] Crear harness A inicial (`llama-seeddelta-toy`) para matrices sinteticas y top-K residual.
 - [x] Agregar modo base (W0) en el harness A para probar residual vs base.
-- [ ] Definir dataset y config exacta para el tiny transformer (B).
+- [x] Definir dataset y config exacta para el tiny transformer (B).
+- [x] Script de dataset y entrenamiento inicial para B.
 
 ### A) Modelo controlado sin entrenamiento
 
