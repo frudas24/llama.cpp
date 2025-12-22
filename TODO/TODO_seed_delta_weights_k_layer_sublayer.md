@@ -191,7 +191,7 @@ primero corregir métricas/criterios.
 
 Las ablations convierten “intuición” en evidencia (y aceleran debugging cuando un modelo se vuelve zombie).
 
-* [ ] Añadir `scripts/seeddelta-ablate.sh`:
+* [x] Añadir `scripts/seeddelta-ablate.sh`:
   * genera y evalúa ablations estándar (mismo texto/ctx/threads):
     * base vs SD (policy completa),
     * `down-only`,
@@ -199,7 +199,7 @@ Las ablations convierten “intuición” en evidencia (y aceleran debugging cua
     * “solo 1 capa” (isolar una capa de interés),
     * “bandas” (p.ej. 8–14, 15–20, 21–27).
   * corre `llama-perplexity` (Wikitext) + greedy pack, y guarda artefactos en un outdir único.
-* [ ] Emitir `ablate_summary.json` (y/o `ablate_summary.md`) con KPIs comparables:
+* [x] Emitir `ablate_summary.json` (y/o `ablate_summary.md`) con KPIs comparables:
   * PPL base/SD, PASS/FAIL greedy, `stack_budget/stack_cost`, y lista de tensores/capas activas por ablation.
 
 ---
