@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "defaults": {
+    "enabled": false
+  },
+  "ranges": [
+    {
+      "layers": "9,11,13,15,17",
+      "enabled": true,
+      "K": { "gate": 256, "up": 256, "down": 64 },
+      "gating": {
+        "metric": "cos",
+        "min_mean": { "gate": 0.0, "up": 0.0, "down": 0.0 },
+        "min_p05":  { "gate": 0.0, "up": 0.0, "down": -1.0 }
+      },
+      "tensors": {
+        "ffn_gate": { "enabled": true },
+        "ffn_up": { "enabled": true },
+        "ffn_down": { "enabled": false }
+      },
+      "autotune": {
+        "enabled": false
+      }
+    }
+  ]
+}
