@@ -165,6 +165,16 @@ Prioridad por ROI y por reducción de ambigüedad:
 
 ---
 
+## 0.2.1) Enfoques posibles para bajar RSS real (no olvidar)
+
+- [ ] StateCells agresivo en FFN (dict+codes+row_scale/vals) para reducir RAM de pesos de verdad.
+- [ ] SeedΔ multicapa con `strip_dense` amplio + gating/stack_cost estricto (y K por tile) para reemplazar densos en más capas.
+- [ ] KV cache quantization (`-ctk/-ctv`) o sliding‑window para bajar RSS dominado por contexto.
+- [ ] Recortar buffers de compute: ajustar `ctx/batch/ubatch`, probar `--no-repack`, y medir picos vs steady.
+- [ ] Híbridos por tensor: gate/up con SeedΔ y down denso (o viceversa) para balance calidad/RSS.
+
+---
+
 ## 0.3) Gates de avance (para no optimizar a ciegas)
 
 Estos gates convierten el TODO en ingeniería “shippeable”. Si un gate falla, **no** avanzar a la siguiente etapa;

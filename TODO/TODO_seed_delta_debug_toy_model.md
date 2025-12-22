@@ -1,0 +1,85 @@
+# TODO — Debug SeedΔ con modelos controlados (A+B)
+
+> Objetivo: aislar errores matematicos y de acumulacion por capas usando
+> (A) matrices sinteticas predecibles y (B) un tiny transformer entrenado.
+> La meta es explicar "donde se rompe" antes de gastar tiempo en modelos grandes.
+
+---
+
+## Teoria corta (por que hacemos esto)
+
+- En modelos grandes, el error se mezcla entre capas y es dificil atribuir la causa.
+- El pipeline SeedΔ tiene dos fuentes de error: aproximacion local (W0+Δ) y
+  acumulacion por profundidad.
+- Un entorno controlado permite medir el error esperado y comparar contra lo observado.
+
+Esperamos encontrar:
+- En A: errores 100% atribuibles a matematica/implementacion.
+- En B: puntos de colapso por acumulacion, gating insuficiente o K mal calibrado.
+
+---
+
+## Plan A+B (combinado)
+
+## Progreso
+
+- [x] Crear harness A inicial (`llama-seeddelta-toy`) para matrices sinteticas y top-K residual.
+- [ ] Agregar modo base (W0) en el harness A para probar residual vs base.
+- [ ] Definir dataset y config exacta para el tiny transformer (B).
+
+### A) Modelo controlado sin entrenamiento
+
+Objetivo:
+- Verificar exactitud de W0+Δ en casos donde la respuesta es conocida.
+
+Diseno:
+- Construir matrices W con estructura simple: identidad, diagonal, low-rank,
+  circulante y bloques.
+- Generar W0 y Δ que deberian aproximar W con error conocido.
+
+Pruebas y expectativas:
+- A1: W=I, W0=I, Δ=0 => salida exacta (error ~ 0).
+- A2: W=diag(s), W0=diag(s), Δ=0 => salida exacta.
+- A3: W=U V^T (rank-r), W0=low-rank, Δ=0 => error controlado segun r.
+- A4: W=circulante, W0=base circulante, Δ=0 => salida exacta.
+- A5: W=I, W0=I, Δ=COO top-K => salida exacta si Δ=0; si Δ no nula, error predecible.
+
+Criterio de exito:
+- Error numerico coincide con el esperado en >= 95% de casos.
+
+### B) Tiny transformer entrenado
+
+Objetivo:
+- Medir acumulacion de error y detectar capas "fragiles" con comportamiento real.
+
+Diseno:
+- 6-12 capas, n_embd 128-256, n_ff 512-1024.
+- Dataset determinista (copy, suma, brackets) para respuestas verificables.
+- Exportar a GGUF y correr SeedΔ por capa.
+
+Pruebas y expectativas:
+- B1: baseline sin SeedΔ => metricas estables (ppl/tok/s).
+- B2: SeedΔ en 1 capa => degradacion pequena y localizada.
+- B3: 2-4 capas separadas => degradacion moderada pero controlable.
+- B4: capas intercaladas => buscar el primer "cliff".
+- B5: policy con gating estricto => evitar colapso (greedy PASS).
+
+Criterio de exito:
+- Identificar el primer punto de colapso y correlacionarlo con metricas de gating.
+
+---
+
+## Entregables
+
+- Un script A para generar matrices controladas y evaluar W x vs (W0+Δ) x.
+- Un tiny model entrenado + GGUF + script de eval SeedΔ.
+- Reportes por prueba: error numerico, PPL, greedy pack, stack_cost.
+- Tabla de "capas fragiles" y thresholds recomendados.
+
+---
+
+## Notas operativas
+
+- Mantener dataset y seeds fijos para reproducibilidad.
+- Usar el mismo harness de logs (report.json + greedy pack).
+- No mezclar con modelos grandes hasta cerrar A y B.
