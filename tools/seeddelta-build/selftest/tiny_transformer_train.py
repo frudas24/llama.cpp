@@ -32,7 +32,7 @@ def train_sentencepiece(texts, outdir, vocab_size):
         return outdir / "tokenizer.model"
     with input_txt.open("w", encoding="utf-8") as f:
         for t in texts:
-            f.write(t.replace("\n", " ") + "\n")
+            f.write(t + "\n")
     spm.SentencePieceTrainer.Train(
         input=str(input_txt),
         model_prefix=str(model_prefix),
@@ -43,6 +43,7 @@ def train_sentencepiece(texts, outdir, vocab_size):
         pad_id=0,
         unk_id=3,
         character_coverage=1.0,
+        byte_fallback=True,
     )
     return outdir / "tokenizer.model"
 
@@ -75,7 +76,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--vocab-size", type=int, default=2048)
+    ap.add_argument("--vocab-size", type=int, default=4096)
     ap.add_argument("--n-layers", type=int, default=8)
     ap.add_argument("--n-embd", type=int, default=192)
     ap.add_argument("--n-ff", type=int, default=768)

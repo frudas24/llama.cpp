@@ -27,6 +27,7 @@ Esperamos encontrar:
 - [x] Agregar modo base (W0) en el harness A para probar residual vs base.
 - [x] Definir dataset y config exacta para el tiny transformer (B).
 - [x] Script de dataset y entrenamiento inicial para B.
+- [x] Tokenizer con byte_fallback para evitar fallos de tokenizacion en llama-cli.
 
 ### A) Modelo controlado sin entrenamiento
 
