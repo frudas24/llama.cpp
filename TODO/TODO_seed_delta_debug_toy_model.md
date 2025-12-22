@@ -119,6 +119,26 @@ PPL base ~6015.29 (ctx=512) en estos runs.
 - L1+L6: 4090.03 (PASS)
 - L5+L6: 4357.64 (PASS)
 
+### Combo 3 capas (K=32 gate/up, down off, coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L5+L6: 3456.17 (PASS)
+
+### Sweep K (combo L1+L5+L6, gate/up, down off, coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- K=16: 3226.41 (PASS)
+- K=32: 3456.17 (PASS)
+- K=64: 4034.95 (PASS)
+
+### ffn_down on (combo L1+L5+L6, K=32, coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- down enabled: 3421.65 (PASS)
+
 ---
 
 ## Notas operativas
