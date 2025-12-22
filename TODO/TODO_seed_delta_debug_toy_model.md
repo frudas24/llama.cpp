@@ -236,3 +236,180 @@ Base PPL ~26081.12 (ctx=256).
 - Mantener dataset y seeds fijos para reproducibilidad.
 - Usar el mismo harness de logs (report.json + greedy pack).
 - No mezclar con modelos grandes hasta cerrar A y B.
+
+## Auto-Gating v2 — Selección automática de capas basada en sensibilidad + stacking
+
+### Motivación
+
+Hemos confirmado que SeedΔ puede mantener PPL/greedy cuando se aplica en capas “seguras”, pero es **extremadamente sensible a dónde** se aplica. Además, la estabilidad **no es aditiva**: dos capas que individualmente pasan pueden fallar juntas (stacking). Necesitamos un mecanismo que **mida** sensibilidad por capa y que también capture **interacciones**.
+
+---
+
+## 1) Definiciones matematicas
+
+Sea una capa $L$ (bloque transformer) y sea $x$ la activacion de entrada al FFN (post-norm del bloque), muestreada de un batch de calibracion.
+
+Denotemos:
+
+* $FFN_{\\text{dense}}^{(L)}(x)$: salida del FFN de la capa $L$ usando pesos densos (baseline).
+* $FFN_{\\text{seed}}^{(L)}(x)$: salida del FFN de la capa $L$ sustituyendo **solo el tensor objetivo** (gate/up/down) por su aproximacion SeedΔ (base+Δ o delta-only), dejando lo demas denso.
+
+### 1.1 Sensibilidad por capa (métrica principal)
+
+Definimos la sensibilidad relativa como:
+
+$$
+S_L = \\mathbb{E}_x\\left[\\frac{\\left\\lVert FFN_{\\text{dense}}^{(L)}(x) - FFN_{\\text{seed}}^{(L)}(x)\\right\\rVert_2}{\\left\\lVert FFN_{\\text{dense}}^{(L)}(x)\\right\\rVert_2 + \\epsilon}\\right]
+$$
+
+donde $\\epsilon$ evita division por cero (ej. $1e{-}8$).
+
+### 1.2 Métricas robustas (colas y dirección)
+
+Ademas de $S_L$, registramos metricas robustas para detectar drift en colas:
+
+* Coseno (direccion) sobre salidas del FFN:
+  $$
+  \\cos_L(x) = \\frac{\\langle y, \\hat y \\rangle}{\\lVert y \\rVert_2 \\lVert \\hat y \\rVert_2 + \\epsilon}
+  $$
+  donde $y = FFN_{\\text{dense}}^{(L)}(x)$, $\\hat y = FFN_{\\text{seed}}^{(L)}(x)$.
+
+* Log-ratio de norma (energia):
+  $$
+  r_L(x) = \\log\\left(\\frac{\\lVert \\hat y \\rVert_2 + \\epsilon}{\\lVert y \\rVert_2 + \\epsilon}\\right)
+  $$
+
+De estas, guardamos percentiles:
+
+* $\\cos_{\\text{p05}}$ (conservador)
+* $S_{\\text{p95}}$ o $L2_{\\text{p95}}$
+* $r_{\\text{p95}}$ (evita explosiones sutiles)
+
+---
+
+## 2) Clasificación de capas: “Estructural” vs “Redundante”
+
+Para un umbral $\\tau$ (o percentil), la regla base es:
+
+* Si $S_L > \\tau$  ⇒ capa “Estructural”: **NO tocar** (mantener densa).
+* Si $S_L \\le \\tau$ ⇒ capa “Redundante”: **candidata** a SeedΔ.
+
+**Nota:** $\\tau$ no debe ser universal. Preferible usar:
+
+* seleccion por percentil (ej. “mejor 30% por menor $S_L$”),
+* o selección por budget (escoger capas hasta alcanzar MB objetivo con mínima degradación).
+
+---
+
+## 3) Restricciones de seguridad (baratas y efectivas)
+
+### 3.1 No consecutivas
+
+Por defecto, prohibir comprimir capas consecutivas:
+$$
+L_{i+1} \\neq L_i + 1
+$$
+Esto fuerza espacio para “recuperación” del residual.
+
+### 3.2 Gap preferido
+
+Preferir gap ≥ 2 si el budget lo permite (reducción de riesgo de stacking).
+
+---
+
+## 4) El punto clave: stacking no aditivo ⇒ necesitamos fase de interacciones
+
+La sensibilidad $S_L$ es **marginal** (capa sola). Para capturar colapsos tipo “10+11”, hacemos construccion incremental con rollback y registro de pares prohibidos.
+
+### 4.1 Constructor incremental (greedy-safe)
+
+Sea un conjunto activo $A$ de capas seleccionadas. Iteramos:
+
+1. Elegir siguiente capa $c$ del ranking (menor $S_c$).
+2. Probar $A' = A \\cup \\{c\\}$ respetando “no consecutivas”.
+3. Evaluar aceptación con batería mínima:
+
+   * greedy pack: PASS
+   * ΔPPL ≤ presupuesto (ej. ≤ +0.1% o configurable)
+   * metricas robustas: $\\cos_{p05}$ ≥ umbral y $r_{p95}$ ≤ umbral
+4. Si PASS ⇒ aceptar $A \\leftarrow A'$
+5. Si FAIL ⇒ rollback y registrar “forbidden interaction”:
+
+$$
+\\text{forbidden}(A, c) = \\text{true}
+$$
+
+Simplificación inicial: registrar forbidden **pairwise**:
+
+* forbidden_pair: $(c, \\ell)$ para $\\ell \\in A$ (si el fallo aparece al anadir $c$).
+
+---
+
+## 5) Entregables (archivos) y formato mínimo
+
+### 5.1 Scan por capa
+
+* `layer_sensitivity_scan.json`
+  Contiene por layer y por sublayer (gate/up/down):
+
+  * `S_mean`, `S_p95`
+  * `cos_mean`, `cos_p05`
+  * `log_norm_ratio_mean`, `log_norm_ratio_p95`
+  * `base_used`, `scheme`, `K_fixed`
+  * `eval_x_n`, `out_subsample_n`, `seed`
+
+### 5.2 Interacciones
+
+* `forbidden_pairs.json`
+  Lista de pares (i,j) que rompen greedy/umbral cuando se activan juntos.
+
+### 5.3 Policy autogenerada
+
+* `policy.autogen.<model>.json`
+  Incluye:
+
+  * layers seleccionadas
+  * K por subcapa (v0: fijo; v1: por capa según sensibilidad)
+  * strip settings (respetando CLI o declarados explícitamente)
+
+### 5.4 Report de comparación
+
+* `autogating_report.md`
+  Tabla:
+
+  * baseline (PPL/greedy/RSS/tok_s)
+  * policy autogen
+  * manual best-known (si existe)
+
+---
+
+## 6) Plan de acción (checklist)
+
+* [ ] Implementar `layer_sensitivity_scan` (script/harness): recorre capa por capa, aplica SeedΔ temporalmente con $K_{\\text{fixed}}$ y produce `layer_sensitivity_scan.json`.
+* [ ] Definir $K_{\\text{fixed}}$ inicial (v0): recomendado 12-16 (o 32 si quieres mas senal), scheme=COO para gate/up, down opcional.
+* [ ] Definir dataset de calibración `eval_x` determinista: mismo seed, mismo N, mismo ctx.
+* [ ] Definir umbral $\\tau$ v0:
+
+  * opción A: percentil (ej. top 30% menor S)
+  * opción B: budget MB (escoger capas hasta X MB ahorrados)
+* [ ] Implementar “no consecutivas” + “gap preferido”.
+* [ ] Implementar constructor incremental con rollback + registrar `forbidden_pairs.json`.
+* [ ] Generar `policy.autogen.<model>.json` y correr batería: greedy pack + PPL + RSS + tok/s.
+* [ ] Comparar contra heuristic/manual: ¿redescubre sets tipo $\\{1,3,5,6\\}$ o encuentra algo mejor?
+* [ ] Integrar output en TODO principal: link a `scan.json`, `forbidden_pairs.json`, `policy.autogen`, `autogating_report.md`.
+
+---
+
+## 7) Criterios de exito (v0)
+
+* Greedy pack: **PASS 0 flags**.
+* ΔPPL: ≤ +0.1% (configurable).
+* RSS: reducción medible cuando strip aplica (reportar “weights RSS” si se puede separar).
+* tok/s: puede caer (aceptado), pero debe estar documentado.
+
+## 8) Refinamiento opcional
+
+Definir dos sensibilidades y aceptar solo si ambas estan bajo umbral:
+
+1. $S_L^{FFN}$ (salida FFN)
+2. $S_L^{Block}$ (salida del bloque despues del residual)
