@@ -207,6 +207,14 @@ Base PPL ~18338.35 (ctx=512).
 - Impares (1,3,5,7), K=14: 7666.95 (PASS)
 - Mix (1,2,5,7), K=16: 9833.72 (PASS)
 
+### Tiny 2k steps (ctx=256)
+
+Base PPL ~26081.12 (ctx=256).
+
+- L1+L3+L5+L6, K=12: 10427.29 (PASS)
+- L1+L3+L5+L6, K=14: 10385.10 (PASS)
+- L1+L3+L5+L6, K=16: 9990.37 (PASS)
+
 ---
 
 ## Notas operativas
