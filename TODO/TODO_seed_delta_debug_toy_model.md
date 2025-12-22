@@ -85,6 +85,93 @@ Criterio de exito:
 - Un tiny model entrenado + GGUF + script de eval SeedΔ.
 - Reportes por prueba: error numerico, PPL, greedy pack, stack_cost.
 - Tabla de "capas fragiles" y thresholds recomendados.
+- [x] `seeddelta-layer-scan.py` + `seeddelta-autogate.py` (scripts ya ejecutados en Gemma 4B) que:
+  * generan `layer_sensitivity_scan.json` con métricas por capa/tensor,
+  * aplican reglas (ranking, min_gap, preferencias) para crear `policy.autogen.json`,
+  * soportan `--rank-metric` configurables y eval incremental.
+
+### Schema `layer_sensitivity_scan.json` (nuevo)
+
+Cada run debe emitir un JSON con estos campos principales:
+
+```json
+{
+  "version": 1,
+  "model": "<base gguf>",
+  "layers": {
+    "L": {
+      "tensors": {
+        "ffn_gate": {
+          "S_rel_l2": 0.123,
+          "cos_mean": 0.95,
+          "cos_p05": 0.88,
+          "cos_mean_x_w": 0.72,
+          "cos_p05_x_w": 0.56,
+          "log_norm_ratio": -0.12,
+          "stack_cost": 3.4
+        },
+        "ffn_up": { … },
+        "ffn_down": { … }
+      },
+      "S_layer": 0.12,      // agregado (mean/max)
+      "S_layer_rank": 42.1  // número usado para ordenar
+    }
+  },
+  "meta": {
+    "scan_k": 32,
+    "seed": 1234,
+    "scheme": "coo"
+  }
+}
+```
+
+- `S_rel_l2` mide la sensibilidad relativa (norma perturbed / norma base) y sirve de señal de ranking.
+- `cos_mean` / `cos_p05` (y sus variantes `_x_w`) son las métricas funcionales que el gating final utilizará para decidir si un tensor puede strippear.
+- `S_layer` se calcula como el `mean` o `max` de los `S_{L,T}` y alimenta el ordenamiento del autogate.
+- `stack_cost` y `log_norm_ratio` quedan disponibles para correlacionar con los cliff detectados.
+
+### Cómo se alinea este feedback con el TODO
+
+1. **Auto-Gating v2** ya está en marcha: el scan reemplaza la “intuición de pares/ímpares” por métricas repetibles (`S_{L,T}`) y el autogate ya ordena/filtra usando `min_gap`, `prefer`, `max_layers` y `rank_metric`.
+2. **Cosine + rel_l2**: el schema captura ambos, lo que permite que el autogate use `rank_metric=S_layer` para priorizar capas seguras y luego aplicar las reglas fuertes (`cos_mean_x_w ≥ α`, `cos_p05_x_w ≥ β`) antes de activar una capa/tensor.
+3. **Política híbrida**: con los scores por tensor podemos experimentar solo con `ffn_down` o solo `gate/up`, exactamente como se sugiere, sin tocar toda la capa.
+
+### Próximo paso claro
+
+- [x] Implementar el filtrado por tensor: el autogate ahora puede marcar `ffn_down` activo pero `gate/up` densos si `cos_*` no cumple.
+- [x] Documentar thresholds `α_T`, `β_T` y `min_gap` usados para mantener seguridad.
+  - Defaults autogate: `cos_mean_x_w >= 0.7`, `cos_p05_x_w >= 0.5`, `min_gap=1`.
+- [x] Añadir una rutina pequeña que valide el schema + decide qué tensores pasan el gate. Por ejemplo:
+
+```python
+from pathlib import Path
+import json
+
+def validate_scan(path: Path):
+    scan = json.loads(path.read_text())
+    for layer, data in scan["layers"].items():
+        assert "tensors" in data
+        for tensor, metrics in data["tensors"].items():
+            assert metrics["cos_mean_x_w"] >= 0
+            assert metrics["S_rel_l2"] >= 0
+        assert "S_layer" in data
+
+def decide_policy(scan_path: Path, cos_thresh=0.7, cos_p05_thresh=0.5):
+    scan = json.loads(scan_path.read_text())
+    selected = []
+    for layer, data in sorted(scan["layers"].items(), key=lambda kv: kv[1]["S_layer"]):
+        tensors = data["tensors"]
+        allow = [
+            tensor
+            for tensor, metrics in tensors.items()
+            if metrics["cos_mean_x_w"] >= cos_thresh and metrics["cos_p05_x_w"] >= cos_p05_thresh
+        ]
+        if allow:
+            selected.append({"layer": layer, "keep": allow})
+    return selected
+```
+
+Rutina integrada en `scripts/seeddelta-autogate.py` como validación + filtrado por tensor antes de emitir `policy.autogen.json`.
 
 ### Artefactos (remote)
 
@@ -93,6 +180,26 @@ Criterio de exito:
 - `calibration/tiny_toy_model_bf/tiny.gguf` (F16) listo para pruebas.
 - `calibration/tiny_toy_model_bf_1k/` modelo 1k steps (mejor output en suma simple).
 - `calibration/tiny_toy_model_bf_1k/tiny.gguf` (F16) para pruebas SeedΔ.
+
+### Autogate con filtrado cos (Gemma 4B Q8, remoto)
+
+- Scan: `calibration/layer_scan_gemma4b_q8_10_19_v3/layer_sensitivity_scan.json`.
+- Autogate: `calibration/autogate_gemma4b_q8_10_19_cosgate_v1/policy.autogen.json`.
+- Policy: capas `12,14,16,18` con **solo `ffn_gate` activo** (gate/up/down filtrado por cos).
+- PPL base 15.0808 → SeedΔ 13.9295 (delta -7.63%), greedy pack PASS (20/20).
+
+### Autogate con filtrado cos (Gemma 4B F16, remoto)
+
+- Scan: `calibration/layer_scan_gemma4b_f16_10_19_v3/layer_sensitivity_scan.json`.
+- Autogate: `calibration/autogate_gemma4b_f16_10_19_cosgate_v1/policy.autogen.json`.
+- Policy: capas `12,14,16,18` con **solo `ffn_gate` activo**.
+- PPL base 15.0469 → SeedΔ 13.9357 (delta -7.38%), greedy pack PASS (20/20).
+
+### Nota (pequena victoria)
+
+- Descubrimiento: el filtrado por cos (`cos_mean_x_w` + `cos_p05_x_w`) produce una policy "segura" por tensor.
+- Hecho: autogate habilito **solo `ffn_gate`** en capas `12,14,16,18` y desactivo `ffn_up/down`.
+- Logrado: PPL bajo en Q8 y F16 (delta ~ -7.6% y -7.4%) con greedy PASS, confirmando estabilidad entre precisiones.
 
 ### Resultados B (tiny, 1k steps)
 

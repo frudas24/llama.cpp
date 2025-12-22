@@ -202,7 +202,7 @@ primero corregir métricas/criterios.
 Las ablations convierten “intuición” en evidencia (y aceleran debugging cuando un modelo se vuelve zombie).
 
 * [x] Añadir `scripts/seeddelta-ablate.sh`:
-  * genera y evalúa ablations estándar (mismo texto/ctx/threads):
+  * genera y evalúa ablations estándar (mismo texto/ctx/threads=16):
     * base vs SD (policy completa),
     * `down-only`,
     * `gate/up-only`,
