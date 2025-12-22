@@ -154,6 +154,12 @@ PPL base ~6015.29 (ctx=512).
 - L1+L2+L5+L6: 3708.13 (PASS)
 - L0+L2+L4+L6 (pares): 15229.64 (PASS)
 
+### K16 impares (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L3+L5+L7: 3296.31 (PASS)
+
 ---
 
 ## Notas operativas
