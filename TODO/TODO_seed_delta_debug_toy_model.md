@@ -147,6 +147,13 @@ PPL base ~6015.29 (ctx=512).
 - L0+L1+L3+L5+L6: 5450.90 (PASS)
 - L1+L3+L5+L6 con down solo en L5: 3174.59 (PASS)
 
+### K16 alterno (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L2+L5+L6: 3708.13 (PASS)
+- L0+L2+L4+L6 (pares): 15229.64 (PASS)
+
 ---
 
 ## Notas operativas
