@@ -87,6 +87,16 @@ Criterio de exito:
 - `calibration/tiny_toy_data/` dataset jsonl.
 - `calibration/tiny_toy_model_bf/` modelo HF + tokenizer con byte_fallback.
 - `calibration/tiny_toy_model_bf/tiny.gguf` (F16) listo para pruebas.
+- `calibration/tiny_toy_model_bf_1k/` modelo 1k steps (mejor output en suma simple).
+- `calibration/tiny_toy_model_bf_1k/tiny.gguf` (F16) para pruebas SeedΔ.
+
+### Resultados B (tiny, 1k steps)
+
+- Baseline PPL (val.txt): ~8789.55.
+- SeedΔ layer0 (K=32 gate/up, down off): PPL ~8192.06, greedy pack PASS (6/6).
+- SeedΔ even (0,2,4,6): PPL ~10048.08, greedy pack PASS (6/6).
+- SeedΔ odd (1,3,5,7): PPL ~5465.42, greedy pack PASS (6/6).
+- Nota: el greedy pack es heuristico; revisar outputs si hay dudas.
 
 ---
 
@@ -95,5 +105,3 @@ Criterio de exito:
 - Mantener dataset y seeds fijos para reproducibilidad.
 - Usar el mismo harness de logs (report.json + greedy pack).
 - No mezclar con modelos grandes hasta cerrar A y B.
-- `calibration/tiny_toy_model_bf_1k/` modelo 1k steps (mejor output en suma simple).
-- `calibration/tiny_toy_model_bf_1k/tiny.gguf` (F16) para pruebas SeedΔ.
