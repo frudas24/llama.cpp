@@ -98,6 +98,19 @@ Criterio de exito:
 - SeedΔ odd (1,3,5,7): PPL ~5465.42, greedy pack PASS (6/6).
 - Nota: el greedy pack es heuristico; revisar outputs si hay dudas.
 
+### Sweep por capa (K=32 gate/up, down off, coo, base on)
+
+PPL base ~8789.55 en todos los runs.
+
+- L0: 8192.06 (PASS)
+- L1: 7301.93 (PASS)
+- L2: 8737.10 (PASS)
+- L3: 9939.09 (PASS)
+- L4: 8312.01 (PASS)
+- L5: 7065.78 (PASS)
+- L6: 7716.13 (PASS)
+- L7: 8117.02 (PASS)
+
 ---
 
 ## Notas operativas
