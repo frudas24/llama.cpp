@@ -201,6 +201,22 @@ Rutina integrada en `scripts/seeddelta-autogate.py` como validación + filtrado 
 - Hecho: autogate habilito **solo `ffn_gate`** en capas `12,14,16,18` y desactivo `ffn_up/down`.
 - Logrado: PPL bajo en Q8 y F16 (delta ~ -7.6% y -7.4%) con greedy PASS, confirmando estabilidad entre precisiones.
 
+### Bitacora: tests de umbral (Q8, remoto)
+
+- Prueba A (0.65 / 0.45):
+  - Capas: 12,14,16,18
+  - Mask: 12 gate-only; 14/16/18 gate+up; down off
+  - PPL base 15.0808 → 15.5639 (delta +3.20%), greedy PASS, 49 new tensors
+- Prueba B (0.65 / 0.50):
+  - Capas: 12,14,16,18
+  - Mask: igual a A (up sigue abierto)
+  - PPL base 15.0808 → 15.5639 (delta +3.20%), greedy PASS, 49 new tensors
+- Prueba up-strict (gate 0.7/0.5, up 0.85/0.70):
+  - Capas: 12,14,16,18
+  - Mask: gate-only en todas (up cerrado)
+  - PPL base 15.0808 → 13.9295 (delta -7.63%), greedy PASS, 28 new tensors
+  - Conclusión: `ffn_up` es el principal causante de degradacion en estas capas.
+
 ### Resultados B (tiny, 1k steps)
 
 - Baseline PPL (val.txt): ~8789.55.

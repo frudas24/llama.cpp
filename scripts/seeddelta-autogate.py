@@ -162,6 +162,11 @@ def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> lis
     for tensor in TENSOR_KEYS:
         if tensor == "ffn_down" and not args.enable_down:
             continue
+        suffix = tensor.replace("ffn_", "")
+        mean_override = getattr(args, f"gate_cos_threshold_{suffix}")
+        p05_override = getattr(args, f"gate_cos_p05_threshold_{suffix}")
+        mean_thr = mean_override if mean_override is not None else args.gate_cos_threshold
+        p05_thr = p05_override if p05_override is not None else args.gate_cos_p05_threshold
         metrics = layer_tensors.get(tensor)
         if not isinstance(metrics, dict):
             continue
@@ -171,7 +176,7 @@ def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> lis
             if args.gate_allow_missing:
                 allowed.append(tensor)
             continue
-        if cos_mean >= args.gate_cos_threshold and cos_p05 >= args.gate_cos_p05_threshold:
+        if cos_mean >= mean_thr and cos_p05 >= p05_thr:
             allowed.append(tensor)
     return allowed
 
@@ -197,6 +202,42 @@ def main() -> int:
     ap.add_argument("--gate-cos-p05-metric", default="cos_p05_x_w", help="Metric for p05 cosine gate")
     ap.add_argument("--gate-cos-threshold", type=float, default=0.7, help="Min cosine mean threshold")
     ap.add_argument("--gate-cos-p05-threshold", type=float, default=0.5, help="Min cosine p05 threshold")
+    ap.add_argument(
+        "--gate-cos-threshold-gate",
+        type=float,
+        default=None,
+        help="Per-tensor cosine mean threshold for ffn_gate",
+    )
+    ap.add_argument(
+        "--gate-cos-p05-threshold-gate",
+        type=float,
+        default=None,
+        help="Per-tensor cosine p05 threshold for ffn_gate",
+    )
+    ap.add_argument(
+        "--gate-cos-threshold-up",
+        type=float,
+        default=None,
+        help="Per-tensor cosine mean threshold for ffn_up",
+    )
+    ap.add_argument(
+        "--gate-cos-p05-threshold-up",
+        type=float,
+        default=None,
+        help="Per-tensor cosine p05 threshold for ffn_up",
+    )
+    ap.add_argument(
+        "--gate-cos-threshold-down",
+        type=float,
+        default=None,
+        help="Per-tensor cosine mean threshold for ffn_down",
+    )
+    ap.add_argument(
+        "--gate-cos-p05-threshold-down",
+        type=float,
+        default=None,
+        help="Per-tensor cosine p05 threshold for ffn_down",
+    )
     ap.add_argument("--gate-allow-missing", action="store_true", help="Allow tensors with missing cos metrics")
     ap.add_argument("--policy-out", default="", help="Output policy path (default: outdir/policy.autogen.json)")
     ap.add_argument("--forbidden-out", default="", help="Output forbidden pairs JSON (optional)")
