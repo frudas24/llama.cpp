@@ -190,6 +190,15 @@ Modelo: `calibration/tiny_toy_model_bf_2k/tiny.gguf` (F16).
 - Base PPL ~18338.35 (ctx=512)
 - SeedΔ L1+L3+L5+L6, K=16: 7000.89 (PASS)
 
+### Tiny 2k steps (sweep K y pares/impares)
+
+Base PPL ~18338.35 (ctx=512).
+
+- L1+L3+L5+L6, K=12: 7340.87 (PASS)
+- L1+L3+L5+L6, K=14: 7267.77 (PASS)
+- Pares (0,2,4,6), K=16: 27560.64 (PASS)
+- Impares (1,3,5,7), K=16: 8049.34 (PASS)
+
 ---
 
 ## Notas operativas
