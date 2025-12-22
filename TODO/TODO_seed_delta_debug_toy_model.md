@@ -24,7 +24,7 @@ Esperamos encontrar:
 ## Progreso
 
 - [x] Crear harness A inicial (`llama-seeddelta-toy`) para matrices sinteticas y top-K residual.
-- [ ] Agregar modo base (W0) en el harness A para probar residual vs base.
+- [x] Agregar modo base (W0) en el harness A para probar residual vs base.
 - [ ] Definir dataset y config exacta para el tiny transformer (B).
 
 ### A) Modelo controlado sin entrenamiento
@@ -56,6 +56,10 @@ Diseno:
 - 6-12 capas, n_embd 128-256, n_ff 512-1024.
 - Dataset determinista (copy, suma, brackets) para respuestas verificables.
 - Exportar a GGUF y correr SeedΔ por capa.
+  - Propuesta v1:
+    - 8 capas, n_embd=192, n_ff=768, n_heads=6, vocab pequeño.
+    - Dataset: copy (input==output), suma de 2 enteros, balanceo de parentesis.
+    - Entrenamiento corto con seed fijo, export a GGUF fp16.
 
 Pruebas y expectativas:
 - B1: baseline sin SeedΔ => metricas estables (ppl/tok/s).

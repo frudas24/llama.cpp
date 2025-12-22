@@ -15,6 +15,7 @@ static void usage() {
     fprintf(stderr,
             "usage: llama-seeddelta-toy [options]\n"
             "  --pattern identity|diag|lowrank|circulant|block\n"
+            "  --use-base         fit W0 (xor_circulant) and encode residual vs base\n"
             "  --n-in N           (default: 64)\n"
             "  --n-out N          (default: 64)\n"
             "  --K N              top-K per column (default: 1)\n"
@@ -22,6 +23,8 @@ static void usage() {
             "  --eval-x N         number of random x evals (default: 0)\n"
             "  --rank N           lowrank rank (default: 4)\n"
             "  --block N          block size for block pattern (default: 8)\n"
+            "  --base-max-samples N max sampled outputs per block for base fit (default: 0=all)\n"
+            "  --perm-trials N    permutation trials for base fit (default: 4)\n"
             "  --seed N           RNG seed (default: 1)\n"
             "  -h, --help\n");
 }
@@ -39,6 +42,9 @@ int main(int argc, char ** argv) {
     int64_t eval_x = 0;
     int64_t rank = 4;
     int64_t block = 8;
+    int64_t base_max_samples = 0;
+    int perm_trials = 4;
+    bool use_base = false;
     int seed = 1;
 
     for (int i = 1; i < argc; ++i) {
@@ -48,6 +54,8 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (arg == "--pattern" && i + 1 < argc) {
             pattern = argv[++i];
+        } else if (arg == "--use-base") {
+            use_base = true;
         } else if (arg == "--n-in" && i + 1 < argc) {
             n_in = std::strtoll(argv[++i], nullptr, 10);
         } else if (arg == "--n-out" && i + 1 < argc) {
@@ -62,6 +70,10 @@ int main(int argc, char ** argv) {
             rank = std::strtoll(argv[++i], nullptr, 10);
         } else if (arg == "--block" && i + 1 < argc) {
             block = std::strtoll(argv[++i], nullptr, 10);
+        } else if (arg == "--base-max-samples" && i + 1 < argc) {
+            base_max_samples = std::strtoll(argv[++i], nullptr, 10);
+        } else if (arg == "--perm-trials" && i + 1 < argc) {
+            perm_trials = std::atoi(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             seed = std::atoi(argv[++i]);
         } else {
@@ -158,28 +170,72 @@ int main(int argc, char ** argv) {
     std::vector<float> d_val((size_t) K * (size_t) n_out, 0.0f);
     std::vector<float> w;
     std::vector<int32_t> topk;
+    std::vector<float> r;
+    base_fit base;
+
+    if (use_base) {
+        base = fit_base_xor_circulant(W, base_max_samples, nullptr, perm_trials, rng);
+    }
 
     for (int64_t col = 0; col < n_out; ++col) {
         read_column_f32(W, col, w);
-        topk_abs_weighted(w, nullptr, K, topk);
-        for (int64_t r = 0; r < K; ++r) {
-            const int32_t ii = r < (int64_t) topk.size() ? topk[(size_t) r] : -1;
-            d_idx[(size_t) col * (size_t) K + (size_t) r] = ii;
-            d_val[(size_t) col * (size_t) K + (size_t) r] = (ii >= 0 && ii < (int32_t) n_in) ? w[(size_t) ii] : 0.0f;
+        const std::vector<float> * src = &w;
+
+        if (use_base) {
+            r.assign((size_t) n_in, 0.0f);
+            const int64_t L = base.L;
+            const bool is_tall = (n_out >= n_in);
+            if (is_tall) {
+                const int64_t b = col / L;
+                const int64_t p = col - b * L;
+                const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    const int64_t j = inv ? (int64_t) inv[(size_t) i] : i;
+                    const int64_t u = (p ^ j) & (L - 1);
+                    const float base_w = h2[(size_t) u];
+                    r[(size_t) i] = w[(size_t) i] - base_w;
+                }
+            } else {
+                const int64_t p = col;
+                for (int64_t b = 0; b < base.B; ++b) {
+                    const float * h2 = base.h2.data() + (size_t) b * (size_t) L;
+                    const int32_t * inv = base.perm1_inv.empty() ? nullptr : base.perm1_inv.data() + (size_t) b * (size_t) L;
+                    const int64_t in0 = b * L;
+                    const int64_t in1 = std::min<int64_t>(n_in, in0 + L);
+                    for (int64_t i = in0; i < in1; ++i) {
+                        const int64_t q = i - in0;
+                        const int64_t j = inv ? (int64_t) inv[(size_t) q] : q;
+                        const int64_t u = (p ^ j) & (L - 1);
+                        const float base_w = h2[(size_t) u];
+                        r[(size_t) i] = w[(size_t) i] - base_w;
+                    }
+                }
+            }
+            src = &r;
+        }
+
+        topk_abs_weighted(*src, nullptr, K, topk);
+        for (int64_t rr = 0; rr < K; ++rr) {
+            const int32_t ii = rr < (int64_t) topk.size() ? topk[(size_t) rr] : -1;
+            d_idx[(size_t) col * (size_t) K + (size_t) rr] = ii;
+            d_val[(size_t) col * (size_t) K + (size_t) rr] = (ii >= 0 && ii < (int32_t) n_in) ? (*src)[(size_t) ii] : 0.0f;
         }
     }
 
     std::mt19937 rng_eval(seed);
-    eval_metrics em = eval_sparse_residual(W, d_idx, d_val, nullptr, nullptr, K, eval_cols, rng_eval);
+    eval_metrics em = use_base
+            ? eval_seeddelta_base_residual(W, base, d_idx, d_val, nullptr, nullptr, K, eval_cols, rng_eval)
+            : eval_sparse_residual(W, d_idx, d_val, nullptr, nullptr, K, eval_cols, rng_eval);
 
-    printf("pattern=%s n_in=%" PRId64 " n_out=%" PRId64 " K=%" PRId64 "\n",
-           pattern.c_str(), n_in, n_out, K);
+    printf("pattern=%s base=%s n_in=%" PRId64 " n_out=%" PRId64 " K=%" PRId64 "\n",
+           pattern.c_str(), use_base ? "on" : "off", n_in, n_out, K);
     printf("eval cols=%" PRId64 " rel_l2 mean=%.6f p95=%.6f cos mean=%.6f p05=%.6f nr=%.6f\n",
            eval_cols, em.rel_l2_mean, em.rel_l2_p95, em.cos_mean, em.cos_p05, em.norm_ratio_mean);
 
     if (eval_x > 0) {
         std::mt19937 rng_x(seed + 1);
-        eval_metrics emx = eval_seeddelta_x(W, nullptr, d_idx, d_val, nullptr, nullptr, K, eval_cols, eval_x, rng_x);
+        eval_metrics emx = eval_seeddelta_x(W, use_base ? &base : nullptr, d_idx, d_val, nullptr, nullptr, K, eval_cols, eval_x, rng_x);
         printf("eval_x x=%" PRId64 " cols=%" PRId64 " rel_l2 mean=%.6f p95=%.6f cos mean=%.6f p05=%.6f nr=%.6f\n",
                eval_x, eval_cols, emx.rel_l2_mean, emx.rel_l2_p95, emx.cos_mean, emx.cos_p05, emx.norm_ratio_mean);
     }
