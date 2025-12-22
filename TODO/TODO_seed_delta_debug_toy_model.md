@@ -217,6 +217,36 @@ Rutina integrada en `scripts/seeddelta-autogate.py` como validación + filtrado 
   - PPL base 15.0808 → 13.9295 (delta -7.63%), greedy PASS, 28 new tensors
   - Conclusión: `ffn_up` es el principal causante de degradacion en estas capas.
 
+### Plan de ataque post-victoria (feedback consolidado)
+
+Reglas base (congeladas por ahora):
+- `ffn_up`: OFF por defecto (deny-by-default).
+- `ffn_gate`: ON solo si pasa thresholds victoria (`cos_mean_x_w >= 0.70`, `cos_p05_x_w >= 0.50`).
+- `ffn_down`: candidato, pero se prueba aislado de `up` y con thresholds mas estrictos.
+  - En autogate: `ffn_up` solo entra si se pasa `--allow-up`.
+
+Metricas de exito:
+- greedy PASS (20/20)
+- ΔPPL <= 0% ideal; aceptable <= +0.5% para "RAM mode"
+- ahorro real: GGUF size y RSS (ctx pequeno 128/256 + ctx normal)
+- tok/s puede degradar
+
+Fase 1 - "marea creciente" (gate-only):
+- [ ] E1: autogate gate-only, rango 0-25 (o 0-N), max_layers escalonado: 8, 16, 24, 32
+- [ ] E2: repetir E1 en Q8 y F16 (estabilidad transversal)
+- Entregable: tabla max_layers vs ΔPPL vs GGUF size vs RSS(ctx=128/256) vs tok/s
+
+Fase 2 - "cazar al gigante" (gate+down, up-off):
+- [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
+- [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
+- [ ] D3: limitar down con max_down_layers separado de max_gate_layers
+- Entregable: policy gate+down, tabla capas gate vs capas down + ΔPPL + ahorro
+
+Fase 3 - STRIP real y medicion de RAM:
+- [ ] Confirmar en logs: no "0 new tensors", strip aplicado
+- [ ] Medir RSS con ctx pequeno y ctx real
+- [ ] Reportar GGUF size, RSS total, y breakdown si existe
+
 ### Resultados B (tiny, 1k steps)
 
 - Baseline PPL (val.txt): ~8789.55.

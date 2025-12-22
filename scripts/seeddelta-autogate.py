@@ -162,6 +162,8 @@ def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> lis
     for tensor in TENSOR_KEYS:
         if tensor == "ffn_down" and not args.enable_down:
             continue
+        if tensor == "ffn_up" and not args.allow_up:
+            continue
         suffix = tensor.replace("ffn_", "")
         mean_override = getattr(args, f"gate_cos_threshold_{suffix}")
         p05_override = getattr(args, f"gate_cos_p05_threshold_{suffix}")
@@ -198,6 +200,7 @@ def main() -> int:
     ap.add_argument("--prefer-mult", type=float, default=0.95, help="Score multiplier for preferred layers")
     ap.add_argument("--avoid-even-only", action="store_true", help="Reject sets that are only even layers")
     ap.add_argument("--enable-down", action="store_true", help="Enable ffn_down in policy")
+    ap.add_argument("--allow-up", action="store_true", help="Allow ffn_up in policy")
     ap.add_argument("--gate-cos-metric", default="cos_mean_x_w", help="Metric for mean cosine gate")
     ap.add_argument("--gate-cos-p05-metric", default="cos_p05_x_w", help="Metric for p05 cosine gate")
     ap.add_argument("--gate-cos-threshold", type=float, default=0.7, help="Min cosine mean threshold")
@@ -271,6 +274,8 @@ def main() -> int:
         print(f"warn: scan {err}", file=sys.stderr)
 
     tensors = [t.strip() for t in args.tensors.split(",") if t.strip()]
+    if not args.allow_up:
+        tensors = [t for t in tensors if t != "ffn_up"]
     prefer_layers = set(parse_layers(args.prefer)) if args.prefer else set()
 
     scores: dict[int, float] = {}
