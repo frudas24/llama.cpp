@@ -361,6 +361,7 @@ Simplificacion inicial: registrar forbidden **pairwise**:
   * `log_norm_ratio_mean`, `log_norm_ratio_p95`
   * `base_used`, `scheme`, `K_fixed`
   * `eval_x_n`, `out_subsample_n`, `seed`
+  * script: `scripts/seeddelta-layer-scan.py`
 
 ### 5.2 Interacciones
 
@@ -389,9 +390,9 @@ Simplificacion inicial: registrar forbidden **pairwise**:
 
 ## 6) Plan de accion (checklist)
 
-* [ ] Implementar `layer_sensitivity_scan` (script/harness): recorre capa por capa, aplica SeedΔ temporalmente con $K_{\\text{fixed}}$ y produce `layer_sensitivity_scan.json`.
-* [ ] Definir $K_{\\text{fixed}}$ inicial (v0): recomendado 12-16 (o 32 si quieres mas senal), scheme=COO para gate/up, down opcional.
-* [ ] Definir dataset de calibracion `eval_x` determinista: mismo seed, mismo N, mismo ctx.
+* [x] Implementar `layer_sensitivity_scan` (script/harness): recorre capa por capa, aplica SeedΔ temporalmente con $K_{\\text{fixed}}$ y produce `layer_sensitivity_scan.json`.
+* [x] Definir $K_{\\text{fixed}}$ inicial (v0): recomendado 12-16 (o 32 si quieres mas senal), scheme=COO para gate/up, down opcional.
+* [x] Definir dataset de calibracion `eval_x` determinista: mismo seed, mismo N, mismo ctx.
 * [ ] Definir umbral $\\tau$ v0:
 
   * opcion A: percentil (ej. top 30% menor S)
