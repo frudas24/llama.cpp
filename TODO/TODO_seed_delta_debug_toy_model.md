@@ -168,6 +168,14 @@ PPL base ~6015.29 (ctx=512).
 - L1+L3+L5+L6, K=12: 3095.68 (PASS)
 - L1+L3+L5+L6, K=24: 3485.64 (PASS)
 
+### K sweep fino (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L3+L5+L6, K=8: 3082.56 (PASS)
+- L1+L3+L5+L6, K=10: 3177.23 (PASS)
+- L1+L3+L5+L6, K=14: 3080.58 (PASS)
+
 ---
 
 ## Notas operativas
