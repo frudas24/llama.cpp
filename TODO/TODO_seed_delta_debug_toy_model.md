@@ -111,6 +111,14 @@ PPL base ~8789.55 en todos los runs.
 - L6: 7716.13 (PASS)
 - L7: 8117.02 (PASS)
 
+### Combos 2 capas (K=32 gate/up, down off, coo, base on)
+
+PPL base ~6015.29 (ctx=512) en estos runs.
+
+- L1+L5: 3992.98 (PASS)
+- L1+L6: 4090.03 (PASS)
+- L5+L6: 4357.64 (PASS)
+
 ---
 
 ## Notas operativas
