@@ -139,6 +139,14 @@ PPL base ~6015.29 (ctx=512).
 
 - down enabled: 3421.65 (PASS)
 
+### K16 con mas capas (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L3+L5+L6: 3073.42 (PASS)
+- L0+L1+L3+L5+L6: 5450.90 (PASS)
+- L1+L3+L5+L6 con down solo en L5: 3174.59 (PASS)
+
 ---
 
 ## Notas operativas
