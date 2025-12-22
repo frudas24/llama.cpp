@@ -82,6 +82,12 @@ Criterio de exito:
 - Reportes por prueba: error numerico, PPL, greedy pack, stack_cost.
 - Tabla de "capas fragiles" y thresholds recomendados.
 
+### Artefactos (remote)
+
+- `calibration/tiny_toy_data/` dataset jsonl.
+- `calibration/tiny_toy_model_bf/` modelo HF + tokenizer con byte_fallback.
+- `calibration/tiny_toy_model_bf/tiny.gguf` (F16) listo para pruebas.
+
 ---
 
 ## Notas operativas
