@@ -95,3 +95,5 @@ Criterio de exito:
 - Mantener dataset y seeds fijos para reproducibilidad.
 - Usar el mismo harness de logs (report.json + greedy pack).
 - No mezclar con modelos grandes hasta cerrar A y B.
+- `calibration/tiny_toy_model_bf_1k/` modelo 1k steps (mejor output en suma simple).
+- `calibration/tiny_toy_model_bf_1k/tiny.gguf` (F16) para pruebas SeedΔ.
