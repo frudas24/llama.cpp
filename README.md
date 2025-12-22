@@ -69,6 +69,28 @@ range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
 
+## SeedDelta research track (this fork)
+
+This fork is exploring SeedDelta: replacing dense FFN tensors with a procedural base + residual (W0 + Delta) and a
+tensor-aware gating policy. The objective is to cut model size and RAM while keeping greedy stability and PPL.
+
+Evolution so far:
+- Started with manual layer heuristics (even/odd) to find stable regions.
+- Added per-layer scans with fixed K to measure sensitivity (`S_rel_l2`) and functional cos metrics.
+- Built autogate that ranks layers and filters tensors using `cos_mean_x_w` and `cos_p05_x_w`.
+- Empirical result: `ffn_gate` is compressible, `ffn_up` is sensitive; gate-only improves PPL and greedy PASS.
+  `ffn_up` is now deny-by-default unless explicitly allowed.
+
+Artifacts and logs live in `TODO/TODO_seed_delta_debug_toy_model.md` and the scripts below:
+- `scripts/seeddelta-layer-scan.py`
+- `scripts/seeddelta-autogate.py`
+- `scripts/seeddelta-policy-eval.sh`
+
+Current plan (short):
+- Sweep `max_layers` in gate-only to find the safe coverage budget.
+- Test `ffn_down` without `ffn_up` using stricter thresholds.
+- Measure GGUF size and RSS with small ctx to expose weight savings (KV cache hides it at large ctx).
+
 <details>
 <summary>Models</summary>
 
