@@ -1,4 +1,4 @@
-# TODO — Debug SeedΔ con modelos controlados (A+B)
+# TODO - Debug SeedΔ con modelos controlados (A+B)
 
 > Objetivo: aislar errores matematicos y de acumulacion por capas usando
 > (A) matrices sinteticas predecibles y (B) un tiny transformer entrenado.
@@ -20,6 +20,10 @@ Esperamos encontrar:
 ---
 
 ## Plan A+B (combinado)
+
+- A) Validar exactitud numerica del harness con matrices controladas (sin entrenamiento).
+- B) Medir sensibilidad/stacking en tiny transformer con dataset determinista.
+- C) Consolidar heuristicas (capas/K) antes de escalar a modelos reales.
 
 ## Progreso
 
@@ -59,7 +63,7 @@ Diseno:
 - Dataset determinista (copy, suma, brackets) para respuestas verificables.
 - Exportar a GGUF y correr SeedΔ por capa.
   - Propuesta v1:
-    - 8 capas, n_embd=192, n_ff=768, n_heads=6, vocab pequeño.
+    - 8 capas, n_embd=192, n_ff=768, n_heads=6, vocab pequeno.
     - Dataset: copy (input==output), suma de 2 enteros, balanceo de parentesis.
     - Entrenamiento corto con seed fijo, export a GGUF fp16.
 
@@ -187,12 +191,12 @@ PPL base ~6015.29 (ctx=512).
 
 Modelo: `calibration/tiny_toy_model_bf_2k/tiny.gguf` (F16).
 
-- Base PPL ~18338.35 (ctx=512)
+- PPL base ~18338.35 (ctx=512)
 - SeedΔ L1+L3+L5+L6, K=16: 7000.89 (PASS)
 
 ### Tiny 2k steps (sweep K y pares/impares)
 
-Base PPL ~18338.35 (ctx=512).
+PPL base ~18338.35 (ctx=512).
 
 - L1+L3+L5+L6, K=12: 7340.87 (PASS)
 - L1+L3+L5+L6, K=14: 7267.77 (PASS)
@@ -201,7 +205,7 @@ Base PPL ~18338.35 (ctx=512).
 
 ### Tiny 2k steps (impares K y mix)
 
-Base PPL ~18338.35 (ctx=512).
+PPL base ~18338.35 (ctx=512).
 
 - Impares (1,3,5,7), K=12: 7734.58 (PASS)
 - Impares (1,3,5,7), K=14: 7666.95 (PASS)
@@ -209,7 +213,7 @@ Base PPL ~18338.35 (ctx=512).
 
 ### Tiny 2k steps (ctx=256)
 
-Base PPL ~26081.12 (ctx=256).
+PPL base ~26081.12 (ctx=256).
 
 - L1+L3+L5+L6, K=12: 10427.29 (PASS)
 - L1+L3+L5+L6, K=14: 10385.10 (PASS)
@@ -237,11 +241,11 @@ Base PPL ~26081.12 (ctx=256).
 - Usar el mismo harness de logs (report.json + greedy pack).
 - No mezclar con modelos grandes hasta cerrar A y B.
 
-## Auto-Gating v2 — Selección automática de capas basada en sensibilidad + stacking
+## Auto-Gating v2 - Seleccion automatica de capas basada en sensibilidad + stacking
 
-### Motivación
+### Motivacion
 
-Hemos confirmado que SeedΔ puede mantener PPL/greedy cuando se aplica en capas “seguras”, pero es **extremadamente sensible a dónde** se aplica. Además, la estabilidad **no es aditiva**: dos capas que individualmente pasan pueden fallar juntas (stacking). Necesitamos un mecanismo que **mida** sensibilidad por capa y que también capture **interacciones**.
+Hemos confirmado que SeedΔ puede mantener PPL/greedy cuando se aplica en capas "seguras", pero es **extremadamente sensible a donde** se aplica. Ademas, la estabilidad **no es aditiva**: dos capas que individualmente pasan pueden fallar juntas (stacking). Necesitamos un mecanismo que **mida** sensibilidad por capa y que tambien capture **interacciones**.
 
 ---
 
@@ -254,7 +258,7 @@ Denotemos:
 * $FFN_{\\text{dense}}^{(L)}(x)$: salida del FFN de la capa $L$ usando pesos densos (baseline).
 * $FFN_{\\text{seed}}^{(L)}(x)$: salida del FFN de la capa $L$ sustituyendo **solo el tensor objetivo** (gate/up/down) por su aproximacion SeedΔ (base+Δ o delta-only), dejando lo demas denso.
 
-### 1.1 Sensibilidad por capa (métrica principal)
+### 1.1 Sensibilidad por capa (metrica principal)
 
 Definimos la sensibilidad relativa como:
 
@@ -264,7 +268,7 @@ $$
 
 donde $\\epsilon$ evita division por cero (ej. $1e{-}8$).
 
-### 1.2 Métricas robustas (colas y dirección)
+### 1.2 Metricas robustas (colas y direccion)
 
 Ademas de $S_L$, registramos metricas robustas para detectar drift en colas:
 
@@ -287,17 +291,17 @@ De estas, guardamos percentiles:
 
 ---
 
-## 2) Clasificación de capas: “Estructural” vs “Redundante”
+## 2) Clasificacion de capas: "Estructural" vs "Redundante"
 
 Para un umbral $\\tau$ (o percentil), la regla base es:
 
-* Si $S_L > \\tau$  ⇒ capa “Estructural”: **NO tocar** (mantener densa).
-* Si $S_L \\le \\tau$ ⇒ capa “Redundante”: **candidata** a SeedΔ.
+* Si $S_L > \\tau$  ⇒ capa "Estructural": **NO tocar** (mantener densa).
+* Si $S_L \\le \\tau$ ⇒ capa "Redundante": **candidata** a SeedΔ.
 
 **Nota:** $\\tau$ no debe ser universal. Preferible usar:
 
-* seleccion por percentil (ej. “mejor 30% por menor $S_L$”),
-* o selección por budget (escoger capas hasta alcanzar MB objetivo con mínima degradación).
+* seleccion por percentil (ej. "mejor 30% por menor $S_L$"),
+* o seleccion por budget (escoger capas hasta alcanzar MB objetivo con minima degradacion).
 
 ---
 
@@ -309,43 +313,43 @@ Por defecto, prohibir comprimir capas consecutivas:
 $$
 L_{i+1} \\neq L_i + 1
 $$
-Esto fuerza espacio para “recuperación” del residual.
+Esto fuerza espacio para "recuperacion" del residual.
 
 ### 3.2 Gap preferido
 
-Preferir gap ≥ 2 si el budget lo permite (reducción de riesgo de stacking).
+Preferir gap >= 2 si el budget lo permite (reduccion de riesgo de stacking).
 
 ---
 
 ## 4) El punto clave: stacking no aditivo ⇒ necesitamos fase de interacciones
 
-La sensibilidad $S_L$ es **marginal** (capa sola). Para capturar colapsos tipo “10+11”, hacemos construccion incremental con rollback y registro de pares prohibidos.
+La sensibilidad $S_L$ es **marginal** (capa sola). Para capturar colapsos tipo "10+11", hacemos construccion incremental con rollback y registro de pares prohibidos.
 
 ### 4.1 Constructor incremental (greedy-safe)
 
 Sea un conjunto activo $A$ de capas seleccionadas. Iteramos:
 
 1. Elegir siguiente capa $c$ del ranking (menor $S_c$).
-2. Probar $A' = A \\cup \\{c\\}$ respetando “no consecutivas”.
-3. Evaluar aceptación con batería mínima:
+2. Probar $A' = A \\cup \\{c\\}$ respetando "no consecutivas".
+3. Evaluar aceptacion con bateria minima:
 
    * greedy pack: PASS
-   * ΔPPL ≤ presupuesto (ej. ≤ +0.1% o configurable)
-   * metricas robustas: $\\cos_{p05}$ ≥ umbral y $r_{p95}$ ≤ umbral
+   * DeltaPPL <= presupuesto (ej. <= +5% en tiny o configurable)
+   * metricas robustas: $\\cos_{p05}$ >= umbral y $r_{p95}$ <= umbral
 4. Si PASS ⇒ aceptar $A \\leftarrow A'$
-5. Si FAIL ⇒ rollback y registrar “forbidden interaction”:
+5. Si FAIL ⇒ rollback y registrar "forbidden interaction":
 
 $$
 \\text{forbidden}(A, c) = \\text{true}
 $$
 
-Simplificación inicial: registrar forbidden **pairwise**:
+Simplificacion inicial: registrar forbidden **pairwise**:
 
 * forbidden_pair: $(c, \\ell)$ para $\\ell \\in A$ (si el fallo aparece al anadir $c$).
 
 ---
 
-## 5) Entregables (archivos) y formato mínimo
+## 5) Entregables (archivos) y formato minimo
 
 ### 5.1 Scan por capa
 
@@ -369,10 +373,10 @@ Simplificación inicial: registrar forbidden **pairwise**:
   Incluye:
 
   * layers seleccionadas
-  * K por subcapa (v0: fijo; v1: por capa según sensibilidad)
-  * strip settings (respetando CLI o declarados explícitamente)
+  * K por subcapa (v0: fijo; v1: por capa segun sensibilidad)
+  * strip settings (respetando CLI o declarados explicitamente)
 
-### 5.4 Report de comparación
+### 5.4 Report de comparacion
 
 * `autogating_report.md`
   Tabla:
@@ -383,19 +387,19 @@ Simplificación inicial: registrar forbidden **pairwise**:
 
 ---
 
-## 6) Plan de acción (checklist)
+## 6) Plan de accion (checklist)
 
 * [ ] Implementar `layer_sensitivity_scan` (script/harness): recorre capa por capa, aplica SeedΔ temporalmente con $K_{\\text{fixed}}$ y produce `layer_sensitivity_scan.json`.
 * [ ] Definir $K_{\\text{fixed}}$ inicial (v0): recomendado 12-16 (o 32 si quieres mas senal), scheme=COO para gate/up, down opcional.
-* [ ] Definir dataset de calibración `eval_x` determinista: mismo seed, mismo N, mismo ctx.
+* [ ] Definir dataset de calibracion `eval_x` determinista: mismo seed, mismo N, mismo ctx.
 * [ ] Definir umbral $\\tau$ v0:
 
-  * opción A: percentil (ej. top 30% menor S)
-  * opción B: budget MB (escoger capas hasta X MB ahorrados)
-* [ ] Implementar “no consecutivas” + “gap preferido”.
+  * opcion A: percentil (ej. top 30% menor S)
+  * opcion B: budget MB (escoger capas hasta X MB ahorrados)
+* [ ] Implementar "no consecutivas" + "gap preferido".
 * [ ] Implementar constructor incremental con rollback + registrar `forbidden_pairs.json`.
-* [ ] Generar `policy.autogen.<model>.json` y correr batería: greedy pack + PPL + RSS + tok/s.
-* [ ] Comparar contra heuristic/manual: ¿redescubre sets tipo $\\{1,3,5,6\\}$ o encuentra algo mejor?
+* [ ] Generar `policy.autogen.<model>.json` y correr bateria: greedy pack + PPL + RSS + tok/s.
+* [ ] Comparar contra heuristic/manual: redescubre sets tipo $\\{1,3,5,6\\}$ o encuentra algo mejor?
 * [ ] Integrar output en TODO principal: link a `scan.json`, `forbidden_pairs.json`, `policy.autogen`, `autogating_report.md`.
 
 ---
@@ -403,8 +407,8 @@ Simplificación inicial: registrar forbidden **pairwise**:
 ## 7) Criterios de exito (v0)
 
 * Greedy pack: **PASS 0 flags**.
-* ΔPPL: ≤ +0.1% (configurable).
-* RSS: reducción medible cuando strip aplica (reportar “weights RSS” si se puede separar).
+* DeltaPPL: tiny <= +5%, modelos reales <= +0.1% (configurable).
+* RSS: reduccion medible cuando strip aplica (reportar "weights RSS" si se puede separar).
 * tok/s: puede caer (aceptado), pero debe estar documentado.
 
 ## 8) Refinamiento opcional
