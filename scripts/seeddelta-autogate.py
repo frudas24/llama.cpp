@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+TENSOR_KEYS = ("ffn_gate", "ffn_up", "ffn_down")
+
 
 def parse_layers(spec: str) -> list[int]:
     layers: list[int] = []
@@ -27,18 +29,22 @@ def parse_layers(spec: str) -> list[int]:
     return sorted(set(layers))
 
 
-def write_policy(path: Path, layers: list[int], k: int, metric: str, enable_down: bool) -> None:
-    layer_csv = ",".join(str(l) for l in layers)
-    policy = {
-        "version": 1,
-        "defaults": {
-            "enabled": False,
-            "gating": {"metric": metric, "min_mean": -1.0, "min_p05": -1.0},
-            "autotune": {"enabled": False},
-        },
-        "ranges": [
+def write_policy(
+    path: Path,
+    layers: list[int],
+    layer_tensors: dict[int, set[str]],
+    k: int,
+    metric: str,
+    enable_down: bool,
+) -> None:
+    ranges = []
+    for layer in layers:
+        allowed = set(layer_tensors.get(layer, set()))
+        if not enable_down and "ffn_down" in allowed:
+            allowed.remove("ffn_down")
+        ranges.append(
             {
-                "layers": layer_csv,
+                "layers": str(layer),
                 "enabled": True,
                 "strip_dense": False,
                 "K": {"gate": k, "up": k, "down": k},
@@ -48,13 +54,21 @@ def write_policy(path: Path, layers: list[int], k: int, metric: str, enable_down
                     "min_p05": {"gate": 0.0, "up": 0.0, "down": 0.0},
                 },
                 "tensors": {
-                    "ffn_gate": {"enabled": True},
-                    "ffn_up": {"enabled": True},
-                    "ffn_down": {"enabled": bool(enable_down)},
+                    "ffn_gate": {"enabled": "ffn_gate" in allowed},
+                    "ffn_up": {"enabled": "ffn_up" in allowed},
+                    "ffn_down": {"enabled": "ffn_down" in allowed},
                 },
                 "autotune": {"enabled": False},
             }
-        ],
+        )
+    policy = {
+        "version": 1,
+        "defaults": {
+            "enabled": False,
+            "gating": {"metric": metric, "min_mean": -1.0, "min_p05": -1.0},
+            "autotune": {"enabled": False},
+        },
+        "ranges": ranges,
     }
     path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
 
@@ -63,10 +77,44 @@ def load_scan(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def extract_tensors(layer_metrics: dict) -> dict:
+    if isinstance(layer_metrics.get("tensors"), dict):
+        return layer_metrics.get("tensors", {})
+    return layer_metrics
+
+
+def metric_value(metrics: dict, primary: str, fallback: str) -> float | None:
+    val = metrics.get(primary)
+    if val is None:
+        return metrics.get(fallback)
+    if fallback and isinstance(val, (int, float)) and val == 0.0:
+        fb = metrics.get(fallback)
+        if fb is not None and fb != 0.0:
+            return fb
+    return val
+
+
+def validate_scan(layers_dict: dict) -> list[str]:
+    errors: list[str] = []
+    for layer_s, layer_metrics in layers_dict.items():
+        tensors = extract_tensors(layer_metrics) if isinstance(layer_metrics, dict) else None
+        if not isinstance(tensors, dict) or not tensors:
+            errors.append(f"layer {layer_s}: missing tensors")
+            continue
+        for tensor_name, metrics in tensors.items():
+            if not isinstance(metrics, dict):
+                errors.append(f"layer {layer_s}:{tensor_name} invalid metrics")
+                continue
+            if "S_mean" not in metrics and "rel_l2_mean" not in metrics:
+                errors.append(f"layer {layer_s}:{tensor_name} missing S_mean")
+    return errors
+
+
 def aggregate_metrics(layer_metrics: dict, tensors: list[str], metric: str, agg: str) -> float | None:
+    layer_tensors = extract_tensors(layer_metrics)
     vals: list[float] = []
     for t in tensors:
-        m = layer_metrics.get(t)
+        m = layer_tensors.get(t)
         if not isinstance(m, dict):
             continue
         v = m.get(metric)
@@ -108,6 +156,26 @@ def parse_greedy_result(path: Path) -> bool | None:
     return None
 
 
+def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> list[str]:
+    allowed: list[str] = []
+    layer_tensors = extract_tensors(layer_metrics)
+    for tensor in TENSOR_KEYS:
+        if tensor == "ffn_down" and not args.enable_down:
+            continue
+        metrics = layer_tensors.get(tensor)
+        if not isinstance(metrics, dict):
+            continue
+        cos_mean = metric_value(metrics, args.gate_cos_metric, "cos_mean")
+        cos_p05 = metric_value(metrics, args.gate_cos_p05_metric, "cos_p05")
+        if cos_mean is None or cos_p05 is None:
+            if args.gate_allow_missing:
+                allowed.append(tensor)
+            continue
+        if cos_mean >= args.gate_cos_threshold and cos_p05 >= args.gate_cos_p05_threshold:
+            allowed.append(tensor)
+    return allowed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Auto-gate layer selection from scan + optional eval")
     ap.add_argument("--scan", required=True, help="Path to layer_sensitivity_scan.json")
@@ -125,6 +193,11 @@ def main() -> int:
     ap.add_argument("--prefer-mult", type=float, default=0.95, help="Score multiplier for preferred layers")
     ap.add_argument("--avoid-even-only", action="store_true", help="Reject sets that are only even layers")
     ap.add_argument("--enable-down", action="store_true", help="Enable ffn_down in policy")
+    ap.add_argument("--gate-cos-metric", default="cos_mean_x_w", help="Metric for mean cosine gate")
+    ap.add_argument("--gate-cos-p05-metric", default="cos_p05_x_w", help="Metric for p05 cosine gate")
+    ap.add_argument("--gate-cos-threshold", type=float, default=0.7, help="Min cosine mean threshold")
+    ap.add_argument("--gate-cos-p05-threshold", type=float, default=0.5, help="Min cosine p05 threshold")
+    ap.add_argument("--gate-allow-missing", action="store_true", help="Allow tensors with missing cos metrics")
     ap.add_argument("--policy-out", default="", help="Output policy path (default: outdir/policy.autogen.json)")
     ap.add_argument("--forbidden-out", default="", help="Output forbidden pairs JSON (optional)")
     ap.add_argument("--scores-out", default="", help="Output scores JSON (optional)")
@@ -152,6 +225,10 @@ def main() -> int:
         print("error: scan.layers missing or invalid", file=sys.stderr)
         return 2
 
+    scan_errors = validate_scan(layers_dict)
+    for err in scan_errors:
+        print(f"warn: scan {err}", file=sys.stderr)
+
     tensors = [t.strip() for t in args.tensors.split(",") if t.strip()]
     prefer_layers = set(parse_layers(args.prefer)) if args.prefer else set()
 
@@ -163,7 +240,10 @@ def main() -> int:
             continue
         if not isinstance(layer_metrics, dict):
             continue
-        val = aggregate_metrics(layer_metrics, tensors, args.rank_metric, args.aggregate)
+        if args.rank_metric == "S_layer" and "S_layer" in layer_metrics:
+            val = float(layer_metrics.get("S_layer", 0.0))
+        else:
+            val = aggregate_metrics(layer_metrics, tensors, args.rank_metric, args.aggregate)
         if val is None:
             continue
         scores[layer] = float(val)
@@ -186,6 +266,7 @@ def main() -> int:
         max_layers = max(1, int(math.ceil(len(ranked) * (args.percent / 100.0))))
 
     selected: list[int] = []
+    selected_tensors: dict[int, set[str]] = {}
     forbidden_pairs: set[tuple[int, int]] = set()
     eval_steps: list[dict] = []
     eval_script = Path(args.eval_script)
@@ -204,12 +285,19 @@ def main() -> int:
         if args.avoid_even_only:
             if (not selected and layer % 2 == 0) or (all(s % 2 == 0 for s in selected) and layer % 2 == 0):
                 continue
+        layer_metrics = layers_dict.get(str(layer), {})
+        allowed = decide_allowed_tensors(layer_metrics, args)
+        if not allowed:
+            continue
 
         candidate = selected + [layer]
         candidate.sort()
+        candidate_tensors = dict(selected_tensors)
+        candidate_tensors[layer] = set(allowed)
 
         if not args.eval:
             selected = candidate
+            selected_tensors = candidate_tensors
             continue
 
         if not args.base or not args.text:
@@ -217,7 +305,7 @@ def main() -> int:
             return 2
 
         policy_path = eval_outdir / f"policy.step{len(eval_steps):03d}.json"
-        write_policy(policy_path, candidate, args.k, args.metric, args.enable_down)
+        write_policy(policy_path, candidate, candidate_tensors, args.k, args.metric, args.enable_down)
 
         layer_range = args.layers_range
         if not layer_range:
@@ -272,6 +360,7 @@ def main() -> int:
             {
                 "layer": layer,
                 "candidate": candidate,
+                "tensors": sorted(allowed),
                 "run_dir": str(run_dir),
                 "base_ppl": base_ppl,
                 "seeddelta_ppl": sd_ppl,
@@ -283,6 +372,7 @@ def main() -> int:
 
         if pass_ok:
             selected = candidate
+            selected_tensors = candidate_tensors
         else:
             for s in selected:
                 pair = tuple(sorted((s, layer)))
@@ -292,7 +382,7 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     policy_out = Path(args.policy_out) if args.policy_out else outdir / "policy.autogen.json"
-    write_policy(policy_out, selected, args.k, args.metric, args.enable_down)
+    write_policy(policy_out, selected, selected_tensors, args.k, args.metric, args.enable_down)
 
     scores_out = Path(args.scores_out) if args.scores_out else outdir / "layer_scores.json"
     scores_out.write_text(json.dumps(scores, indent=2) + "\n", encoding="utf-8")
@@ -305,8 +395,10 @@ def main() -> int:
         )
 
     if eval_steps:
+        selected_map = {str(layer): sorted(list(selected_tensors.get(layer, set()))) for layer in selected}
         report = {
             "selected_layers": selected,
+            "selected_tensors": selected_map,
             "steps": eval_steps,
         }
         (outdir / "autogating_report.json").write_text(

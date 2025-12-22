@@ -64,6 +64,8 @@ def collect_metrics(entry: dict) -> dict:
     rel_l2_p95 = float(entry.get("rel_l2_p95", 0.0) or 0.0)
     cos_mean = float(entry.get("cos_mean", 0.0) or 0.0)
     cos_p05 = float(entry.get("cos_p05", 0.0) or 0.0)
+    cos_mean_x_w = float(entry.get("cos_mean_x_w", 0.0) or 0.0)
+    cos_p05_x_w = float(entry.get("cos_p05_x_w", 0.0) or 0.0)
     norm_ratio_mean = float(entry.get("norm_ratio_mean", 0.0) or 0.0)
     log_norm_ratio_mean = math.log(norm_ratio_mean) if norm_ratio_mean > 0 else 0.0
     return {
@@ -71,6 +73,8 @@ def collect_metrics(entry: dict) -> dict:
         "S_p95": rel_l2_p95,
         "cos_mean": cos_mean,
         "cos_p05": cos_p05,
+        "cos_mean_x_w": cos_mean_x_w,
+        "cos_p05_x_w": cos_p05_x_w,
         "log_norm_ratio_mean": log_norm_ratio_mean,
         "log_norm_ratio_p95": None,
         "raw": {
