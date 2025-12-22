@@ -160,6 +160,14 @@ PPL base ~6015.29 (ctx=512).
 
 - L1+L3+L5+L7: 3296.31 (PASS)
 
+### Mix intercalado + sweep fino (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L0+L3+L5+L7 (mix): 7873.60 (PASS)
+- L1+L3+L5+L6, K=12: 3095.68 (PASS)
+- L1+L3+L5+L6, K=24: 3485.64 (PASS)
+
 ---
 
 ## Notas operativas
