@@ -176,6 +176,20 @@ PPL base ~6015.29 (ctx=512).
 - L1+L3+L5+L6, K=10: 3177.23 (PASS)
 - L1+L3+L5+L6, K=14: 3080.58 (PASS)
 
+### K sweep extremo (coo, base on)
+
+PPL base ~6015.29 (ctx=512).
+
+- L1+L3+L5+L6, K=6: 3160.24 (PASS)
+- L1+L3+L5+L6, K=18: 3204.16 (PASS)
+
+### Tiny 2k steps (nuevo modelo)
+
+Modelo: `calibration/tiny_toy_model_bf_2k/tiny.gguf` (F16).
+
+- Base PPL ~18338.35 (ctx=512)
+- SeedΔ L1+L3+L5+L6, K=16: 7000.89 (PASS)
+
 ---
 
 ## Notas operativas
