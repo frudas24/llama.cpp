@@ -376,6 +376,7 @@ Simplificacion inicial: registrar forbidden **pairwise**:
   * layers seleccionadas
   * K por subcapa (v0: fijo; v1: por capa segun sensibilidad)
   * strip settings (respetando CLI o declarados explicitamente)
+  * script: `scripts/seeddelta-autogate.py`
 
 ### 5.4 Report de comparacion
 
@@ -398,8 +399,8 @@ Simplificacion inicial: registrar forbidden **pairwise**:
   * opcion A: percentil (ej. top 30% menor S)
   * opcion B: budget MB (escoger capas hasta X MB ahorrados)
 * [ ] Implementar "no consecutivas" + "gap preferido".
-* [ ] Implementar constructor incremental con rollback + registrar `forbidden_pairs.json`.
-* [ ] Generar `policy.autogen.<model>.json` y correr bateria: greedy pack + PPL + RSS + tok/s.
+* [x] Implementar constructor incremental con rollback + registrar `forbidden_pairs.json`.
+* [x] Generar `policy.autogen.<model>.json` y correr bateria: greedy pack + PPL + RSS + tok/s.
 * [ ] Comparar contra heuristic/manual: redescubre sets tipo $\\{1,3,5,6\\}$ o encuentra algo mejor?
 * [ ] Integrar output en TODO principal: link a `scan.json`, `forbidden_pairs.json`, `policy.autogen`, `autogating_report.md`.
 
