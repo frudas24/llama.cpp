@@ -215,6 +215,20 @@ Base PPL ~26081.12 (ctx=256).
 - L1+L3+L5+L6, K=14: 10385.10 (PASS)
 - L1+L3+L5+L6, K=16: 9990.37 (PASS)
 
+### Consolidado (tiny)
+
+- Mejor set estable: L1+L3+L5+L6 con K en 8-16 (PPL ~3080-3096 en 1k; ~7-10k en 2k).
+- Paridad importa: pares (0,2,4,6) degrada fuerte; impares mejor que pares, pero peor que L1+L3+L5+L6.
+- K fuera de 8-16 tiende a empeorar (K=24/64).
+- `ffn_down` no aporta mejora clara; mantener apagado por defecto.
+
+### Heuristica propuesta (para modelos reales)
+
+- [ ] Seleccionar capas candidatas por delta de PPL single-layer (mejoras o menor degradacion).
+- [ ] Evitar sets solo pares; priorizar impares o mezcla con sesgo a L1/L3/L5/L6.
+- [ ] Grid chico de K en {8,12,16}; elegir el mejor que pase greedy.
+- [ ] Mantener `ffn_down` off; habilitar solo si el eval local de esa capa supera un umbral (cos mean >= 0.60).
+
 ---
 
 ## Notas operativas
