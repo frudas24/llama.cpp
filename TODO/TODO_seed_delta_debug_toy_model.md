@@ -278,6 +278,13 @@ Resultados E3 (Q8, filtro funcional + cos prefilter ajustado a scan sin base-fit
 - ctx512: base 15.0808 → SD 192.7277 (Δ +1177.97%), RSS +5.6 MiB
 - Nota: el filtro funcional auto-calibrado no excluye la capa 10; con prefilter relajado el PPL explota. Revisar criterio/umbral funcional o añadir lista negra temprana.
 
+Resultados E4 (Q8, guardrails funcionales + K=128, scan v4 con meta):
+- Autogate selecciona layers=13,15,18,20,22,25 (6 capas), 42 new tensors.
+- greedy PASS (ctx256 y ctx512).
+- ctx256: base 24.0128 → SD 26.9834 (Δ +12.37%)
+- ctx512: base 15.0808 → SD 14.6115 (Δ -3.11%)
+- Nota: con K=128 y guardrail early-layer (cutoff=12), desaparece el desastre temprano; mejora en ctx512 pero pierde en ctx256.
+
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
