@@ -270,6 +270,14 @@ Resultados E2 (F16, whitelist 12/14/16/18, gate-only):
 - ctx512: base 15.0469 → SD 14.7325 (Δ -2.09%), RSS +3.3 MiB
 - Nota: replica el patron Q8 (mejora en ctx512, leve degradacion en ctx256).
 
+Resultados E3 (Q8, filtro funcional + cos prefilter ajustado a scan sin base-fit):
+- Scan v3 sin --base-fit (ffn_proxy disponible). Prefiltro cos ajustado a min good: mean>=0.48, p05>=0.22.
+- Autogate selecciona layers=1,5,7,10,12,14,17,22 (incluye 10).
+- greedy PASS, 56 new tensors.
+- ctx256: base 24.0128 → SD 423.6253 (Δ +1664.16%), RSS +7.1 MiB
+- ctx512: base 15.0808 → SD 192.7277 (Δ +1177.97%), RSS +5.6 MiB
+- Nota: el filtro funcional auto-calibrado no excluye la capa 10; con prefilter relajado el PPL explota. Revisar criterio/umbral funcional o añadir lista negra temprana.
+
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF

@@ -29,6 +29,12 @@ def parse_layers(spec: str) -> list[int]:
     return sorted(set(layers))
 
 
+def parse_layers_set(spec: str) -> set[int] | None:
+    if not spec or not spec.strip():
+        return None
+    return set(parse_layers(spec))
+
+
 def write_policy(
     path: Path,
     layers: list[int],
@@ -110,6 +116,50 @@ def validate_scan(layers_dict: dict) -> list[str]:
     return errors
 
 
+def scan_meta_value(scan: dict, key: str) -> object:
+    meta = scan.get("meta")
+    if isinstance(meta, dict) and key in meta:
+        return meta.get(key)
+    return scan.get(key)
+
+
+def validate_scan_meta(scan: dict, args: argparse.Namespace) -> None:
+    mismatches: list[tuple[str, object, object]] = []
+
+    def chk(name: str, got: object, want: object) -> None:
+        if got is None or want is None:
+            return
+        if str(got) != str(want):
+            mismatches.append((name, got, want))
+
+    chk("scheme", scan_meta_value(scan, "scheme"), args.eval_scheme)
+    if args.eval_scheme == "block":
+        chk("block", scan_meta_value(scan, "block"), args.eval_block)
+    chk("eval_x", scan_meta_value(scan, "eval_x"), args.eval_x)
+    chk("eval_cols", scan_meta_value(scan, "eval_cols"), args.eval_cols)
+    chk("K_fixed", scan_meta_value(scan, "K_fixed"), args.k)
+
+    if mismatches:
+        msg_lines = ["scan/meta mismatch:"]
+        msg_lines.extend(f"  - {name}: scan={got} != args={want}" for name, got, want in mismatches)
+        msg = "\n".join(msg_lines)
+        if args.strict_scan_meta:
+            raise SystemExit(msg)
+        print(f"warn: {msg}", file=sys.stderr)
+
+    scan_k = scan_meta_value(scan, "K_fixed")
+    if scan_k is not None and int(scan_k) <= args.warn_small_k:
+        print(
+            f"warn: scan K_fixed={scan_k} is very small; expect quality drops unless calibrated",
+            file=sys.stderr,
+        )
+    if args.k <= args.warn_small_k and (scan_k is None or int(args.k) != int(scan_k)):
+        print(
+            f"warn: policy K={args.k} is very small; consider matching scan K",
+            file=sys.stderr,
+        )
+
+
 def read_float(value: object) -> float | None:
     if value is None:
         return None
@@ -148,8 +198,11 @@ def calibrate_functional_thresholds(
             norm_vals.append(abs(norm))
         if not cos_vals:
             continue
+        cos_thr = min(cos_vals)
+        if args.functional_relax_cos:
+            cos_thr -= args.functional_cos_margin
         thresholds[tensor] = {
-            "cos_p05": min(cos_vals) - args.functional_cos_margin,
+            "cos_p05": cos_thr,
             "l2_p95": max(l2_vals) * (1.0 + args.functional_l2_margin),
             "norm_p95": max(norm_vals) * (1.0 + args.functional_norm_margin),
         }
@@ -205,6 +258,8 @@ def passes_functional_gate(
     l2_thr = thresholds["l2_p95"]
     norm_thr = thresholds["norm_p95"]
 
+    if layer < args.functional_early_layer_cutoff and not args.functional_allow_early:
+        return False
     if layer < args.functional_early_layer_cutoff:
         cos_thr += args.functional_early_cos_boost
         l2_thr *= args.functional_early_l2_scale
@@ -300,6 +355,8 @@ def main() -> int:
     ap.add_argument("--scan", required=True, help="Path to layer_sensitivity_scan.json")
     ap.add_argument("--outdir", required=True, help="Output directory")
     ap.add_argument("--k", type=int, default=12, help="Fixed K for policy")
+    ap.add_argument("--strict-scan-meta", action="store_true", help="Error on scan/arg mismatches")
+    ap.add_argument("--warn-small-k", type=int, default=32, help="Warn when K <= this threshold")
     ap.add_argument("--metric", default="cos", help="Gating metric for policy")
     ap.add_argument("--rank-metric", default="S_mean", help="Scan metric for ranking")
     ap.add_argument("--aggregate", default="mean", choices=["mean", "max"], help="Aggregate per-layer metrics")
@@ -364,7 +421,12 @@ def main() -> int:
         "--functional-cos-margin",
         type=float,
         default=0.01,
-        help="Margin below min ffn_proxy_cos_p05 (calibration)",
+        help="Cos margin below min ffn_proxy_cos_p05 (requires --functional-relax-cos)",
+    )
+    ap.add_argument(
+        "--functional-relax-cos",
+        action="store_true",
+        help="Allow relaxing ffn_proxy_cos_p05 below the worst good layer",
     )
     ap.add_argument(
         "--functional-l2-margin",
@@ -457,6 +519,11 @@ def main() -> int:
         help="Early layer cutoff for stricter functional thresholds",
     )
     ap.add_argument(
+        "--functional-allow-early",
+        action="store_true",
+        help="Allow functional gate to consider layers < early cutoff",
+    )
+    ap.add_argument(
         "--functional-early-cos-boost",
         type=float,
         default=0.02,
@@ -488,6 +555,8 @@ def main() -> int:
     ap.add_argument("--base", default="", help="Base GGUF for eval")
     ap.add_argument("--text", default="", help="Text file for eval PPL")
     ap.add_argument("--layers-range", default="", help="Layer range for builder (e.g. 0-31)")
+    ap.add_argument("--layer-allowlist", default="", help="Layer allowlist (e.g. 12,14,16,18)")
+    ap.add_argument("--layer-denylist", default="", help="Layer denylist (e.g. 0-11)")
     ap.add_argument("--eval-outdir", default="", help="Base eval outdir")
     ap.add_argument("--eval-threads", type=int, default=os.cpu_count() or 1, help="Eval threads")
     ap.add_argument("--eval-ctx", type=int, default=512, help="Eval context")
@@ -509,11 +578,14 @@ def main() -> int:
     scan_errors = validate_scan(layers_dict)
     for err in scan_errors:
         print(f"warn: scan {err}", file=sys.stderr)
+    validate_scan_meta(scan, args)
 
     tensors = [t.strip() for t in args.tensors.split(",") if t.strip()]
     if not args.allow_up:
         tensors = [t for t in tensors if t != "ffn_up"]
     prefer_layers = set(parse_layers(args.prefer)) if args.prefer else set()
+    allow_layers = parse_layers_set(args.layer_allowlist)
+    deny_layers = parse_layers_set(args.layer_denylist) or set()
 
     functional_thresholds: dict[str, dict[str, float]] = {}
     if args.functional_gate:
@@ -535,6 +607,10 @@ def main() -> int:
         try:
             layer = int(layer_s)
         except ValueError:
+            continue
+        if allow_layers is not None and layer not in allow_layers:
+            continue
+        if layer in deny_layers:
             continue
         if not isinstance(layer_metrics, dict):
             continue
