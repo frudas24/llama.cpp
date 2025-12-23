@@ -232,9 +232,43 @@ Metricas de exito:
 - tok/s puede degradar
 
 Fase 1 - "marea creciente" (gate-only):
-- [ ] E1: autogate gate-only, rango 0-25 (o 0-N), max_layers escalonado: 8, 16, 24, 32
-- [ ] E2: repetir E1 en Q8 y F16 (estabilidad transversal)
+- [x] E1: autogate gate-only, rango 0-25, max_layers escalonado: 8, 16, 24 (Q8)
+- [x] E1b: repetir gate-only con rango seguro (10-19), mismos thresholds
+- [x] E2: repetir E1b en F16 (evitar 0-25)
 - Entregable: tabla max_layers vs ΔPPL vs GGUF size vs RSS(ctx=128/256) vs tok/s
+
+Resultados E1 (Q8, 0-25, gate-only, thresholds victoria 0.70/0.50, scheme=coo, eval-x=32, eval-cols=64):
+- max_layers=8: layers=1,5,12,14,16,18,23,25
+  - ctx256: base 24.0128 → SD 37.7318 (Δ +57.1%), RSS +43.5 MiB, greedy PASS, 56 new tensors
+  - ctx512: base 15.0808 → SD 20.8776 (Δ +38.4%), RSS +41.9 MiB, greedy PASS, 56 new tensors
+- max_layers=16: layers=1,3,5,7,9,12,14,16,18,20,23,25 (no llega a 16 por filtros)
+  - ctx256: base 24.0128 → SD 101.3362 (Δ +322.0%), RSS +59.2 MiB, greedy PASS, 77 new tensors
+  - ctx512: base 15.0808 → SD 59.1786 (Δ +292.4%), RSS +57.7 MiB, greedy PASS, 77 new tensors
+- max_layers=24: layers iguales a m16 (mismo set por filtros)
+  - ctx256: base 24.0128 → SD 101.3362 (Δ +322.0%), RSS +59.2 MiB, greedy PASS, 77 new tensors
+  - ctx512: base 15.0808 → SD 59.2843 (Δ +293.1%), RSS +57.7 MiB, greedy PASS, 77 new tensors
+- Nota: con rango 0-25, incluso gate-only degrada fuerte (capas tempranas). Reforzar rango "seguro" (12/14/16/18) o usar selector adicional.
+- Conclusión: cos-only no basta para capas tempranas; greedy PASS no implica PPL OK. Hace falta selector funcional (FFN proxy / Δoutput) y/o prior de rango.
+- [x] Implementar 2nd gate funcional en autogate (ffn_proxy_cos_p05 + l2_p95 + log_norm_ratio_p95) y extender scan con ffn_proxy_*.
+- [ ] Calibrar thresholds funcionales con whitelist 12/14/16/18 y reintentar expansion con barandales.
+
+Resultados E1b (Q8, 10-19, gate-only, thresholds victoria 0.70/0.50):
+- autogate selecciona layers=10,12,14,16,18 (5 capas), greedy PASS
+- ctx256: base 24.0128 → SD 32.2135 (Δ +34.15%), RSS +4.5 MiB, 35 new tensors
+- ctx512: base 15.0808 → SD 25.3050 (Δ +67.80%), RSS +4.4 MiB, 35 new tensors
+- Nota: incluir capa 10 rompe la mejora; siguiente intento debe ser whitelist 12/14/16/18 (sin 10) o filtro funcional.
+
+Resultados E1b (Q8, whitelist 12/14/16/18, gate-only):
+- greedy PASS, 28 new tensors
+- ctx256: base 24.0128 → SD 25.0971 (Δ +4.52%), RSS +3.3 MiB
+- ctx512: base 15.0808 → SD 14.7436 (Δ -2.24%), RSS +3.2 MiB
+- Nota: mejora en ctx512, leve degradacion en ctx256; confirmar en F16 antes de concluir.
+
+Resultados E2 (F16, whitelist 12/14/16/18, gate-only):
+- greedy PASS, 28 new tensors
+- ctx256: base 24.1772 → SD 25.1559 (Δ +4.05%), RSS +3.7 MiB
+- ctx512: base 15.0469 → SD 14.7325 (Δ -2.09%), RSS +3.3 MiB
+- Nota: replica el patron Q8 (mejora en ctx512, leve degradacion en ctx256).
 
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria

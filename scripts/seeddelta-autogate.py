@@ -110,6 +110,108 @@ def validate_scan(layers_dict: dict) -> list[str]:
     return errors
 
 
+def read_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def calibrate_functional_thresholds(
+    layers_dict: dict,
+    good_layers: list[int],
+    tensors: list[str],
+    args: argparse.Namespace,
+) -> dict[str, dict[str, float]]:
+    thresholds: dict[str, dict[str, float]] = {}
+    for tensor in tensors:
+        cos_vals: list[float] = []
+        l2_vals: list[float] = []
+        norm_vals: list[float] = []
+        for layer in good_layers:
+            layer_metrics = layers_dict.get(str(layer), {})
+            layer_tensors = extract_tensors(layer_metrics) if isinstance(layer_metrics, dict) else {}
+            metrics = layer_tensors.get(tensor)
+            if not isinstance(metrics, dict):
+                continue
+            if not metrics.get("ffn_proxy_available", False):
+                continue
+            cos = read_float(metrics.get("ffn_proxy_cos_p05"))
+            l2 = read_float(metrics.get("ffn_proxy_l2_p95"))
+            norm = read_float(metrics.get("ffn_proxy_log_norm_ratio_p95"))
+            if cos is None or l2 is None or norm is None:
+                continue
+            cos_vals.append(cos)
+            l2_vals.append(l2)
+            norm_vals.append(abs(norm))
+        if not cos_vals:
+            continue
+        thresholds[tensor] = {
+            "cos_p05": min(cos_vals) - args.functional_cos_margin,
+            "l2_p95": max(l2_vals) * (1.0 + args.functional_l2_margin),
+            "norm_p95": max(norm_vals) * (1.0 + args.functional_norm_margin),
+        }
+    return thresholds
+
+
+def resolve_functional_thresholds(
+    args: argparse.Namespace,
+    tensors: list[str],
+    calibrated: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    resolved: dict[str, dict[str, float]] = {}
+    for tensor in tensors:
+        suffix = tensor.replace("ffn_", "")
+        cos_override = getattr(args, f"functional_cos_p05_threshold_{suffix}")
+        l2_override = getattr(args, f"functional_l2_threshold_{suffix}")
+        norm_override = getattr(args, f"functional_norm_threshold_{suffix}")
+
+        base = calibrated.get(tensor, {})
+        cos_thr = cos_override if cos_override is not None else base.get("cos_p05", args.functional_cos_p05_threshold)
+        l2_thr = l2_override if l2_override is not None else base.get("l2_p95", args.functional_l2_threshold)
+        norm_thr = norm_override if norm_override is not None else base.get("norm_p95", args.functional_norm_threshold)
+
+        if cos_thr is None or l2_thr is None or norm_thr is None:
+            continue
+
+        resolved[tensor] = {
+            "cos_p05": float(cos_thr),
+            "l2_p95": float(l2_thr),
+            "norm_p95": float(norm_thr),
+        }
+    return resolved
+
+
+def passes_functional_gate(
+    layer: int,
+    metrics: dict,
+    thresholds: dict[str, float] | None,
+    args: argparse.Namespace,
+) -> bool:
+    if thresholds is None:
+        return args.functional_allow_missing
+    if not metrics.get("ffn_proxy_available", False):
+        return args.functional_allow_missing
+
+    cos = read_float(metrics.get("ffn_proxy_cos_p05"))
+    l2 = read_float(metrics.get("ffn_proxy_l2_p95"))
+    norm = read_float(metrics.get("ffn_proxy_log_norm_ratio_p95"))
+    if cos is None or l2 is None or norm is None:
+        return args.functional_allow_missing
+
+    cos_thr = thresholds["cos_p05"]
+    l2_thr = thresholds["l2_p95"]
+    norm_thr = thresholds["norm_p95"]
+
+    if layer < args.functional_early_layer_cutoff:
+        cos_thr += args.functional_early_cos_boost
+        l2_thr *= args.functional_early_l2_scale
+        norm_thr *= args.functional_early_norm_scale
+
+    return cos >= cos_thr and l2 <= l2_thr and abs(norm) <= norm_thr
+
 def aggregate_metrics(layer_metrics: dict, tensors: list[str], metric: str, agg: str) -> float | None:
     layer_tensors = extract_tensors(layer_metrics)
     vals: list[float] = []
@@ -156,7 +258,12 @@ def parse_greedy_result(path: Path) -> bool | None:
     return None
 
 
-def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> list[str]:
+def decide_allowed_tensors(
+    layer: int,
+    layer_metrics: dict,
+    args: argparse.Namespace,
+    functional_thresholds: dict[str, dict[str, float]],
+) -> list[str]:
     allowed: list[str] = []
     layer_tensors = extract_tensors(layer_metrics)
     for tensor in TENSOR_KEYS:
@@ -178,8 +285,13 @@ def decide_allowed_tensors(layer_metrics: dict, args: argparse.Namespace) -> lis
             if args.gate_allow_missing:
                 allowed.append(tensor)
             continue
-        if cos_mean >= mean_thr and cos_p05 >= p05_thr:
-            allowed.append(tensor)
+        if cos_mean < mean_thr or cos_p05 < p05_thr:
+            continue
+        if args.functional_gate:
+            thresholds = functional_thresholds.get(tensor)
+            if not passes_functional_gate(layer, metrics, thresholds, args):
+                continue
+        allowed.append(tensor)
     return allowed
 
 
@@ -242,6 +354,131 @@ def main() -> int:
         help="Per-tensor cosine p05 threshold for ffn_down",
     )
     ap.add_argument("--gate-allow-missing", action="store_true", help="Allow tensors with missing cos metrics")
+    ap.add_argument(
+        "--functional-gate",
+        action="store_true",
+        help="Enable functional proxy gate using ffn_proxy_* metrics",
+    )
+    ap.add_argument("--functional-good-layers", default="", help="CSV layers to calibrate thresholds")
+    ap.add_argument(
+        "--functional-cos-margin",
+        type=float,
+        default=0.01,
+        help="Margin below min ffn_proxy_cos_p05 (calibration)",
+    )
+    ap.add_argument(
+        "--functional-l2-margin",
+        type=float,
+        default=0.15,
+        help="Margin above max ffn_proxy_l2_p95 (calibration)",
+    )
+    ap.add_argument(
+        "--functional-norm-margin",
+        type=float,
+        default=0.15,
+        help="Margin above max |ffn_proxy_log_norm_ratio_p95| (calibration)",
+    )
+    ap.add_argument(
+        "--functional-cos-p05-threshold",
+        type=float,
+        default=None,
+        help="Min ffn_proxy_cos_p05 threshold",
+    )
+    ap.add_argument(
+        "--functional-l2-threshold",
+        type=float,
+        default=None,
+        help="Max ffn_proxy_l2_p95 threshold",
+    )
+    ap.add_argument(
+        "--functional-norm-threshold",
+        type=float,
+        default=None,
+        help="Max abs ffn_proxy_log_norm_ratio_p95 threshold",
+    )
+    ap.add_argument(
+        "--functional-cos-p05-threshold-gate",
+        type=float,
+        default=None,
+        help="Per-tensor min ffn_proxy_cos_p05 for ffn_gate",
+    )
+    ap.add_argument(
+        "--functional-l2-threshold-gate",
+        type=float,
+        default=None,
+        help="Per-tensor max ffn_proxy_l2_p95 for ffn_gate",
+    )
+    ap.add_argument(
+        "--functional-norm-threshold-gate",
+        type=float,
+        default=None,
+        help="Per-tensor max abs ffn_proxy_log_norm_ratio_p95 for ffn_gate",
+    )
+    ap.add_argument(
+        "--functional-cos-p05-threshold-up",
+        type=float,
+        default=None,
+        help="Per-tensor min ffn_proxy_cos_p05 for ffn_up",
+    )
+    ap.add_argument(
+        "--functional-l2-threshold-up",
+        type=float,
+        default=None,
+        help="Per-tensor max ffn_proxy_l2_p95 for ffn_up",
+    )
+    ap.add_argument(
+        "--functional-norm-threshold-up",
+        type=float,
+        default=None,
+        help="Per-tensor max abs ffn_proxy_log_norm_ratio_p95 for ffn_up",
+    )
+    ap.add_argument(
+        "--functional-cos-p05-threshold-down",
+        type=float,
+        default=None,
+        help="Per-tensor min ffn_proxy_cos_p05 for ffn_down",
+    )
+    ap.add_argument(
+        "--functional-l2-threshold-down",
+        type=float,
+        default=None,
+        help="Per-tensor max ffn_proxy_l2_p95 for ffn_down",
+    )
+    ap.add_argument(
+        "--functional-norm-threshold-down",
+        type=float,
+        default=None,
+        help="Per-tensor max abs ffn_proxy_log_norm_ratio_p95 for ffn_down",
+    )
+    ap.add_argument(
+        "--functional-early-layer-cutoff",
+        type=int,
+        default=12,
+        help="Early layer cutoff for stricter functional thresholds",
+    )
+    ap.add_argument(
+        "--functional-early-cos-boost",
+        type=float,
+        default=0.02,
+        help="Boost ffn_proxy_cos_p05 threshold for early layers",
+    )
+    ap.add_argument(
+        "--functional-early-l2-scale",
+        type=float,
+        default=0.85,
+        help="Scale ffn_proxy_l2_p95 threshold for early layers",
+    )
+    ap.add_argument(
+        "--functional-early-norm-scale",
+        type=float,
+        default=0.85,
+        help="Scale ffn_proxy_log_norm_ratio_p95 threshold for early layers",
+    )
+    ap.add_argument(
+        "--functional-allow-missing",
+        action="store_true",
+        help="Allow tensors with missing ffn_proxy metrics",
+    )
     ap.add_argument("--policy-out", default="", help="Output policy path (default: outdir/policy.autogen.json)")
     ap.add_argument("--forbidden-out", default="", help="Output forbidden pairs JSON (optional)")
     ap.add_argument("--scores-out", default="", help="Output scores JSON (optional)")
@@ -277,6 +514,21 @@ def main() -> int:
     if not args.allow_up:
         tensors = [t for t in tensors if t != "ffn_up"]
     prefer_layers = set(parse_layers(args.prefer)) if args.prefer else set()
+
+    functional_thresholds: dict[str, dict[str, float]] = {}
+    if args.functional_gate:
+        good_layers = parse_layers(args.functional_good_layers) if args.functional_good_layers else []
+        calibrated: dict[str, dict[str, float]] = {}
+        if good_layers:
+            calibrated = calibrate_functional_thresholds(layers_dict, good_layers, tensors, args)
+            if not calibrated:
+                print("error: functional calibration produced no thresholds", file=sys.stderr)
+                return 2
+        functional_thresholds = resolve_functional_thresholds(args, tensors, calibrated)
+        missing = [t for t in tensors if t not in functional_thresholds]
+        if missing:
+            print(f"error: functional thresholds missing for {', '.join(missing)}", file=sys.stderr)
+            return 2
 
     scores: dict[int, float] = {}
     for layer_s, layer_metrics in layers_dict.items():
@@ -332,7 +584,7 @@ def main() -> int:
             if (not selected and layer % 2 == 0) or (all(s % 2 == 0 for s in selected) and layer % 2 == 0):
                 continue
         layer_metrics = layers_dict.get(str(layer), {})
-        allowed = decide_allowed_tensors(layer_metrics, args)
+        allowed = decide_allowed_tensors(layer, layer_metrics, args, functional_thresholds)
         if not allowed:
             continue
 

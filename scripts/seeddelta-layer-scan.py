@@ -60,14 +60,32 @@ def write_policy(path: Path, layer: int, tensors: list[str], k: int, metric: str
 
 
 def collect_metrics(entry: dict) -> dict:
-    rel_l2_mean = float(entry.get("rel_l2_mean", 0.0) or 0.0)
-    rel_l2_p95 = float(entry.get("rel_l2_p95", 0.0) or 0.0)
-    cos_mean = float(entry.get("cos_mean", 0.0) or 0.0)
-    cos_p05 = float(entry.get("cos_p05", 0.0) or 0.0)
-    cos_mean_x_w = float(entry.get("cos_mean_x_w", 0.0) or 0.0)
-    cos_p05_x_w = float(entry.get("cos_p05_x_w", 0.0) or 0.0)
-    norm_ratio_mean = float(entry.get("norm_ratio_mean", 0.0) or 0.0)
+    def read_float(key: str) -> float | None:
+        val = entry.get(key)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    rel_l2_mean = read_float("rel_l2_mean") or 0.0
+    rel_l2_p95 = read_float("rel_l2_p95") or 0.0
+    cos_mean = read_float("cos_mean") or 0.0
+    cos_p05 = read_float("cos_p05") or 0.0
+    cos_mean_x_w = read_float("cos_mean_x_w") or 0.0
+    cos_p05_x_w = read_float("cos_p05_x_w") or 0.0
+    norm_ratio_mean = read_float("norm_ratio_mean") or 0.0
     log_norm_ratio_mean = math.log(norm_ratio_mean) if norm_ratio_mean > 0 else 0.0
+
+    ffn_proxy_available = bool(entry.get("ffn_proxy_available", False))
+    ffn_proxy_cos_mean = read_float("ffn_proxy_cos_mean")
+    ffn_proxy_cos_p05 = read_float("ffn_proxy_cos_p05")
+    ffn_proxy_l2_mean = read_float("ffn_proxy_l2_mean")
+    ffn_proxy_l2_p95 = read_float("ffn_proxy_l2_p95")
+    ffn_proxy_log_norm_ratio_mean = read_float("ffn_proxy_log_norm_ratio_mean")
+    ffn_proxy_log_norm_ratio_p95 = read_float("ffn_proxy_log_norm_ratio_p95")
+
     return {
         "S_mean": rel_l2_mean,
         "S_p95": rel_l2_p95,
@@ -77,6 +95,13 @@ def collect_metrics(entry: dict) -> dict:
         "cos_p05_x_w": cos_p05_x_w,
         "log_norm_ratio_mean": log_norm_ratio_mean,
         "log_norm_ratio_p95": None,
+        "ffn_proxy_available": ffn_proxy_available,
+        "ffn_proxy_cos_mean": ffn_proxy_cos_mean,
+        "ffn_proxy_cos_p05": ffn_proxy_cos_p05,
+        "ffn_proxy_l2_mean": ffn_proxy_l2_mean,
+        "ffn_proxy_l2_p95": ffn_proxy_l2_p95,
+        "ffn_proxy_log_norm_ratio_mean": ffn_proxy_log_norm_ratio_mean,
+        "ffn_proxy_log_norm_ratio_p95": ffn_proxy_log_norm_ratio_p95,
         "raw": {
             "rel_l2_mean": rel_l2_mean,
             "rel_l2_p95": rel_l2_p95,
