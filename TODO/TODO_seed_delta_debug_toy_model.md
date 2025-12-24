@@ -364,6 +364,7 @@ Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
 - [ ] D3: limitar down con max_down_layers separado de max_gate_layers
 - Entregable: policy gate+down, tabla capas gate vs capas down + ΔPPL + ahorro
+  - Helpers: `scripts/seeddelta-e8-make-policy.py`, `scripts/seeddelta-e8-run.sh`, `scripts/seeddelta-e8-summary.py`
 
 Fase 3 - STRIP real y medicion de RAM:
 - [ ] Confirmar en logs: no "0 new tensors", strip aplicado
