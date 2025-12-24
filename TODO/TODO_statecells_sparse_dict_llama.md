@@ -5,15 +5,15 @@
 ---
 
 ## Índice
-0) Contexto (Devstral 24B, RAM/KV)  
-1) Idea central  
-2) Matemática esencial  
-3) Config/flags  
-4) Integración (offline + runtime)  
-5) Pseudocódigo  
-6) Métricas/aceptación  
-7) Roadmap  
-8) Riesgos/mitigación  
+0) Contexto (Devstral 24B, RAM/KV)
+1) Idea central
+2) Matemática esencial
+3) Config/flags
+4) Integración (offline + runtime)
+5) Pseudocódigo
+6) Métricas/aceptación
+7) Roadmap
+8) Riesgos/mitigación
 9) Commits sugeridos
 10) Research/prior art (para “hacerlo bien”)
 
@@ -104,12 +104,12 @@
   2) entrena `D` por Oja (streaming sobre filas),
   3) codifica cada fila/bloque en SparseCode top‑k,
   4) escribe un GGUF nuevo con tensores:
-     - `blk.N.ffn_gate.dict`  `[n_embd, M]` tipo F16/F32  
-     - `blk.N.ffn_gate.codes` `[k, n_ff]`   tipo I16 con signo embebido  
-     - `blk.N.ffn_up.dict`    `[n_embd, M]` tipo F16/F32  
-     - `blk.N.ffn_up.codes`   `[k, n_ff]`   tipo I16  
-     - `blk.N.ffn_down.dict`  `[n_ff,  M]`  tipo F16/F32  
-     - `blk.N.ffn_down.codes` `[k, n_embd]` tipo I16  
+     - `blk.N.ffn_gate.dict`  `[n_embd, M]` tipo F16/F32
+     - `blk.N.ffn_gate.codes` `[k, n_ff]`   tipo I16 con signo embebido
+     - `blk.N.ffn_up.dict`    `[n_embd, M]` tipo F16/F32
+     - `blk.N.ffn_up.codes`   `[k, n_ff]`   tipo I16
+     - `blk.N.ffn_down.dict`  `[n_ff,  M]`  tipo F16/F32
+     - `blk.N.ffn_down.codes` `[k, n_embd]` tipo I16
      - (✅ opcional) `blk.N.*.vals` `[k, d_out]` fp16 para esquema `sign+vals`.
 
   **Interpretación codes (sign‑scheme):**
@@ -149,13 +149,13 @@
 
 **4.2 Runtime (inferencia)**
 Dos rutas:
-1. **Sin reconstruir W:**  
-   - Para input `x`, computa proyecciones base `p_j = dot(D[:,j], x)` para todos `j=1..M`.  
-   - Para cada fila `r`: `y_r = Σ_{(j,s)∈code(r)} s · p_j`.  
+1. **Sin reconstruir W:**
+   - Para input `x`, computa proyecciones base `p_j = dot(D[:,j], x)` para todos `j=1..M`.
+   - Para cada fila `r`: `y_r = Σ_{(j,s)∈code(r)} s · p_j`.
    - Complejidad ≈ `O(M·d + k·rows)` (si `M ≪ rows`, ahorro grande).
    - (futuro) **reuso de `p`**: si `ffn_gate` y `ffn_up` comparten diccionario `D`, se calcula `p = Dᵀx` una vez y se usa para ambos (ahorro directo).
-2. **Reconstrucción bajo demanda + cache:**  
-   - Reconstruye bloques `ŵ_block` solo cuando se usan, con LRU en RAM.  
+2. **Reconstrucción bajo demanda + cache:**
+   - Reconstruye bloques `ŵ_block` solo cuando se usan, con LRU en RAM.
    - Útil si además hay sparsidad KWTA/event‑driven que evita usar todos los bloques.
 
 ### 5) Pseudocódigo
@@ -197,36 +197,36 @@ for row in 0..R-1:
   - Para Devstral en 32 GB: reportar también **KV cache RAM** (según `-ctk/-ctv` y `ctx`), porque puede dominar el total.
 
 ### 7) Roadmap
-1. ✅ Tool offline `llama-statecells-build` (leer GGUF, entrenar D, emitir `*.dict/*.codes`, escribir GGUF).  
-2. ✅ Formato GGUF extendido + loader/hook runtime opt‑in en llama.cpp (`--statecells`).  
-3. ✅ Kernel runtime rápido “sin reconstrucción” (precompute `p = Dᵀx`, sumar `k` coeficientes por salida).  
-4. ✅ Schedule por matriz (`M/k` por `gate/up/down`).  
-5. ✅ Scheme `sign+row_scale` (`...row_scale` fp16).  
-6. ✅ Scheme `sign+vals` (`*.vals`) (opcional vía `--vals`).  
-7. ✅ Builder data‑aware v1 con imatrix (diagonal) (`--imatrix`) + métricas `*_w`.  
-8. ⏳ Builder data‑aware v2 (objetivo funcional real `||W X − Ŵ X||` con activaciones) + auto‑tune por capa/tensor.  
-9. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).  
-10. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.  
+1. ✅ Tool offline `llama-statecells-build` (leer GGUF, entrenar D, emitir `*.dict/*.codes`, escribir GGUF).
+2. ✅ Formato GGUF extendido + loader/hook runtime opt‑in en llama.cpp (`--statecells`).
+3. ✅ Kernel runtime rápido “sin reconstrucción” (precompute `p = Dᵀx`, sumar `k` coeficientes por salida).
+4. ✅ Schedule por matriz (`M/k` por `gate/up/down`).
+5. ✅ Scheme `sign+row_scale` (`...row_scale` fp16).
+6. ✅ Scheme `sign+vals` (`*.vals`) (opcional vía `--vals`).
+7. ✅ Builder data‑aware v1 con imatrix (diagonal) (`--imatrix`) + métricas `*_w`.
+8. ⏳ Builder data‑aware v2 (objetivo funcional real `||W X − Ŵ X||` con activaciones) + auto‑tune por capa/tensor.
+9. ⏳ Decisión **offline** de capas/tensores (emitir StateCells solo si pasa gap); runtime solo ejecuta lo que el GGUF trae (sin “comparar baseline” en caliente).
+10. ⏳ Integración con KWTA/event‑driven para explotar máscaras y cachear trabajo.
 11. ⏳ Bench `llama-bench` + `llama-perplexity` A/B vs Q4/Q5 (script: `scripts/statecells-eval.sh`).
 
 ### 8) Riesgos/mitigación
-- **M demasiado grande** → no hay ahorro: auto‑tune M por capa (target M≈rows/8).  
-- **k muy bajo** → sube ppl: empezar con k=16–32 y bajar gradualmente.  
-- **Costo p_j** puede dominar: vectorizar dot(D,x) y reusar para varias proyecciones en la capa.  
+- **M demasiado grande** → no hay ahorro: auto‑tune M por capa (target M≈rows/8).
+- **k muy bajo** → sube ppl: empezar con k=16–32 y bajar gradualmente.
+- **Costo p_j** puede dominar: vectorizar dot(D,x) y reusar para varias proyecciones en la capa.
 - **No todas las capas separables**: permitir fallback per‑layer con `gap_tol`.
 - **Tool offline lento** en pesos grandes: limitar `--dict-max-samples`, restringir `--layers`, y preferir correr el builder en Ubuntu real con suficiente RAM (evitar swap/WSL).
 - **Sign‑only puede ser muy restrictivo**: priorizar `row_scale` o `vals` antes de aumentar `M` sin control.
 - **KV cache domina en ctx largo**: mitigar con `-ctk/-ctv` y medir el total (weights+KV) para no optimizar “la mitad equivocada”.
 
 ### Compatibilidad e interacciones
-- **Backend de pesos exclusivo por capa:** no combinar StateCells con ternario/TT/proc‑sparse en la misma matriz en primera iteración.  
-- Sinergia con KWTA/event‑driven: usando la ruta “reconstrucción bajo demanda”, las máscaras reducen reconstrucciones y aumentan el ahorro real.  
+- **Backend de pesos exclusivo por capa:** no combinar StateCells con ternario/TT/proc‑sparse en la misma matriz en primera iteración.
+- Sinergia con KWTA/event‑driven: usando la ruta “reconstrucción bajo demanda”, las máscaras reducen reconstrucciones y aumentan el ahorro real.
 - Nan‑Guardian debe cubrir reescalados/renorm y la salida reconstruida antes de mezclarse con staleness.
 
 ### 9) Commits sugeridos
-- `statecells: add offline dict+code builder for GGUF`  
-- `gguf: add dict/codes tensor types + metadata`  
-- `kernels: add statecells matvec path (mlp)`  
+- `statecells: add offline dict+code builder for GGUF`
+- `gguf: add dict/codes tensor types + metadata`
+- `kernels: add statecells matvec path (mlp)`
 - `runtime: flags + gap fallback + metrics`
 
 ---

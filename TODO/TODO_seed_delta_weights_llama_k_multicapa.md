@@ -185,7 +185,7 @@ Para evitar typos y drift, el schema v1 debe declarar keys canónicas y comporta
 
 ### 4.3 Semántica de merge (determinista)
 
-1) Baseline = **CLI global** (flags actuales).  
+1) Baseline = **CLI global** (flags actuales).
 2) Si hay `--policy`: `defaults` → aplica cada `ranges[]` que contenga la capa (en orden) → aplica `layers[L]` → aplica `layers[L].tensors[T]`.
 
 Regla de “último gana”: si varias reglas aplican y definen el mismo campo, la regla más específica (tensor > capa > rango > defaults) y/o la última en orden debe ganar (determinista).
@@ -215,9 +215,9 @@ Archivo objetivo: `tools/seeddelta-build/seeddelta-build.cpp`
 
 Conceptualmente, por cada tensor `blk.N.ffn_{gate,up,down}.weight` el builder ya hace:
 
-1) fit base (`--base-*`)  
-2) fit residual (scheme block/coo, K, row_scale)  
-3) eval (cols / eval_x)  
+1) fit base (`--base-*`)
+2) fit residual (scheme block/coo, K, row_scale)
+3) eval (cols / eval_x)
 4) write GGUF + JSON
 
 El mecanismo policy/gating/autotune se inserta alrededor de ese flujo por tensor:
@@ -278,9 +278,9 @@ Campos recomendados (para forense y reproducibilidad):
 
 ## 8) Workflow recomendado (modelo nuevo)
 
-1) Generar imatrix con dataset representativo del modelo (chat + idioma + código si aplica).  
-2) Ejecutar builder con `--policy` y `autotune.enabled=true` en un rango acotado (p.ej. 15–20).  
-3) Confirmar estabilidad con batería greedy (varios prompts) usando `--seeddelta --no-repack --ignore-eos`.  
+1) Generar imatrix con dataset representativo del modelo (chat + idioma + código si aplica).
+2) Ejecutar builder con `--policy` y `autotune.enabled=true` en un rango acotado (p.ej. 15–20).
+3) Confirmar estabilidad con batería greedy (varios prompts) usando `--seeddelta --no-repack --ignore-eos`.
 4) Solo después, medir PPL (chunks pequeños) y throughput/RSS.
 
 ---
