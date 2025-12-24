@@ -85,6 +85,17 @@ def collect_metrics(entry: dict) -> dict:
     ffn_proxy_l2_p95 = read_float("ffn_proxy_l2_p95")
     ffn_proxy_log_norm_ratio_mean = read_float("ffn_proxy_log_norm_ratio_mean")
     ffn_proxy_log_norm_ratio_p95 = read_float("ffn_proxy_log_norm_ratio_p95")
+    ffn_proxy_score = None
+    if (
+        ffn_proxy_cos_p05 is not None
+        and ffn_proxy_l2_p95 is not None
+        and ffn_proxy_log_norm_ratio_p95 is not None
+    ):
+        ffn_proxy_score = max(
+            1.0 - ffn_proxy_cos_p05,
+            ffn_proxy_l2_p95,
+            abs(ffn_proxy_log_norm_ratio_p95),
+        )
 
     return {
         "S_mean": rel_l2_mean,
@@ -102,6 +113,7 @@ def collect_metrics(entry: dict) -> dict:
         "ffn_proxy_l2_p95": ffn_proxy_l2_p95,
         "ffn_proxy_log_norm_ratio_mean": ffn_proxy_log_norm_ratio_mean,
         "ffn_proxy_log_norm_ratio_p95": ffn_proxy_log_norm_ratio_p95,
+        "ffn_proxy_score": ffn_proxy_score,
         "raw": {
             "rel_l2_mean": rel_l2_mean,
             "rel_l2_p95": rel_l2_p95,

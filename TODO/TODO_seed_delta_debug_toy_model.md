@@ -359,6 +359,25 @@ Resultados E7c (gate-only, policy strip {13,15,18,20}, remoto, multi-ctx + RSS p
 - ctx2048: base 15.1789 → SD 14.2602 (Δ -6.05%), RSS delta -87,208 kB (~-85.1 MiB), greedy pack RESULT: PASS (0/20 flagged).
 - Nota: greedy pack es heuristico (anti-colapso). Los diffs exactos vs base son esperables cuando cambiamos pesos.
 
+Resultados Gemma 1B (local, Q4_K_M, gate-only):
+- Policy {13,15,18,20} strip_dense=true:
+  - ctx512: base 1.0050 → SD 1.0072 (Δ +0.22%).
+  - ctx2048: base 1.0024 → SD 1.0023 (Δ -0.01%).
+  - ctx4096: base 1.0021 → SD 1.0020 (Δ -0.01%).
+  - ctx8192: base 1.0023 → SD 1.0023 (Δ ~0%).
+  - GGUF delta: -7.06 MiB; RSS delta: -6.8 MiB (ctx64) / -6.3 MiB (ctx128).
+- Autogate {1,3,5,10} (capas tempranas):
+  - ctx512: base 1.0050 → SD 1.0196 (Δ +1.45%).
+  - ctx2048: base 1.0024 → SD 1.0039 (Δ +0.15%).
+- Autogate con denylist 0-11 (layers {17,19,21,23}):
+  - ctx512: base 1.0050 → SD 1.0076 (Δ +0.26%).
+  - ctx2048: base 1.0024 → SD 1.0029 (Δ +0.05%).
+- Scan ffn_proxy (sin --base-fit) + detector por ffn_proxy_score:
+  - ffn_proxy_available=true (proxy solo disponible sin base-fit).
+  - Autogate (rank=ffn_proxy_score, good layers 13/15/18/20) selecciona {12,19,21,23}.
+  - ctx512: base 1.0050 → SD 1.0063 (Δ +0.13%).
+  - ctx2048: base 1.0024 → SD 1.0031 (Δ +0.07%).
+
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
