@@ -365,6 +365,16 @@ Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D3: limitar down con max_down_layers separado de max_gate_layers
 - Entregable: policy gate+down, tabla capas gate vs capas down + ΔPPL + ahorro
   - Helpers: `scripts/seeddelta-e8-make-policy.py`, `scripts/seeddelta-e8-run.sh`, `scripts/seeddelta-e8-summary.py`
+  - One-liners (remoto):
+    - E8a (down solo capa 20):
+      - `scripts/seeddelta-e8-make-policy.py --out calibration/e8a_down20/policy_down20.json --layers 13,15,18,20 --down 20 --k 128 --strip-dense`
+      - `scripts/seeddelta-e8-run.sh --base ~/models/gemma-3-4b-it-Q8_0.gguf --policy calibration/e8a_down20/policy_down20.json --outdir calibration/e8a_down20`
+    - E8b (down en 18,20):
+      - `scripts/seeddelta-e8-make-policy.py --out calibration/e8b_down18_20/policy_down18_20.json --layers 13,15,18,20 --down 18,20 --k 128 --strip-dense`
+      - `scripts/seeddelta-e8-run.sh --base ~/models/gemma-3-4b-it-Q8_0.gguf --policy calibration/e8b_down18_20/policy_down18_20.json --outdir calibration/e8b_down18_20`
+    - E8c (down en 13,15,18,20):
+      - `scripts/seeddelta-e8-make-policy.py --out calibration/e8c_down_all/policy_down_all.json --layers 13,15,18,20 --down 13,15,18,20 --k 128 --strip-dense`
+      - `scripts/seeddelta-e8-run.sh --base ~/models/gemma-3-4b-it-Q8_0.gguf --policy calibration/e8c_down_all/policy_down_all.json --outdir calibration/e8c_down_all`
 
 Fase 3 - STRIP real y medicion de RAM:
 - [ ] Confirmar en logs: no "0 new tensors", strip aplicado
