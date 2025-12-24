@@ -284,6 +284,41 @@ Resultados E4 (Q8, guardrails funcionales + K=128, scan v4 con meta):
 - ctx256: base 24.0128 → SD 26.9834 (Δ +12.37%)
 - ctx512: base 15.0808 → SD 14.6115 (Δ -3.11%)
 - Nota: con K=128 y guardrail early-layer (cutoff=12), desaparece el desastre temprano; mejora en ctx512 pero pierde en ctx256.
+- ctx768: base 12.7670 → SD 12.2994 (Δ -3.66%), greedy PASS.
+- ctx1024: base 16.6540 → SD 15.5520 (Δ -6.62%), greedy PASS.
+- ctx1280: base 14.9195 → SD 15.0916 (Δ +1.15%), greedy PASS.
+- ctx1536: base 16.3335 → SD 16.7454 (Δ +2.52%), greedy PASS.
+- ctx1792: base 15.9578 → SD 18.4126 (Δ +15.39%), greedy PASS.
+- ctx2048 (run1/2/3): base 15.1789 → SD 16.2703 (Δ +7.19%), greedy PASS.
+- Nota: la curva no es monótona; mejora hasta ~1024, cruza a + a partir de ~1280. 2048 repetido 3x arroja la misma PPL (varianza despreciable).
+
+Diagnostico (E4 + sweep ctx):
+- Pipeline real y trazable (scan → autogate → policy → build → eval). New tensors confirma cambios.
+- ffn_gate compresible; ffn_up sigue deny-by-default.
+- Greedy PASS no implica calidad global (PPL es el guardián real).
+- La policy actual es dependiente del regimen de ctx: mejora 512-1024 y degrada >=1280.
+
+Matices y feedback (post-E5):
+- Pipeline real: new tensors + apples-to-apples => no placebo.
+- Gate-only tiene regimen: en ctx medio (512-1024) regulariza y puede bajar PPL.
+- Guardrails: cutoff temprano + functional gate evitaron el infierno (E3).
+- Quiebre de contexto es real: 2048 repetido con la misma PPL => no es ruido.
+- E5 es oro: hay causalidad; layer 25 es el principal detonante en ctx largo.
+- Matiz importante: policy_mid {13,15,18,20,22,25} no es necesariamente optima; todas las variantes leave-one-out mejoran mas en ctx1024 que la policy completa, asi que hay margen quitando 1-2 capas incluso en mid.
+
+Siguiente ROI (ctx-aware):
+- [x] E5: leave-one-out sobre {13,15,18,20,22,25} midiendo ctx1024 y ctx2048 para detectar capas toxicas en largo.
+- [ ] E6: policy por buckets (policy_mid <=1024, policy_long >=1536) o selector multi-ctx.
+- [ ] E7: gate+down (up-off) solo despues de estabilizar multi-ctx (medir 1024+2048 desde el primer intento).
+
+Resultados E5 (leave-one-out, policy base {13,15,18,20,22,25}, gate-only):
+- minus_13: ctx1024 base 16.6540 → SD 15.0719 (Δ -9.50%), ctx2048 base 15.1789 → SD 15.5016 (Δ +2.13%)
+- minus_15: ctx1024 base 16.6540 → SD 15.2213 (Δ -8.60%), ctx2048 base 15.1789 → SD 15.4970 (Δ +2.10%)
+- minus_18: ctx1024 base 16.6540 → SD 14.7696 (Δ -11.31%), ctx2048 base 15.1789 → SD 15.3373 (Δ +1.04%)
+- minus_20: ctx1024 base 16.6540 → SD 14.8316 (Δ -10.94%), ctx2048 base 15.1789 → SD 15.4103 (Δ +1.52%)
+- minus_22: ctx1024 base 16.6540 → SD 14.8465 (Δ -10.85%), ctx2048 base 15.1789 → SD 15.2537 (Δ +0.49%)
+- minus_25: ctx1024 base 16.6540 → SD 15.1529 (Δ -9.01%), ctx2048 base 15.1789 → SD 14.8568 (Δ -2.12%)
+- Nota: remover 25 invierte ctx2048 a mejora (unico caso negativo). Remover 22 deja ctx2048 casi neutro. Todas las variantes mejoran mas en ctx1024 que la policy completa.
 
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria

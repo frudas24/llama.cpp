@@ -567,6 +567,11 @@ def main() -> int:
     ap.add_argument("--eval-cols", type=int, default=64, help="Eval cols")
     ap.add_argument("--eval-greedy-pack", default="", help="Greedy pack file")
     ap.add_argument("--max-delta-ppl", type=float, default=5.0, help="Max DeltaPPL percent")
+    ap.add_argument(
+        "--ctx-sweep",
+        default="",
+        help="Comma-separated ctx values to evaluate final policy (e.g. 512,768,1024)",
+    )
     args = ap.parse_args()
 
     scan = load_scan(Path(args.scan))
@@ -777,6 +782,91 @@ def main() -> int:
         }
         (outdir / "autogating_report.json").write_text(
             json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+
+    if args.ctx_sweep:
+        if not args.base or not args.text:
+            print("error: --ctx-sweep requires --base and --text", file=sys.stderr)
+            return 2
+        ctx_list: list[int] = []
+        seen: set[int] = set()
+        for part in args.ctx_sweep.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ctx_val = int(part)
+            except ValueError:
+                print(f"error: invalid ctx value '{part}' in --ctx-sweep", file=sys.stderr)
+                return 2
+            if ctx_val in seen:
+                continue
+            seen.add(ctx_val)
+            ctx_list.append(ctx_val)
+        if not ctx_list:
+            print("error: --ctx-sweep has no valid ctx values", file=sys.stderr)
+            return 2
+
+        layer_range = args.layers_range
+        if not layer_range and selected:
+            layer_range = f"{min(selected)}-{max(selected)}"
+        if not layer_range:
+            print("error: --ctx-sweep needs a non-empty layer range", file=sys.stderr)
+            return 2
+
+        sweep: list[dict[str, object]] = []
+        for ctx in ctx_list:
+            run_dir = outdir / f"ctx_sweep_ctx{ctx}"
+            args_list = [
+                "--base",
+                args.base,
+                "--policy",
+                str(policy_out),
+                "--layers",
+                layer_range,
+                "--text",
+                args.text,
+                "--threads",
+                str(args.eval_threads),
+                "--ctx",
+                str(ctx),
+                "--chunks",
+                str(args.eval_chunks),
+                "--scheme",
+                args.eval_scheme,
+                "--outdir",
+                str(run_dir),
+                "--eval-x",
+                str(args.eval_x),
+                "--eval-cols",
+                str(args.eval_cols),
+            ]
+            if args.eval_scheme == "block":
+                args_list.extend(["--block", str(args.eval_block)])
+            if args.eval_greedy_pack:
+                args_list.extend(["--greedy-pack", args.eval_greedy_pack])
+            run_eval(eval_script, args_list)
+
+            base_ppl = parse_ppl(run_dir / "perplexity_base.log")
+            sd_ppl = parse_ppl(run_dir / "perplexity_seeddelta.log")
+            greedy_ok = parse_greedy_result(run_dir / "greedy_pack.log")
+            delta_pct = None
+            if base_ppl and sd_ppl:
+                delta_pct = (sd_ppl - base_ppl) / base_ppl * 100.0
+
+            sweep.append(
+                {
+                    "ctx": ctx,
+                    "base_ppl": base_ppl,
+                    "seeddelta_ppl": sd_ppl,
+                    "delta_pct": delta_pct,
+                    "greedy_ok": greedy_ok,
+                }
+            )
+
+        (outdir / "ctx_sweep.json").write_text(
+            json.dumps({"ctx_sweep": sweep}, indent=2) + "\n",
+            encoding="utf-8",
         )
 
     return 0
