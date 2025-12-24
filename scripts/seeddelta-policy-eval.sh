@@ -15,6 +15,7 @@ LAYERS=""
 THREADS="$(nproc)"
 TB=""
 CTX="512"
+CTX_LIST=""
 N_PREDICT="256"
 PPL_CHUNKS="16"
 
@@ -31,11 +32,14 @@ EVAL_X="16"
 
 NO_REPACK="0"
 ROUNDTRIP="0"
+EVAL_ONLY="0"
+BUILD_ONLY="0"
 
 GREEDY_PACK=""
 
 OUTDIR="calibration/seeddelta-policy-eval-$(date +%Y%m%d-%H%M%S)"
 SD_MODEL=""
+MODEL_SD=""
 REPORT_JSON=""
 POLICY_EXPORT=""
 SD_MODEL_ROUNDTRIP=""
@@ -62,10 +66,14 @@ options (common):
   --threads N             (default: nproc)
   --tb N                  (default: = --threads)
   --ctx N                 (default: 512)
+  --ctx-list A,B,C        run eval for multiple ctx values (build once)
   --n-predict N           (default: 256)
   --chunks N              perplexity chunks (default: 16)
   --no-repack             pass --no-repack to runtime (debug)
   --roundtrip             rebuild using --policy-export and verify decisions match
+  --eval-only             skip build, run eval using --model-sd
+  --build-only            build model only, skip eval
+  --model-sd FILE         use an existing SeedΔ model for --eval-only
 
 options (builder):
   --scheme block|coo      (default: block)
@@ -110,10 +118,14 @@ while (( "$#" )); do
     --threads) THREADS="${2:-}"; shift 2 ;;
     --tb) TB="${2:-}"; shift 2 ;;
     --ctx) CTX="${2:-}"; shift 2 ;;
+    --ctx-list) CTX_LIST="${2:-}"; shift 2 ;;
     --n-predict) N_PREDICT="${2:-}"; shift 2 ;;
     --chunks) PPL_CHUNKS="${2:-}"; shift 2 ;;
     --no-repack) NO_REPACK="1"; shift ;;
     --roundtrip) ROUNDTRIP="1"; shift ;;
+    --eval-only) EVAL_ONLY="1"; shift ;;
+    --build-only) BUILD_ONLY="1"; shift ;;
+    --model-sd) MODEL_SD="${2:-}"; shift 2 ;;
 
     --scheme) SCHEME="${2:-}"; shift 2 ;;
     --block) BLOCK="${2:-}"; shift 2 ;;
@@ -132,14 +144,26 @@ while (( "$#" )); do
   esac
 done
 
+if [[ "${EVAL_ONLY}" == "1" && "${BUILD_ONLY}" == "1" ]]; then
+  die "--eval-only and --build-only are mutually exclusive"
+fi
+
 [[ -n "${BASE_MODEL}" ]] || { usage; die "missing --base"; }
-[[ -n "${POLICY_FILE}" ]] || { usage; die "missing --policy"; }
-[[ -n "${LAYERS}" ]] || { usage; die "missing --layers"; }
-[[ -n "${TEXT_FILE}" ]] || { usage; die "missing --text"; }
+if [[ "${EVAL_ONLY}" != "1" ]]; then
+  [[ -n "${POLICY_FILE}" ]] || { usage; die "missing --policy"; }
+  [[ -n "${LAYERS}" ]] || { usage; die "missing --layers"; }
+fi
+if [[ "${BUILD_ONLY}" != "1" ]]; then
+  [[ -n "${TEXT_FILE}" ]] || { usage; die "missing --text"; }
+fi
 
 [[ -f "${BASE_MODEL}" ]] || die "missing base model: ${BASE_MODEL}"
-[[ -f "${POLICY_FILE}" ]] || die "missing policy file: ${POLICY_FILE}"
-[[ -f "${TEXT_FILE}" ]] || die "missing text file: ${TEXT_FILE}"
+if [[ "${EVAL_ONLY}" != "1" ]]; then
+  [[ -f "${POLICY_FILE}" ]] || die "missing policy file: ${POLICY_FILE}"
+fi
+if [[ "${BUILD_ONLY}" != "1" ]]; then
+  [[ -f "${TEXT_FILE}" ]] || die "missing text file: ${TEXT_FILE}"
+fi
 if [[ -n "${IMATRIX_FILE}" && ! -f "${IMATRIX_FILE}" ]]; then
   die "missing imatrix: ${IMATRIX_FILE}"
 fi
@@ -152,13 +176,21 @@ done
 
 mkdir -p "${OUTDIR}"
 
-SD_MODEL="${SD_MODEL:-${OUTDIR}/model_sd.gguf}"
+if [[ -n "${MODEL_SD}" ]]; then
+  SD_MODEL="${MODEL_SD}"
+else
+  SD_MODEL="${SD_MODEL:-${OUTDIR}/model_sd.gguf}"
+fi
 REPORT_JSON="${REPORT_JSON:-${OUTDIR}/report.json}"
 POLICY_EXPORT="${POLICY_EXPORT:-${OUTDIR}/policy.exported.json}"
 SD_MODEL_ROUNDTRIP="${SD_MODEL_ROUNDTRIP:-${OUTDIR}/model_sd_roundtrip.gguf}"
 REPORT_JSON_ROUNDTRIP="${REPORT_JSON_ROUNDTRIP:-${OUTDIR}/report_roundtrip.json}"
 
 BUILD_LOG="${OUTDIR}/build.log"
+
+if [[ "${EVAL_ONLY}" == "1" ]]; then
+  [[ -f "${SD_MODEL}" ]] || die "missing seeddelta model: ${SD_MODEL}"
+fi
 
 build_cmd=(
   "${BIN_DIR}/llama-seeddelta-build"
@@ -198,12 +230,14 @@ if [[ "${ROUNDTRIP}" == "1" ]]; then
   build_cmd+=( --policy-export "${POLICY_EXPORT}" )
 fi
 
-echo "== build ==" | tee "${BUILD_LOG}"
-printf 'CMD: %q ' "${build_cmd[@]}" | tee -a "${BUILD_LOG}"
-echo | tee -a "${BUILD_LOG}"
-"${build_cmd[@]}" 2>&1 | tee -a "${BUILD_LOG}"
+if [[ "${EVAL_ONLY}" != "1" ]]; then
+  echo "== build ==" | tee "${BUILD_LOG}"
+  printf 'CMD: %q ' "${build_cmd[@]}" | tee -a "${BUILD_LOG}"
+  echo | tee -a "${BUILD_LOG}"
+  "${build_cmd[@]}" 2>&1 | tee -a "${BUILD_LOG}"
+fi
 
-if [[ "${ROUNDTRIP}" == "1" ]]; then
+if [[ "${ROUNDTRIP}" == "1" && "${EVAL_ONLY}" != "1" ]]; then
   RT_LOG="${OUTDIR}/roundtrip.log"
   echo "== roundtrip build ==" | tee "${RT_LOG}"
   [[ -f "${POLICY_EXPORT}" ]] || die "missing policy export: ${POLICY_EXPORT}"
@@ -310,6 +344,12 @@ print(f"roundtrip decisions OK ({len(a)} tensors)")
 PY
 fi
 
+if [[ "${BUILD_ONLY}" == "1" ]]; then
+  echo "build-only requested; skipping eval"
+  echo "wrote results to: ${OUTDIR}"
+  exit 0
+fi
+
 run_cli() {
   local label="$1"
   local model="$2"
@@ -378,7 +418,12 @@ run_ppl() {
   "${cmd[@]}" "$@" >> "${out_path}" 2>&1
 }
 
-echo "== greedy smoke ==" | tee "${OUTDIR}/smoke.log"
+CTX_VALUES=()
+if [[ -n "${CTX_LIST}" ]]; then
+  IFS=',' read -r -a CTX_VALUES <<< "${CTX_LIST}"
+else
+  CTX_VALUES=("${CTX}")
+fi
 
 PROMPTS=(
   "hola"
@@ -388,50 +433,57 @@ PROMPTS=(
   "Explain what a mutex is in Go in one paragraph."
 )
 
-for i in "${!PROMPTS[@]}"; do
-  p="${PROMPTS[$i]}"
-  run_cli "base" "${BASE_MODEL}" "${p}" "${OUTDIR}/greedy_${i}_base.txt"
-  run_cli "seeddelta" "${SD_MODEL}" "${p}" "${OUTDIR}/greedy_${i}_seeddelta.txt"
-  diff -u "${OUTDIR}/greedy_${i}_base.txt" "${OUTDIR}/greedy_${i}_seeddelta.txt" > "${OUTDIR}/greedy_${i}.diff" || true
-done
+for ctx_val in "${CTX_VALUES[@]}"; do
+  CTX="${ctx_val}"
+  EVAL_DIR="${OUTDIR}/ctx${CTX}"
+  mkdir -p "${EVAL_DIR}"
 
-echo "== perplexity ==" | tee "${OUTDIR}/ppl.log"
-run_ppl "base" "${BASE_MODEL}" "${OUTDIR}/perplexity_base.log"
-run_ppl "seeddelta" "${SD_MODEL}" "${OUTDIR}/perplexity_seeddelta.log"
+  echo "== greedy smoke (ctx=${CTX}) ==" | tee "${EVAL_DIR}/smoke.log"
+  for i in "${!PROMPTS[@]}"; do
+    p="${PROMPTS[$i]}"
+    run_cli "base" "${BASE_MODEL}" "${p}" "${EVAL_DIR}/greedy_${i}_base.txt"
+    run_cli "seeddelta" "${SD_MODEL}" "${p}" "${EVAL_DIR}/greedy_${i}_seeddelta.txt"
+    diff -u "${EVAL_DIR}/greedy_${i}_base.txt" "${EVAL_DIR}/greedy_${i}_seeddelta.txt" > "${EVAL_DIR}/greedy_${i}.diff" || true
+  done
 
-if command -v /usr/bin/time >/dev/null 2>&1; then
-  echo "== time -v (RSS probe, n=16) ==" | tee "${OUTDIR}/time.log"
+  echo "== perplexity (ctx=${CTX}) ==" | tee "${EVAL_DIR}/ppl.log"
+  run_ppl "base" "${BASE_MODEL}" "${EVAL_DIR}/perplexity_base.log"
+  run_ppl "seeddelta" "${SD_MODEL}" "${EVAL_DIR}/perplexity_seeddelta.log"
 
-  /usr/bin/time -v "${BIN_DIR}/llama-cli" \
-    -m "${BASE_MODEL}" -p "hola" -n 16 \
-    -t "${THREADS}" -tb "${TB}" -c "${CTX}" \
-    --ignore-eos --simple-io --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup --no-display-prompt \
-    $([[ "${NO_REPACK}" == "1" ]] && echo --no-repack) \
-    > /dev/null 2> "${OUTDIR}/time_base.txt" || true
+  if command -v /usr/bin/time >/dev/null 2>&1; then
+    echo "== time -v (RSS probe, ctx=${CTX}, n=16) ==" | tee "${EVAL_DIR}/time.log"
 
-  /usr/bin/time -v "${BIN_DIR}/llama-cli" \
-    -m "${SD_MODEL}" --seeddelta -p "hola" -n 16 \
-    -t "${THREADS}" -tb "${TB}" -c "${CTX}" \
-    --ignore-eos --simple-io --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup --no-display-prompt \
-    $([[ "${NO_REPACK}" == "1" ]] && echo --no-repack) \
-    > /dev/null 2> "${OUTDIR}/time_seeddelta.txt" || true
-fi
+    /usr/bin/time -v "${BIN_DIR}/llama-cli" \
+      -m "${BASE_MODEL}" -p "hola" -n 16 \
+      -t "${THREADS}" -tb "${TB}" -c "${CTX}" \
+      --ignore-eos --simple-io --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup --no-display-prompt \
+      $([[ "${NO_REPACK}" == "1" ]] && echo --no-repack) \
+      > /dev/null 2> "${EVAL_DIR}/time_base.txt" || true
 
-if [[ -n "${GREEDY_PACK}" ]]; then
-  echo "== greedy pack (${GREEDY_PACK}) ==" | tee "${OUTDIR}/greedy_pack.log"
-  if [[ ! -x "scripts/seeddelta-greedy-pack.sh" ]]; then
-    echo "warning: scripts/seeddelta-greedy-pack.sh not found or not executable, skipping greedy pack" | tee -a "${OUTDIR}/greedy_pack.log"
-  else
-    scripts/seeddelta-greedy-pack.sh \
-      --base "${BASE_MODEL}" \
-      --sd   "${SD_MODEL}" \
-      --pack "${GREEDY_PACK}" \
-      --outdir "${OUTDIR}/greedy_pack" \
-      | tee -a "${OUTDIR}/greedy_pack.log"
-    if ! grep -q "^RESULT: " "${OUTDIR}/greedy_pack.log"; then
-      echo "RESULT: UNKNOWN (missing RESULT line)" | tee -a "${OUTDIR}/greedy_pack.log"
+    /usr/bin/time -v "${BIN_DIR}/llama-cli" \
+      -m "${SD_MODEL}" --seeddelta -p "hola" -n 16 \
+      -t "${THREADS}" -tb "${TB}" -c "${CTX}" \
+      --ignore-eos --simple-io --temp 0 --top-k 1 --seed 1 --single-turn --no-warmup --no-display-prompt \
+      $([[ "${NO_REPACK}" == "1" ]] && echo --no-repack) \
+      > /dev/null 2> "${EVAL_DIR}/time_seeddelta.txt" || true
+  fi
+
+  if [[ -n "${GREEDY_PACK}" ]]; then
+    echo "== greedy pack (${GREEDY_PACK}) ==" | tee "${EVAL_DIR}/greedy_pack.log"
+    if [[ ! -x "scripts/seeddelta-greedy-pack.sh" ]]; then
+      echo "warning: scripts/seeddelta-greedy-pack.sh not found or not executable, skipping greedy pack" | tee -a "${EVAL_DIR}/greedy_pack.log"
+    else
+      scripts/seeddelta-greedy-pack.sh \
+        --base "${BASE_MODEL}" \
+        --sd   "${SD_MODEL}" \
+        --pack "${GREEDY_PACK}" \
+        --outdir "${EVAL_DIR}/greedy_pack" \
+        | tee -a "${EVAL_DIR}/greedy_pack.log"
+      if ! grep -q "^RESULT: " "${EVAL_DIR}/greedy_pack.log"; then
+        echo "RESULT: UNKNOWN (missing RESULT line)" | tee -a "${EVAL_DIR}/greedy_pack.log"
+      fi
     fi
   fi
-fi
+done
 
 echo "wrote results to: ${OUTDIR}"
