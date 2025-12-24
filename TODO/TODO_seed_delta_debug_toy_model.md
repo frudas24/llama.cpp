@@ -308,7 +308,7 @@ Matices y feedback (post-E5):
 
 Siguiente ROI (ctx-aware):
 - [x] E5: leave-one-out sobre {13,15,18,20,22,25} midiendo ctx1024 y ctx2048 para detectar capas toxicas en largo.
-- [ ] E6: policy por buckets (policy_mid <=1024, policy_long >=1536) o selector multi-ctx.
+- [x] E6: policy por buckets (policy_mid <=1024, policy_long >=1536) o selector multi-ctx.
 - [ ] E7: gate+down (up-off) solo despues de estabilizar multi-ctx (medir 1024+2048 desde el primer intento).
 
 Resultados E5 (leave-one-out, policy base {13,15,18,20,22,25}, gate-only):
@@ -319,6 +319,23 @@ Resultados E5 (leave-one-out, policy base {13,15,18,20,22,25}, gate-only):
 - minus_22: ctx1024 base 16.6540 → SD 14.8465 (Δ -10.85%), ctx2048 base 15.1789 → SD 15.2537 (Δ +0.49%)
 - minus_25: ctx1024 base 16.6540 → SD 15.1529 (Δ -9.01%), ctx2048 base 15.1789 → SD 14.8568 (Δ -2.12%)
 - Nota: remover 25 invierte ctx2048 a mejora (unico caso negativo). Remover 22 deja ctx2048 casi neutro. Todas las variantes mejoran mas en ctx1024 que la policy completa.
+
+Resultados E6 (policies manuales gate-only, K=128, ctx 512/1024/2048):
+- P_full = {13,15,18,20,22,25}
+  - ctx512: base 15.0808 → SD 14.6115 (Δ -3.11%)
+  - ctx1024: base 16.6540 → SD 15.5520 (Δ -6.62%)
+  - ctx2048: base 15.1789 → SD 16.2703 (Δ +7.19%)
+- P_long1 = {13,15,18,20,22} (drop 25)
+  - ctx512: base 15.0808 → SD 13.5248 (Δ -10.32%)
+  - ctx1024: base 16.6540 → SD 15.1529 (Δ -9.01%)
+  - ctx2048: base 15.1789 → SD 14.8568 (Δ -2.12%)
+- P_long2 = {13,15,18,20} (drop 25+22)
+  - ctx512: base 15.0808 → SD 13.4581 (Δ -10.76%)
+  - ctx1024: base 16.6540 → SD 14.7227 (Δ -11.60%)
+  - ctx2048: base 15.1789 → SD 14.2602 (Δ -6.05%)
+- Nota: P_long2 domina en los 3 ctx (mejor PPL en mid y long). Candidato fuerte para policy_long y posiblemente policy_mid.
+- Nota: report.json no expone strip_*; hay que verificar strip real por tamano GGUF/logs.
+- Decision: congelar policy_long = policy_mid = P_long2 = {13,15,18,20} (mejor en ctx512/1024/2048).
 
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
