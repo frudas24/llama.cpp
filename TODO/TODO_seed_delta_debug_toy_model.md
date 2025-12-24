@@ -347,6 +347,13 @@ Resultados E7 (gate-only, policy {13,15,18,20}):
 - RSS (kB): ctx1024 base=4,241,760 sd=4,263,764 delta=+22,004; ctx2048 base=4,322,920 sd=4,344,744 delta=+21,824.
 - Nota: no se observaron campos strip_* en report.json; GGUF y RSS suben ~+21-22 MiB, sugiere que --strip-dense no esta reduciendo pesos o los deltas agregan mas de lo que se quita.
 
+Resultados E7b (gate-only, policy {13,15,18,20} con strip_dense=true en policy, remoto, ctx1024):
+- report.json: emit=4, strip_dense=4 (strip aplicado a los 4 tensores gate).
+- PPL ctx1024: base 16.6540 → SD 14.7227 (Δ -11.60%).
+- GGUF size (bytes): base=4,130,226,336; SD=4,040,268,224; delta=-89,958,112 (~-85.8 MiB).
+- RSS (kB): base=4,242,500; SD=4,154,944; delta=-87,556 (~-85.6 MiB).
+- Nota: strip en policy si reduce GGUF/RSS de forma consistente; confirma que el control debe venir de la policy (no del flag CLI).
+
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
