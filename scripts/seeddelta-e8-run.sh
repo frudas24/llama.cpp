@@ -21,6 +21,7 @@ optional:
   --ctx-list CSV          (default: 1024,2048)
   --rss-ctx-list CSV      (default: 64,128)
   --greedy-pack FILE      (default: calibration/greedy_zombie_pack.txt)
+  --strip-dense-cli       pass --strip-dense to builder (policy still decides)
 EOF
 }
 
@@ -34,6 +35,7 @@ THREADS="16"
 CTX_LIST="1024,2048"
 RSS_CTX_LIST="64,128"
 GREEDY_PACK="calibration/greedy_zombie_pack.txt"
+STRIP_DENSE_CLI="0"
 
 while (( "$#" )); do
   case "$1" in
@@ -47,6 +49,7 @@ while (( "$#" )); do
     --ctx-list) CTX_LIST="${2:-}"; shift 2 ;;
     --rss-ctx-list) RSS_CTX_LIST="${2:-}"; shift 2 ;;
     --greedy-pack) GREEDY_PACK="${2:-}"; shift 2 ;;
+    --strip-dense-cli) STRIP_DENSE_CLI="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -63,20 +66,27 @@ mkdir -p "${OUTDIR}"
 SD_MODEL="${OUTDIR}/model_sd.gguf"
 REPORT_JSON="${OUTDIR}/report.json"
 
-./build/bin/llama-seeddelta-build \
-  -i "${BASE}" \
-  -o "${SD_MODEL}" \
-  --layers "${LAYERS}" \
-  --scheme coo \
-  -t "${THREADS}" \
-  --eval-cols 64 \
-  --eval-x 32 \
-  --report-json "${REPORT_JSON}" \
-  --policy "${POLICY}" \
-  --row-scale \
-  --base --base-max-samples 2048 --base-perm-trials 4 \
-  --strip-dense \
+build_cmd=(
+  ./build/bin/llama-seeddelta-build
+  -i "${BASE}"
+  -o "${SD_MODEL}"
+  --layers "${LAYERS}"
+  --scheme coo
+  -t "${THREADS}"
+  --eval-cols 64
+  --eval-x 32
+  --report-json "${REPORT_JSON}"
+  --policy "${POLICY}"
+  --row-scale
+  --base --base-max-samples 2048 --base-perm-trials 4
   --imatrix "${IMATRIX}"
+)
+
+if [[ "${STRIP_DENSE_CLI}" == "1" ]]; then
+  build_cmd+=( --strip-dense )
+fi
+
+"${build_cmd[@]}"
 
 IFS=',' read -r -a ctx_vals <<< "${CTX_LIST}"
 for ctx in "${ctx_vals[@]}"; do
