@@ -309,7 +309,7 @@ Matices y feedback (post-E5):
 Siguiente ROI (ctx-aware):
 - [x] E5: leave-one-out sobre {13,15,18,20,22,25} midiendo ctx1024 y ctx2048 para detectar capas toxicas en largo.
 - [x] E6: policy por buckets (policy_mid <=1024, policy_long >=1536) o selector multi-ctx.
-- [ ] E7: gate+down (up-off) solo despues de estabilizar multi-ctx (medir 1024+2048 desde el primer intento).
+- [x] E7: verificacion de ahorro real (gate-only, up-off) con ctx 64/128/1024/2048, medir GGUF size + RSS + PPL + greedy.
 
 Resultados E5 (leave-one-out, policy base {13,15,18,20,22,25}, gate-only):
 - minus_13: ctx1024 base 16.6540 → SD 15.0719 (Δ -9.50%), ctx2048 base 15.1789 → SD 15.5016 (Δ +2.13%)
@@ -336,6 +336,16 @@ Resultados E6 (policies manuales gate-only, K=128, ctx 512/1024/2048):
 - Nota: P_long2 domina en los 3 ctx (mejor PPL en mid y long). Candidato fuerte para policy_long y posiblemente policy_mid.
 - Nota: report.json no expone strip_*; hay que verificar strip real por tamano GGUF/logs.
 - Decision: congelar policy_long = policy_mid = P_long2 = {13,15,18,20} (mejor en ctx512/1024/2048).
+
+Resultados E7 (gate-only, policy {13,15,18,20}):
+- GGUF size (bytes): base=4,130,226,336; SD=4,151,689,600; delta=+21,463,264 (~+20.5 MiB).
+- ctx64: base 15.9299 → SD 15.4288 (Δ -3.15%), greedy PASS.
+- ctx128: base 18.3384 → SD 17.7740 (Δ -3.08%), greedy PASS.
+- ctx1024: base 16.6540 → SD 14.7227 (Δ -11.60%), greedy PASS.
+- ctx2048: base 15.1789 → SD 14.2602 (Δ -6.05%), greedy PASS.
+- RSS (kB): ctx64 base=4,131,312 sd=4,153,404 delta=+22,092; ctx128 base=4,131,700 sd=4,153,608 delta=+21,908.
+- RSS (kB): ctx1024 base=4,241,760 sd=4,263,764 delta=+22,004; ctx2048 base=4,322,920 sd=4,344,744 delta=+21,824.
+- Nota: no se observaron campos strip_* en report.json; GGUF y RSS suben ~+21-22 MiB, sugiere que --strip-dense no esta reduciendo pesos o los deltas agregan mas de lo que se quita.
 
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria

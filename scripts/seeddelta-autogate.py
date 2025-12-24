@@ -42,6 +42,7 @@ def write_policy(
     k: int,
     metric: str,
     enable_down: bool,
+    strip_dense: bool,
 ) -> None:
     ranges = []
     for layer in layers:
@@ -52,7 +53,7 @@ def write_policy(
             {
                 "layers": str(layer),
                 "enabled": True,
-                "strip_dense": False,
+                "strip_dense": bool(strip_dense),
                 "K": {"gate": k, "up": k, "down": k},
                 "gating": {
                     "metric": metric,
@@ -547,6 +548,11 @@ def main() -> int:
         help="Allow tensors with missing ffn_proxy metrics",
     )
     ap.add_argument("--policy-out", default="", help="Output policy path (default: outdir/policy.autogen.json)")
+    ap.add_argument(
+        "--policy-strip-dense",
+        action="store_true",
+        help="Set strip_dense=true in generated policy ranges",
+    )
     ap.add_argument("--forbidden-out", default="", help="Output forbidden pairs JSON (optional)")
     ap.add_argument("--scores-out", default="", help="Output scores JSON (optional)")
 
@@ -684,7 +690,15 @@ def main() -> int:
             return 2
 
         policy_path = eval_outdir / f"policy.step{len(eval_steps):03d}.json"
-        write_policy(policy_path, candidate, candidate_tensors, args.k, args.metric, args.enable_down)
+        write_policy(
+            policy_path,
+            candidate,
+            candidate_tensors,
+            args.k,
+            args.metric,
+            args.enable_down,
+            args.policy_strip_dense,
+        )
 
         layer_range = args.layers_range
         if not layer_range:
@@ -761,7 +775,15 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     policy_out = Path(args.policy_out) if args.policy_out else outdir / "policy.autogen.json"
-    write_policy(policy_out, selected, selected_tensors, args.k, args.metric, args.enable_down)
+    write_policy(
+        policy_out,
+        selected,
+        selected_tensors,
+        args.k,
+        args.metric,
+        args.enable_down,
+        args.policy_strip_dense,
+    )
 
     scores_out = Path(args.scores_out) if args.scores_out else outdir / "layer_scores.json"
     scores_out.write_text(json.dumps(scores, indent=2) + "\n", encoding="utf-8")

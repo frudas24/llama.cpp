@@ -178,6 +178,9 @@ int sd_run(const sd_args & args) {
     if (!build_res.ok) {
         return 1;
     }
+    if (strip_dense && !build_res.any_strip) {
+        fprintf(stderr, "seeddelta-build: --strip-dense requested but no tensors were stripped (policy/gating may disable strip_dense)\n");
+    }
 
     sd_write_params wparams;
     wparams.src = src;
