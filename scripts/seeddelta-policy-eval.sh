@@ -428,16 +428,8 @@ if [[ -n "${GREEDY_PACK}" ]]; then
       --pack "${GREEDY_PACK}" \
       --outdir "${OUTDIR}/greedy_pack" \
       | tee -a "${OUTDIR}/greedy_pack.log"
-    if [[ -d "${OUTDIR}/greedy_pack/diff" ]]; then
-      diff_total="$(find "${OUTDIR}/greedy_pack/diff" -type f -name "*.diff" | wc -l | tr -d ' ')"
-      diff_nonzero="$(find "${OUTDIR}/greedy_pack/diff" -type f -name "*.diff" -size +0c | wc -l | tr -d ' ')"
-      if [[ "${diff_total}" -eq 0 ]]; then
-        echo "RESULT: UNKNOWN (no diff files)" | tee -a "${OUTDIR}/greedy_pack.log"
-      elif [[ "${diff_nonzero}" -eq 0 ]]; then
-        echo "RESULT: PASS" | tee -a "${OUTDIR}/greedy_pack.log"
-      else
-        echo "RESULT: FAIL (${diff_nonzero}/${diff_total} diffs non-empty)" | tee -a "${OUTDIR}/greedy_pack.log"
-      fi
+    if ! grep -q "^RESULT: " "${OUTDIR}/greedy_pack.log"; then
+      echo "RESULT: UNKNOWN (missing RESULT line)" | tee -a "${OUTDIR}/greedy_pack.log"
     fi
   fi
 fi

@@ -354,6 +354,11 @@ Resultados E7b (gate-only, policy {13,15,18,20} con strip_dense=true en policy, 
 - RSS (kB): base=4,242,500; SD=4,154,944; delta=-87,556 (~-85.6 MiB).
 - Nota: strip en policy si reduce GGUF/RSS de forma consistente; confirma que el control debe venir de la policy (no del flag CLI).
 
+Resultados E7c (gate-only, policy strip {13,15,18,20}, remoto, multi-ctx + RSS probe):
+- ctx512: base 15.0808 → SD 13.4581 (Δ -10.76%), RSS delta -86,844 kB (~-84.8 MiB), greedy pack RESULT: PASS (0/20 flagged).
+- ctx2048: base 15.1789 → SD 14.2602 (Δ -6.05%), RSS delta -87,208 kB (~-85.1 MiB), greedy pack RESULT: PASS (0/20 flagged).
+- Nota: greedy pack es heuristico (anti-colapso). Los diffs exactos vs base son esperables cuando cambiamos pesos.
+
 Fase 2 - "cazar al gigante" (gate+down, up-off):
 - [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
 - [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
