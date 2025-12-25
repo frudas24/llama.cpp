@@ -26,6 +26,16 @@ struct sd_tile_stats {
     int64_t cols = 0;
 };
 
+static double sd_tensor_l2_norm(ggml_tensor * W) {
+    const int64_t n = ggml_nelements(W);
+    double sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = ggml_get_f32_1d(W, i);
+        sum += (double) v * (double) v;
+    }
+    return sum > 0.0 ? std::sqrt(sum) : 0.0;
+}
+
 static std::vector<sd_tile_stats> sd_compute_tile_stats(
         ggml_tensor * W,
         int64_t tile_rows,
@@ -362,6 +372,10 @@ sd_build_result sd_build_layers(
                 continue;
             }
 
+            const double w_l2_norm = (args.delta_norm_clamp_down > 0.0 && kind == "ffn_down")
+                    ? sd_tensor_l2_norm(W)
+                    : 0.0;
+
             if (!cfg.enabled) {
                 report_entry re;
                 re.layer = il;
@@ -677,6 +691,23 @@ sd_build_result sd_build_layers(
 
                 for (auto & th : workers) {
                     th.join();
+                }
+
+                if (args.delta_norm_clamp_down > 0.0 && kind == "ffn_down" && !t.d_val.empty() && w_l2_norm > 0.0) {
+                    double delta_norm = 0.0;
+                    for (float v : t.d_val) {
+                        delta_norm += (double) v * (double) v;
+                    }
+                    delta_norm = delta_norm > 0.0 ? std::sqrt(delta_norm) : 0.0;
+                    const double limit = args.delta_norm_clamp_down * w_l2_norm;
+                    if (limit > 0.0 && delta_norm > limit) {
+                        const double scale = limit / delta_norm;
+                        for (float & v : t.d_val) {
+                            v = (float) (v * scale);
+                        }
+                        fprintf(stderr, "  [blk.%" PRId64 ".%s] delta clamp down: norm=%.3g w_norm=%.3g scale=%.4f\n",
+                                il, kind.c_str(), delta_norm, w_l2_norm, scale);
+                    }
                 }
 
                 if (t.re.cost.ops_dense > 0.0) {

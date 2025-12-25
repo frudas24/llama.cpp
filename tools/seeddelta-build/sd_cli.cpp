@@ -37,6 +37,7 @@ namespace {
     printf("  --policy-self-test   run internal policy merge tests and exit\n");
     printf("  --overwrite-existing allow rebuilding tensors that already have SeedΔ (default: skip)\n");
     printf("  --stack-cost-cap F   hard cap for accumulated stack_cost (default: +inf => no cap)\n");
+    printf("  --delta-norm-clamp-down F clamp ffn_down delta norm to F * ||W|| (default: 0=off)\n");
     printf("  --tile-rows N        enable tiling metadata: rows per tile (default: 0 = disabled)\n");
     printf("  --tile-align N       alignment for tile rows/boundaries (default: 32)\n");
     printf("  --k-selector NAME    K assignment: cycle (default), uniform, ttcross\n");
@@ -98,6 +99,7 @@ bool sd_parse_args(int argc, char ** argv, sd_args & args) {
         if (arg == "--policy-export" && i + 1 < argc) { args.policy_export_file = argv[++i]; continue; }
         if (arg == "--policy-self-test") { args.policy_self_test = true; continue; }
         if (arg == "--stack-cost-cap" && i + 1 < argc) { args.stack_cost_cap = std::stod(argv[++i]); continue; }
+        if (arg == "--delta-norm-clamp-down" && i + 1 < argc) { args.delta_norm_clamp_down = std::stod(argv[++i]); continue; }
         if (arg == "--tile-rows" && i + 1 < argc) { args.tile_rows = std::stoll(argv[++i]); continue; }
         if (arg == "--tile-align" && i + 1 < argc) { args.tile_rows_align = std::max<int64_t>(1, std::stoll(argv[++i])); continue; }
         if (arg == "--k-selector" && i + 1 < argc) { args.k_selector = argv[++i]; continue; }

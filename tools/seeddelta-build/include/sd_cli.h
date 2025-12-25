@@ -40,6 +40,7 @@ struct sd_args {
     bool policy_self_test = false;
     bool overwrite_existing = false;
     double stack_cost_cap = 0.0;
+    double delta_norm_clamp_down = 0.0;
     int64_t tile_rows = 0;
     int64_t tile_rows_align = 32;
     std::string k_selector = "cycle"; // uniform/cycle/ttcross

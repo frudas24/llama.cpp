@@ -22,6 +22,7 @@ optional:
   --rss-ctx-list CSV      (default: 64,128)
   --greedy-pack FILE      (default: calibration/greedy_zombie_pack.txt)
   --strip-dense-cli       pass --strip-dense to builder (policy still decides)
+  --delta-norm-clamp-down F clamp ffn_down delta norm to F * ||W||
 EOF
 }
 
@@ -36,6 +37,7 @@ CTX_LIST="1024,2048"
 RSS_CTX_LIST="64,128"
 GREEDY_PACK="calibration/greedy_zombie_pack.txt"
 STRIP_DENSE_CLI="0"
+DELTA_NORM_CLAMP_DOWN=""
 
 while (( "$#" )); do
   case "$1" in
@@ -50,6 +52,7 @@ while (( "$#" )); do
     --rss-ctx-list) RSS_CTX_LIST="${2:-}"; shift 2 ;;
     --greedy-pack) GREEDY_PACK="${2:-}"; shift 2 ;;
     --strip-dense-cli) STRIP_DENSE_CLI="1"; shift ;;
+    --delta-norm-clamp-down) DELTA_NORM_CLAMP_DOWN="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -84,6 +87,9 @@ build_cmd=(
 
 if [[ "${STRIP_DENSE_CLI}" == "1" ]]; then
   build_cmd+=( --strip-dense )
+fi
+if [[ -n "${DELTA_NORM_CLAMP_DOWN}" ]]; then
+  build_cmd+=( --delta-norm-clamp-down "${DELTA_NORM_CLAMP_DOWN}" )
 fi
 
 "${build_cmd[@]}"
