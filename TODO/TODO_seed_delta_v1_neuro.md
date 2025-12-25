@@ -14,6 +14,33 @@ All ideas are ordered from most promising to least, based on our current data.
 
 ---
 
+## 0) Down viability triage (E8 hypotheses)
+
+Why now:
+- E8 showed big RAM wins from ffn_down strip, but quality degraded fast.
+- Before we go "neuro", we need to test the 3 concrete hypotheses that can
+  explain E8 and might unlock "down" safely.
+
+Hypotheses to attack:
+- H1: K_down=128 is too low for down (needs higher fidelity).
+- H2: Our current safety signal does not measure down damage (wrong metric).
+- H3: Error accumulates via residuals; we need a clamp or partial strip.
+
+Plan (minimal, executable):
+- [ ] H1: sweep K_down with gate fixed at K=128 (down in 1 layer only):
+      K_down = 256, 384, 512. Measure PPL ctx1024/2048 + RSS ctx64/128.
+- [ ] H2: use proxy-based thresholds for down only (stricter than gate):
+      cos_p05 and l2_p95 thresholds from "good" layers + tighter margin.
+- [ ] H3a: add delta norm clamp for down (tau * ||W||), keep gate unchanged.
+- [ ] H3b: partial strip for down (top-K rows/cols by imatrix or by |delta|),
+      evaluate if RAM drops without PPL blow-up.
+
+Exit criteria:
+- If any setting gets ctx2048 delta <= +2% with meaningful RSS drop, keep down.
+- If not, keep down off and move on (gate-only stays the default).
+
+---
+
 ## 1) Consolidation + selective forgetting (hippo -> neocortex)
 
 Neuro idea:
