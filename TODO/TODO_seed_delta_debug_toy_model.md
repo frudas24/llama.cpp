@@ -547,6 +547,48 @@ PPL base ~26081.12 (ctx=256).
 - Usar el mismo harness de logs (report.json + greedy pack).
 - No mezclar con modelos grandes hasta cerrar A y B.
 
+---
+
+## Nota temporal (2025-12-24) — estado remoto + idea “KV procedural”
+
+### Qué estábamos corriendo (para retomar fácil)
+
+**Remoto 64GB (root@REMOTE_64GB_HOST)**:
+- Job pesado: `llama-imatrix` para **Mistral 7B Q8** con **wikitext-2 completo**.
+  - Modelo (canon): `/models/mistral-7b-instruct-v0.2.Q8_0.gguf` (`/models` es symlink al cache).
+  - Output: `/root/llama.cpp/calibration/mistral7b.imatrix.gguf`
+  - Log: `/root/llama.cpp/calibration/mistral7b_imatrix.log`
+  - ETA observado en log: ~2h21m (varía).
+- Tuning OS: zram activo (25%, lz4), `vm.swappiness=1`, `vm.vfs_cache_pressure=50`.
+
+**Remoto 32GB (devgpt@REMOTE_32GB_HOST)**:
+- Baseline Mistral 7B Q8 (wikitext-2, chunks=4):
+  - ctx512: PPL `7.3049 ± 0.62997`
+  - ctx2048: PPL `6.8369 ± 0.27176`
+- Swap físico desactivado; solo zram (prio alto) para evitar swapping “sorpresa”.
+- Job en curso: “E7 equivalente” sobre Mistral 7B Q8 (gate-only + strip, policy `{13,15,18,20}`) vía `scripts/seeddelta-e8-run.sh`
+  - Outdir: `calibration/mistral_e7_gateonly_k128/`
+  - Mide PPL (ctx1024/2048) + RSS probes (ctx64/128) + greedy pack.
+
+### Limpieza/consistencia lograda en tooling
+- `scripts/seeddelta-e8-run.sh` ya no fuerza `--strip-dense` por CLI: el strip es **policy-driven**; CLI `--strip-dense-cli` queda opcional.
+- README actualizado con timeline + “war stories” (números que forzaron decisiones).
+
+### Idea divergente (no implementada aún): KV procedural en runtime
+
+Objetivo: bajar RSS en ctx enormes (KV domina), aceptando penalización en tok/s.
+
+Propuesta simple/realista: **compresión online de KV por bloques** (“summary tokens”):
+- Mantener KV exacto para los últimos `W` tokens.
+- Para tokens más viejos, agrupar en bloques `B` y comprimir a `r` resúmenes por bloque.
+- Para cada cluster `j` (tamaño `n_j`):
+  - `k̃_j = k_pivot` (evitar promediar K; RoPE/posiciones se mezclan raro)
+  - `ṽ_j = mean(v_i)`
+  - bias de “masa” `b_j = log(n_j)` y usar score `q·k̃_j + b_j` en softmax.
+- Parámetros a explorar: `W∈{2048,4096}`, `B∈{256,512}`, `r∈{4,8}`.
+
+Hipótesis: reduce memoria ~O(ctx) → ~O(W + (#bloques)*r) y mantiene coherencia si el “barrido” del pasado se resume bien.
+
 ## Auto-Gating v2 - Seleccion automatica de capas basada en sensibilidad + stacking
 
 ### Motivacion

@@ -48,6 +48,28 @@ sino **no almacenar todo** y reconstruir/aproximar su efecto:
 La pregunta clave:
 > ¿Cómo aproximar la suma de contribuciones de muchos tokens viejos con pocos estados?
 
+### 0.3 Motivos útiles de `./internal/*` (neuronas procedurales) aplicados a KV
+
+Nuestra tecnología de “synapsis procedurales” (base + Δ) tiene varios patrones que
+encajan *directo* con KV:
+
+- **Base + deltas escasos**: no guardamos todo, guardamos el “resumen” (base) y los
+  “errores/importantes” (Δ). En KV: *summaries* = base, *outliers exactos* = Δ.
+- **Caps + top‑K por |Δ| (heap)**: mantener un tope duro por unidad (ej. por neurona/pre)
+  y recortar por magnitud. En KV: `max_outliers_per_block`, `max_summaries_total`,
+  trimming por “salience score”.
+- **Shedding (soft + hard)**:
+  - soft: descartar contribuciones pequeñas (`|Δ| <= eps`)
+  - hard: si se excede el watermark, quedarse con top‑K por score.
+- **Retención (half‑life) + decay**: las Δ se apagan si no importan, y se sostienen si
+  hay señal de retención. En KV: outliers con `ret∈[0,1]` y expiración, y “olvido”
+  multiplicativo sobre el score.
+- **Time wheel / scheduling**: no recorrer todo cada token; agendar compactaciones/decays
+  por buckets (ring buffer) para amortizar costo.
+- **Shadow/A‑B drift**: comparar “procedural vs referencia” en una fracción del tráfico para
+  medir *drift* y ajustar heurísticas. En KV: comparar atención full‑KV vs proc‑KV en
+  muestras para tener un “guardrail” cuantitativo.
+
 ---
 
 ## 1) Objetivo y definición de éxito
@@ -145,6 +167,26 @@ Implementación v1:
 - Por bloque guardamos los top-$s$ outliers con KV exacto.
 - El resto se representa por summary tokens.
 
+### 3.1 Caps, shedding y “olvido” (inspirado en nuestro backend procedural)
+
+Para que 100k sea estable (y para no “crecer por accidente”), el MVP debe tener:
+
+- **Cap duro por bloque**: `max_outliers_per_block = s`.
+  - Si un bloque intenta añadir más, recortar los de menor score.
+- **Shedding soft**: descartar outliers cuyo score cae bajo `eps`.
+- **Shedding hard** (budget global): si el total de outliers/summaries excede watermark,
+  quedarse con top‑K por score (por nivel o global).
+- **Retención por outlier**: cada outlier mantiene `ret∈[0,1]` + `ret_expiry` opcional.
+  - Ret alto = no olvidar; ret bajo = olvidar rápido.
+- **Decay multiplicativo** del score (por “tick” de consolidación):
+  $$
+  \\text{score} \\leftarrow \\text{score}\\cdot(1 - \\alpha\\cdot(1-\\text{ret}))
+  $$
+  - Si `ret=0` ⇒ score *= (1-α)
+  - Si `ret=1` ⇒ score se conserva
+
+Esto convierte “KV procedural” en un sistema con presupuesto explícito (sin sorpresas).
+
 ---
 
 ## 4) Consolidación multi-nivel (100k sin crecer lineal)
@@ -161,6 +203,17 @@ Regla tipo “LSM tree”:
 
 Esto mantiene memoria ~O(W + r·log(T)).
 
+### 4.1 Retención durante consolidación (no perder lo importante)
+
+Cuando compactamos niveles, necesitamos una regla simple para no “matar” detalles:
+
+- Los **outliers** pasan al siguiente nivel solo si su score (ya decaído) lo justifica.
+- La **retención** se puede propagar con una regla conservadora (ej. `max` o `p95`) para
+  mantener lo “valioso” a través de compactaciones.
+- Mantener invariantes fáciles de auditar:
+  - `sum(n_j)` se conserva por nivel (masa total)
+  - el bias `log(n)` se actualiza de forma consistente al agrupar (suma de masas)
+
 ---
 
 ## 5) Plan de implementación (escalonado, “shippeable”)
@@ -172,6 +225,13 @@ Esto mantiene memoria ~O(W + r·log(T)).
 - [ ] Crear un benchmark “long prompt” reproducible:
   - construir un prompt largo con wikitext / repetición controlada
   - medir RSS y tok/s en ctx 8k/32k/100k (si cabe)
+
+### Fase 0.5 — Guardrails (shadow) antes de ir a 100k
+
+- [ ] “Shadow mode” opcional (debug): en una fracción de tokens, calcular atención con:
+  - KV full (referencia) vs KV proc (aprox), y reportar drift (jaccard/top‑k/L2).
+- [ ] Logging de presupuesto:
+  - tokens exactos vivos, #summaries por nivel, #outliers, watermark hits.
 
 ### Fase 1 — Ventana viva + resumen posicional (v1.0)
 
@@ -196,6 +256,8 @@ Esto mantiene memoria ~O(W + r·log(T)).
 - [ ] Añadir outliers top-$s$ por bloque:
   - flags `--kv-salient s`
   - métrica inicial: novelty o norma de V
+  - implementar cap/top‑K por heap (no listas lineales)
+  - implementar decay + shedding (soft/hard) para estabilidad
 
 ### Fase 3 — Multi-nivel (consolidación)
 
@@ -219,6 +281,7 @@ Gates por fase (si falla, no avanzar):
 - Gate A: no colapsa (greedy smoke) en ctx grande.
 - Gate B: PPL no explota (ΔPPL razonable).
 - Gate C: RSS cae fuerte con ctx grande (la meta real).
+- Gate D (debug): shadow drift dentro de límites (cuando esté activado).
 
 Experimentos mínimos:
 
@@ -242,3 +305,4 @@ Experimentos mínimos:
 - Flags y documentación.
 - Bench reproducible (long prompt).
 - Tabla (por modelo): ctx vs RSS vs tok/s vs ΔPPL con presets (W,B,r,s).
+- (debug) Métricas de drift “shadow” para no volar a ciegas.
