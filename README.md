@@ -75,6 +75,15 @@ looks the way it does.
 - New frontier discovered: **context regime**. The same policy can improve PPL up to ~1024 ctx and flip sign beyond ~1280 unless bucketed.
 - Doc: `TODO/TODO_seed_delta_debug_toy_model.md`
 
+### Act VI — Gate+down reality check and pivot to KV procedural
+- Goal: use `ffn_down` as the “RAM lever”.
+- Result: strong GGUF/RSS savings but **clear PPL regression** even with conservative down:
+  - Mistral 7B Q8, E8a (down only on layer 20): ΔPPL `+11.95%` (ctx1024), `+13.27%` (ctx2048), GGUF `≈ -266.8 MiB`.
+  - E8b (down on 18+20): ΔPPL `+18.29%` (ctx1024), `+18.10%` (ctx2048), GGUF `≈ -324.1 MiB`.
+- Conclusion: **down needs a stronger functional filter**; pausing down as default.
+- Pivot: **the real RAM enemy is KV** at long ctx. We pivoted to procedural KV.
+- Doc: `TODO/TODO_kv_procedural_long_context_100k.md`
+
 **Core lessons so far**
 - Gate-only can be a *regularizer* (PPL improves) but only in safe bands.
 - `ffn_up` is toxic under current metrics; hard-off by default.
@@ -126,17 +135,18 @@ These are the experiments that forced design decisions (not just “interesting 
   improved PPL at ctx512/2048 with greedy PASS.
 - Context regime is real: gains are strongest at ctx512-1024 and can flip
   positive past ~1280 without bucketed policies.
+- E8a/E8b (gate+down) showed **RAM wins but PPL loss** at 1–2 down layers → down is now backlog.
 
-## Current plan (summary)
+## Current plan (post-pivot)
 
-1) Gate-only coverage expansion:
-   - Sweep `max_layers` (8/16/24/32) on wider ranges.
-   - Track PPL, GGUF size, RSS, tok/s.
-2) Gate + down (up-off):
-   - Tight thresholds first; relax only if stable.
-3) Strip real + RAM measurement:
-   - Confirm non-zero emitted tensors and strip in logs.
-   - Measure RSS with small ctx where weight savings are visible.
+1) **KV procedural MVP** (window + summaries + log-mass bias):
+   - Implement tiered KV (W + block summaries + outliers) with budget caps.
+   - Add shadow drift metrics for safety.
+2) **Multi-level consolidation**:
+   - Compact summaries in LSM-style levels to keep memory sublinear.
+3) **Bench long-ctx**:
+   - ctx 8k/32k/100k RSS/PPL/tok/s tables with presets (W,B,r,s).
+4) **SeedΔ down** stays as backlog until we have a stronger functional filter.
 
 ## E8 (gate + down, up-off) workflow
 
@@ -177,6 +187,8 @@ Notes:
 ## Where to read more (living notes)
 
 - `TODO/TODO_seed_delta_debug_toy_model.md`
+- `TODO/TODO_seed_delta_v1_neuro.md`
+- `TODO/TODO_kv_procedural_long_context_100k.md`
 - `TODO/TODO_seed_delta_weights_k_layer_sublayer.md`
 - `TODO/TODO_seed_delta_weights_llama_k_multicapa.md`
 - `TODO/TODO_seed_delta_weights_llama.md`
