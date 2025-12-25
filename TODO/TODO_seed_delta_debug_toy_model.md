@@ -359,6 +359,19 @@ Resultados E7c (gate-only, policy strip {13,15,18,20}, remoto, multi-ctx + RSS p
 - ctx2048: base 15.1789 → SD 14.2602 (Δ -6.05%), RSS delta -87,208 kB (~-85.1 MiB), greedy pack RESULT: PASS (0/20 flagged).
 - Nota: greedy pack es heuristico (anti-colapso). Los diffs exactos vs base son esperables cuando cambiamos pesos.
 
+Resultados E8 (Mistral 7B Q8, gate+down, up-off, strip en policy):
+- E8a (down solo en capa 20, policy {13,15,18,20}):
+  - ctx1024: base 4.9288 → SD 5.5176 (Δ +11.95%)
+  - ctx2048: base 6.3703 → SD 7.2158 (Δ +13.27%)
+  - GGUF delta: -266.8 MiB, RSS delta: ~-264 MiB (ctx64/128)
+  - strip aplicado: gate 4 capas + down 1 capa
+- E8b (down en capas 18,20):
+  - ctx1024: base 4.9288 → SD 5.8301 (Δ +18.29%)
+  - ctx2048: base 6.3703 → SD 7.5232 (Δ +18.10%)
+  - GGUF delta: -324.1 MiB, RSS delta: ~-322 MiB (ctx64/128)
+  - strip aplicado: gate 4 capas + down 2 capas
+- Conclusion: down aporta ahorro fuerte pero degrada PPL de forma clara incluso con 1-2 capas; se pausa Fase 2 hasta tener filtro funcional mas fuerte para down.
+
 Resultados Gemma 1B (local, Q4_K_M, gate-only):
 - Policy {13,15,18,20} strip_dense=true:
   - ctx512: base 1.0050 → SD 1.0072 (Δ +0.22%).
@@ -379,9 +392,9 @@ Resultados Gemma 1B (local, Q4_K_M, gate-only):
   - ctx2048: base 1.0024 → SD 1.0031 (Δ +0.07%).
 
 Fase 2 - "cazar al gigante" (gate+down, up-off):
-- [ ] D1: down estricto (ej: 0.75/0.55) con gate victoria
-- [ ] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
-- [ ] D3: limitar down con max_down_layers separado de max_gate_layers
+- [x] D1: down estricto (ej: 0.75/0.55) con gate victoria
+- [x] D2: si D1 pasa, relajar down (ej: 0.60/0.40), up sigue OFF
+- [x] D3: limitar down con max_down_layers separado de max_gate_layers
 - Entregable: policy gate+down, tabla capas gate vs capas down + ΔPPL + ahorro
   - Helpers: `scripts/seeddelta-e8-make-policy.py`, `scripts/seeddelta-e8-run.sh`, `scripts/seeddelta-e8-summary.py`
   - One-liners (remoto):
@@ -396,9 +409,9 @@ Fase 2 - "cazar al gigante" (gate+down, up-off):
       - `scripts/seeddelta-e8-run.sh --base ~/models/gemma-3-4b-it-Q8_0.gguf --policy calibration/e8c_down_all/policy_down_all.json --outdir calibration/e8c_down_all`
 
 Fase 3 - STRIP real y medicion de RAM:
-- [ ] Confirmar en logs: no "0 new tensors", strip aplicado
-- [ ] Medir RSS con ctx pequeno y ctx real
-- [ ] Reportar GGUF size, RSS total, y breakdown si existe
+- [x] Confirmar en logs: no "0 new tensors", strip aplicado
+- [x] Medir RSS con ctx pequeno y ctx real
+- [x] Reportar GGUF size, RSS total, y breakdown si existe
 
 ### Resultados B (tiny, 1k steps)
 
@@ -588,6 +601,12 @@ Propuesta simple/realista: **compresión online de KV por bloques** (“summary 
 - Parámetros a explorar: `W∈{2048,4096}`, `B∈{256,512}`, `r∈{4,8}`.
 
 Hipótesis: reduce memoria ~O(ctx) → ~O(W + (#bloques)*r) y mantiene coherencia si el “barrido” del pasado se resume bien.
+
+---
+
+## Nota de pivoteo (2025-12-25)
+
+Motivo: el gate-only con strip ya entrega ahorro real de pesos y mejora PPL en Mistral (E7c), pero gate+down (E8a/E8b) degrada PPL con claridad incluso en configuraciones conservadoras. El cuello de botella de RAM ahora es el KV cache en ctx grande, no los pesos. Por eso se pivotea el foco principal al TODO de "KV procedural 100k", dejando Fase 2 (down) como backlog hasta tener un filtro funcional mas fuerte.
 
 ## Auto-Gating v2 - Seleccion automatica de capas basada en sensibilidad + stacking
 

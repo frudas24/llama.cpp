@@ -306,3 +306,15 @@ Experimentos mínimos:
 - Bench reproducible (long prompt).
 - Tabla (por modelo): ctx vs RSS vs tok/s vs ΔPPL con presets (W,B,r,s).
 - (debug) Métricas de drift “shadow” para no volar a ciegas.
+
+---
+
+## Backlog heredado (SeedΔ) a revisar si retomamos
+
+Pendientes que quedaron del TODO anterior y que pueden aportar si volvemos a SeedΔ:
+
+- [ ] Calibrar thresholds funcionales con whitelist 12/14/16/18 y reintentar expansion con barandales.
+- [ ] Definir umbral tau v0 (percentil o budget MB) para autogate.
+- [ ] Implementar "no consecutivas" + "gap preferido" como hard rule.
+- [ ] Comparar contra heuristic/manual (ver si redescubre sets tipo {1,3,5,6}).
+- [ ] Integrar output final: links a scan.json, forbidden_pairs.json, policy.autogen, autogating_report.md.
