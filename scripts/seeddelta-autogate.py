@@ -11,6 +11,52 @@ from pathlib import Path
 TENSOR_KEYS = ("ffn_gate", "ffn_up", "ffn_down")
 
 
+def retention_score(metrics: dict, args: argparse.Namespace) -> float | None:
+    mode = args.retention_mode
+    if mode == "off":
+        return None
+    use_proxy = mode in ("proxy", "auto")
+    use_cos = mode in ("cos", "auto")
+    if use_proxy and metrics.get("ffn_proxy_available", False):
+        cos = read_float(metrics.get("ffn_proxy_cos_p05"))
+        l2 = read_float(metrics.get("ffn_proxy_l2_p95"))
+        norm = read_float(metrics.get("ffn_proxy_log_norm_ratio_p95"))
+        if cos is None or l2 is None or norm is None:
+            return None
+        score = max(0.0, cos) / (1.0 + l2 + abs(norm))
+        return max(0.0, score)
+    if use_cos:
+        cos_p05 = read_float(metric_value(metrics, args.gate_cos_p05_metric, "cos_p05"))
+        cos_mean = read_float(metric_value(metrics, args.gate_cos_metric, "cos_mean"))
+        if cos_p05 is None:
+            return None
+        if cos_mean is None:
+            cos_mean = cos_p05
+        score = max(0.0, cos_p05) * max(0.0, cos_mean)
+        return max(0.0, score)
+    return None
+
+
+def retention_layer_score(layer_scores: dict[str, float], aggregate: str) -> float | None:
+    if not layer_scores:
+        return None
+    vals = [v for v in layer_scores.values() if v is not None]
+    if not vals:
+        return None
+    if aggregate == "mean":
+        return sum(vals) / len(vals)
+    return max(vals)
+
+
+def apply_retention_adjust(val: float, retention: float | None, rank_is_higher: bool, alpha: float) -> float:
+    if retention is None or alpha <= 0.0:
+        return val
+    penalty = alpha * (1.0 - retention)
+    if rank_is_higher:
+        return val * (1.0 - penalty)
+    return val * (1.0 + penalty)
+
+
 def parse_layers(spec: str) -> list[int]:
     layers: list[int] = []
     for token in spec.split(","):
@@ -319,6 +365,8 @@ def decide_allowed_tensors(
     layer_metrics: dict,
     args: argparse.Namespace,
     functional_thresholds: dict[str, dict[str, float]],
+    retention_scores: dict[int, dict[str, float]],
+    retention_allowlist: dict[str, set[int]] | None,
 ) -> list[str]:
     allowed: list[str] = []
     layer_tensors = extract_tensors(layer_metrics)
@@ -347,6 +395,16 @@ def decide_allowed_tensors(
             thresholds = functional_thresholds.get(tensor)
             if not passes_functional_gate(layer, metrics, thresholds, args):
                 continue
+        if args.retention_mode != "off":
+            score = retention_scores.get(layer, {}).get(tensor)
+            if score is None:
+                if not args.retention_allow_missing:
+                    continue
+            else:
+                if args.retention_min > 0.0 and score < args.retention_min:
+                    continue
+                if retention_allowlist is not None and layer not in retention_allowlist.get(tensor, set()):
+                    continue
         allowed.append(tensor)
     return allowed
 
@@ -412,6 +470,26 @@ def main() -> int:
         help="Per-tensor cosine p05 threshold for ffn_down",
     )
     ap.add_argument("--gate-allow-missing", action="store_true", help="Allow tensors with missing cos metrics")
+    ap.add_argument(
+        "--retention-mode",
+        default="off",
+        choices=["off", "proxy", "cos", "auto"],
+        help="Retention score source (proxy or cos).",
+    )
+    ap.add_argument("--retention-min", type=float, default=0.0, help="Min retention score to keep tensor")
+    ap.add_argument("--retention-topk", type=int, default=0, help="Max layers per tensor by retention score")
+    ap.add_argument("--retention-aggregate", default="max", choices=["max", "mean"], help="Layer retention aggregate")
+    ap.add_argument(
+        "--retention-decay-alpha",
+        type=float,
+        default=0.0,
+        help="Penalize low retention in ranking (0=disabled)",
+    )
+    ap.add_argument(
+        "--retention-allow-missing",
+        action="store_true",
+        help="Allow tensors with missing retention score when retention_mode is active",
+    )
     ap.add_argument(
         "--functional-gate",
         action="store_true",
@@ -613,6 +691,42 @@ def main() -> int:
             print(f"error: functional thresholds missing for {', '.join(missing)}", file=sys.stderr)
             return 2
 
+    retention_scores: dict[int, dict[str, float]] = {}
+    for layer_s, layer_metrics in layers_dict.items():
+        try:
+            layer = int(layer_s)
+        except ValueError:
+            continue
+        if allow_layers is not None and layer not in allow_layers:
+            continue
+        if layer in deny_layers:
+            continue
+        if not isinstance(layer_metrics, dict):
+            continue
+        layer_tensors = extract_tensors(layer_metrics)
+        for tensor in TENSOR_KEYS:
+            metrics = layer_tensors.get(tensor)
+            if not isinstance(metrics, dict):
+                continue
+            score = retention_score(metrics, args)
+            if score is None:
+                continue
+            retention_scores.setdefault(layer, {})[tensor] = float(score)
+
+    retention_allowlist: dict[str, set[int]] | None = None
+    if args.retention_topk > 0 and retention_scores:
+        retention_allowlist = {tensor: set() for tensor in TENSOR_KEYS}
+        for tensor in TENSOR_KEYS:
+            ranked = []
+            for layer, layer_scores in retention_scores.items():
+                score = layer_scores.get(tensor)
+                if score is None:
+                    continue
+                ranked.append((score, layer))
+            ranked.sort(reverse=True)
+            for _, layer in ranked[: args.retention_topk]:
+                retention_allowlist[tensor].add(layer)
+
     scores: dict[int, float] = {}
     for layer_s, layer_metrics in layers_dict.items():
         try:
@@ -631,6 +745,9 @@ def main() -> int:
             val = aggregate_metrics(layer_metrics, tensors, args.rank_metric, args.aggregate)
         if val is None:
             continue
+        if args.retention_decay_alpha > 0.0:
+            layer_ret = retention_layer_score(retention_scores.get(layer, {}), args.retention_aggregate)
+            val = apply_retention_adjust(val, layer_ret, args.rank_metric.startswith("cos"), args.retention_decay_alpha)
         scores[layer] = float(val)
 
     if not scores:
@@ -671,7 +788,14 @@ def main() -> int:
             if (not selected and layer % 2 == 0) or (all(s % 2 == 0 for s in selected) and layer % 2 == 0):
                 continue
         layer_metrics = layers_dict.get(str(layer), {})
-        allowed = decide_allowed_tensors(layer, layer_metrics, args, functional_thresholds)
+        allowed = decide_allowed_tensors(
+            layer,
+            layer_metrics,
+            args,
+            functional_thresholds,
+            retention_scores,
+            retention_allowlist,
+        )
         if not allowed:
             continue
 
