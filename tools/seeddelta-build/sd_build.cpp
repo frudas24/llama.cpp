@@ -18,7 +18,7 @@
 #include "sd_ffn_proxy.h"
 #include "sd_constants.h"
 #include "sd_utils.h"
-#include "ggml/ggml-cpu.h"
+#include "ggml-cpu.h"
 
 struct sd_tile_stats {
     double l2 = 0.0;
