@@ -18,7 +18,6 @@
 #include "sd_ffn_proxy.h"
 #include "sd_constants.h"
 #include "sd_utils.h"
-#include "ggml-cpu.h"
 
 struct sd_tile_stats {
     double l2 = 0.0;
@@ -28,11 +27,20 @@ struct sd_tile_stats {
 };
 
 static double sd_tensor_l2_norm(ggml_tensor * W) {
-    const int64_t n = ggml_nelements(W);
+    const int64_t n_in = W->ne[0];
+    const int64_t n_out = W->ne[1];
+    if (n_in <= 0 || n_out <= 0) {
+        return 0.0;
+    }
+    std::vector<float> col;
+    col.reserve((size_t) n_in);
     double sum = 0.0;
-    for (int64_t i = 0; i < n; ++i) {
-        const float v = ggml_get_f32_1d(W, i);
-        sum += (double) v * (double) v;
+    for (int64_t j = 0; j < n_out; ++j) {
+        read_column_f32(W, j, col);
+        for (float v : col) {
+            const double dv = (double) v;
+            sum += dv * dv;
+        }
     }
     return sum > 0.0 ? std::sqrt(sum) : 0.0;
 }
